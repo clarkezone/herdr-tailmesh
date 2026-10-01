@@ -13,6 +13,18 @@ service NodeControl {
   rpc Connect(stream NodeEnvelope) returns (stream NodeEnvelope);
 }
 
+// Observation only, served on IPv4 loopback by the managed daemon.
+// This API intentionally permits any local process to read mesh observations.
+service LocalObserver {
+  rpc GetInfo(google.protobuf.Empty) returns (ObserverInfo);
+  rpc WatchNodes(google.protobuf.Empty) returns (stream NodeList);
+}
+
+message ObserverInfo {
+  uint32 api_version = 1;
+  string daemon_name = 2;
+}
+
 service Fleet {
   rpc GetServerInfo(google.protobuf.Empty) returns (ServerInfo);
   rpc ListNodes(google.protobuf.Empty) returns (NodeList);

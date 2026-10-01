@@ -298,6 +298,17 @@ func TestManagedRuntimePreservesAssignedCollisionSuffix(t *testing.T) {
 	testManagedRuntimeAssignedDNS(t, "herdr-mesh-desktop-1.assigned-tail.test", canonicalTempDir(t))
 }
 
+func TestManagedRuntimeSurvivesOccupiedVisualizerPort(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, port, _ := net.SplitHostPort(listener.Addr().String())
+	t.Setenv(VisualizerPortEnv, port)
+	testManagedRuntimeAssignedDNS(t, "herdr-mesh-desktop.assigned-tail.test", canonicalTempDir(t))
+}
+
 func testManagedRuntimeAssignedDNS(t *testing.T, assignedDNS, dir string) {
 	t.Helper()
 	if err := Save(dir, Config{Version: 1, Name: "desktop", Tailnet: "example.test", Coordinator: true}); err != nil {
