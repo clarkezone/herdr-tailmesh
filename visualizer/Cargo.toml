@@ -1,0 +1,38 @@
+[package]
+name = "herdr-mesh-visualizer"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+egui = "=0.36.2"
+egui-wgpu = "=0.36.2"
+env_logger = "0.11"
+log = "0.4"
+pollster = "1.0.1"
+wgpu = "=30.0.1"
+winit = "0.30"
+prost = "0.14"
+prost-types = "0.14"
+tonic = "0.14"
+tonic-prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Preserve wgputests' Wayland startup fix: no eager arboard X11 connection.
+egui-winit = { version = "=0.36.2", default-features = false, features = ["links", "wayland", "x11", "smithay-clipboard"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+egui-winit = "=0.36.2"
+
+[profile.dev]
+debug = 0

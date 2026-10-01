@@ -27,22 +27,24 @@ type Options struct {
 
 // Dependencies keeps network, interactive and process effects injectable.
 type Dependencies struct {
-	Dir           func() (string, error)
-	Load          func(string) (meshlocal.Config, error)
-	Save          func(string, meshlocal.Config) error
-	Status        func(string) (meshlocal.Status, error)
-	Running       func(string) (bool, error)
-	Verify        func(context.Context, string) error
-	Prerequisites func(string) error
-	Executable    func() (string, error)
-	Start         func(string, string, []string) error
-	Browser       func(string) error
-	Token         func(context.Context) ([]byte, error)
-	Confirm       func(context.Context) (bool, error)
-	Policy        func(context.Context, setup.Options, []byte) (setup.Report, error)
-	PolicyRead    func(context.Context, string, []byte) ([]byte, error)
-	Wait          func(context.Context) error
-	Environment   func() []string
+	// Zero means no explicit per-launch override; never stored in identity config.
+	VisualizerPort int
+	Dir            func() (string, error)
+	Load           func(string) (meshlocal.Config, error)
+	Save           func(string, meshlocal.Config) error
+	Status         func(string) (meshlocal.Status, error)
+	Running        func(string) (bool, error)
+	Verify         func(context.Context, string) error
+	Prerequisites  func(string) error
+	Executable     func() (string, error)
+	Start          func(string, string, []string) error
+	Browser        func(string) error
+	Token          func(context.Context) ([]byte, error)
+	Confirm        func(context.Context) (bool, error)
+	Policy         func(context.Context, setup.Options, []byte) (setup.Report, error)
+	PolicyRead     func(context.Context, string, []byte) ([]byte, error)
+	Wait           func(context.Context) error
+	Environment    func() []string
 }
 
 var portableName = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
@@ -134,6 +136,11 @@ func ValidDNS(host string) bool {
 }
 
 func Run(ctx context.Context, options Options, output io.Writer, d Dependencies) (result error) {
+	if d.VisualizerPort != 0 {
+		if err := meshlocal.ValidateVisualizerPort(d.VisualizerPort); err != nil {
+			return err
+		}
+	}
 	o, err := options.Normalize()
 	if err != nil {
 		return err
@@ -198,6 +205,15 @@ func Run(ctx context.Context, options Options, output io.Writer, d Dependencies)
 	if err := meshlocal.CheckNotDestroying(dir); err != nil {
 		return err
 	}
+	if d.VisualizerPort != 0 {
+		running, err := d.Running(dir)
+		if err != nil {
+			return err
+		}
+		if running {
+			return errors.New("--visualizer-port requires a new launch; run shutdown then start with the desired port")
+		}
+	}
 	if o.Coordinator {
 		if err := configurePolicy(ctx, dir, o.Tailnet, output, d); err != nil {
 			return err
@@ -215,9 +231,12 @@ func launchAndWait(ctx context.Context, exe, dir string, coordinator bool, outpu
 	if err != nil {
 		return fmt.Errorf("cannot check whether mesh is already running; check access to %s before retrying (no second process was started): %w", dir, err)
 	}
+	if running && d.VisualizerPort != 0 {
+		return errors.New("--visualizer-port requires a new launch; run shutdown then start with the desired port")
+	}
 	if !running {
 		fmt.Fprintln(output, "Starting mesh...")
-		if err := d.Start(exe, dir, DaemonEnvironment(d.Environment())); err != nil {
+		if err := d.Start(exe, dir, visualizerEnvironment(DaemonEnvironment(d.Environment()), d.VisualizerPort)); err != nil {
 			return fmt.Errorf("could not start managed daemon; saved identity is preserved: %w", err)
 		}
 		for attempt := 0; ; attempt++ {
@@ -237,6 +256,20 @@ func launchAndWait(ctx context.Context, exe, dir string, coordinator bool, outpu
 		}
 	}
 	return waitReady(ctx, dir, coordinator, output, d)
+}
+
+func visualizerEnvironment(environment []string, port int) []string {
+	result := make([]string, 0, len(environment)+1)
+	for _, entry := range environment {
+		key, _, _ := strings.Cut(entry, "=")
+		if !strings.EqualFold(key, meshlocal.VisualizerPortEnv) {
+			result = append(result, entry)
+		}
+	}
+	if port == 0 {
+		port = meshlocal.DefaultVisualizerPort
+	}
+	return append(result, meshlocal.VisualizerPortEnv+"="+strconv.Itoa(port))
 }
 
 func checkAdvanced(root string) error {

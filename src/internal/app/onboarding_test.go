@@ -41,6 +41,38 @@ func TestGuidedOnboardingDefaultsAndHelpNoEffects(t *testing.T) {
 	}
 }
 
+func TestVisualizerPortFlagsValidateBeforeOnboarding(t *testing.T) {
+	for _, command := range []string{"init", "join"} {
+		args := []string{"--name", "desktop", "--tailnet", "example.com"}
+		if command == "join" {
+			args = []string{"--name", "desktop", "--server", "herdr-mesh-server.actual.ts.net"}
+		}
+		streams := IO{In: strings.NewReader(""), Out: io.Discard, Err: io.Discard}
+		calls := 0
+		run := func(_ context.Context, _ onboard.Options, _ io.Writer, d onboard.Dependencies) error {
+			calls++
+			if d.VisualizerPort != 8791 {
+				t.Fatalf("override lost: %d", d.VisualizerPort)
+			}
+			return nil
+		}
+		for _, port := range []string{"0", "65536", "-1"} {
+			if err := runOnboardingWith(context.Background(), command, append(append([]string{}, args...), "--visualizer-port", port), streams, run); err == nil {
+				t.Fatal("invalid port accepted")
+			}
+		}
+		if calls != 0 {
+			t.Fatal("invalid flags had effects")
+		}
+		if err := runOnboardingWith(context.Background(), command, append(args, "--visualizer-port", "8791"), streams, run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runStart(context.Background(), []string{"--visualizer-port", "0"}, IO{Out: io.Discard, Err: io.Discard}); err == nil {
+		t.Fatal("start accepted invalid port")
+	}
+}
+
 func TestManagedRunInternalContract(t *testing.T) {
 	calls := 0
 	dir := t.TempDir()

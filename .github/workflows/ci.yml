@@ -14,6 +14,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  visualizer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: visualizer
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev
+      - name: Format
+        run: cargo fmt --manifest-path visualizer/Cargo.toml -- --check
+      - name: Lint
+        run: cargo clippy --manifest-path visualizer/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Projection and observer tests
+        run: cargo test --manifest-path visualizer/Cargo.toml --locked
+      - name: Build native viewer
+        run: cargo build --manifest-path visualizer/Cargo.toml --locked --release
+      - name: Go to Rust observer contract (including a 5 MiB snapshot)
+        shell: bash
+        run: |
+          binary="$(python -c 'import os; print(os.path.abspath("visualizer/target/release/herdr-mesh-visualizer" + (".exe" if os.name == "nt" else ""))))')"
+          HERDR_VISUALIZER_TEST_BINARY="$binary" go test ./src/internal/meshlocal -run TestRustObserverWireContract -count=1
+      - name: Package viewer separately from the Go CLI
+        shell: bash
+        run: |
+          binary="$PWD/visualizer/target/release/herdr-mesh-visualizer"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          python scripts/package-visualizer.py --binary "$binary" --version 0.1.0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: herdr-mesh-visualizer-${{ runner.os }}-${{ runner.arch }}
+          path: dist/visualizer/*
   test:
     strategy:
       fail-fast: false
