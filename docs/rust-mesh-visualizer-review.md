@@ -34,8 +34,7 @@ native GPU smoke rendered default/named sessions, working/blocked agents and an
 offline node from a Go bridge fixture. The fixture uses no Tailscale identity.
 
 Windows/macOS/Linux CI jobs build/test and package the viewer separately.
-Those jobs are configured in source; their remote execution has not been
-claimed here. Native Windows/macOS acceptance, comprehensive graphical
+Those jobs must pass for the final PR head before merge. Native Windows/macOS acceptance, comprehensive graphical
 interaction/DPI checks, and attachment to upgraded live managed installations
 on the established target machines remain outstanding. The first cut is built;
 the full cross-platform live acceptance matrix is not yet certified.
@@ -60,9 +59,20 @@ CI and packaging. The following findings were fixed before merge:
   existing Go node/session/entity count and identifier-length limits before
   projection. Regression tests reject excessive counts and oversized identities;
   the 5 MiB display-name wire fixture remains accepted and truncated for display.
+- A retained empty snapshot still claimed the mesh was connected after a stream
+  loss. Show explicit last-known empty-state copy while disconnected, with a
+  regression test covering both live and retained empty snapshots.
+- First Linux CI exposed socket tests that used a fixed yield-iteration budget:
+  they could exhaust it before HTTP/2 delivered a replacement. Use bounded real
+  deadlines and resume the clock before real reconnect I/O. The first-snapshot
+  deadline test now exercises the real timeout instead of assuming headers
+  arrive within a fixed sleep before jumping simulated time.
 - Longer animations made fixed frame-count waits unreliable. Settle interaction
   tests relative to the shared duration and verify interrupted retargeting,
   monotonic/symmetric easing, moving hit targets, fade cleanup and idle completion.
+- The cross-platform wire-test workflow had an extra Python closing parenthesis,
+  preventing its contract check from starting. Resolve the native binary path
+  with pathlib and verify the exact workflow command locally before rerunning CI.
 
 Geometry, opacity and pane allocation now share 400 ms quintic ease-in/ease-out
 with zero velocity and acceleration at the endpoints. Repeated identical targets
@@ -71,6 +81,6 @@ root, remote exposure, destination dialog, heartbeat pulse or Fleet pulse cards
 are implemented in this PR; the latter features have separate ai-core requirements.
 
 Local verification: full Go tests/vet, affected-package race tests, dashboard model
-checks, Rust format/clippy and twenty tests, release build/packaging, and the real
+checks, Rust format/clippy and twenty-one tests, release build/packaging, and the real
 Go-to-Rust observer wire contract. Cross-platform CI must pass before merge.
 Native Windows/macOS graphical acceptance remains a separate follow-up.

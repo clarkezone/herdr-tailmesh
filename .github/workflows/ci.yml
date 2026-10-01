@@ -47,7 +47,7 @@ jobs:
       - name: Go to Rust observer contract (including a 5 MiB snapshot)
         shell: bash
         run: |
-          binary="$(python -c 'import os; print(os.path.abspath("visualizer/target/release/herdr-mesh-visualizer" + (".exe" if os.name == "nt" else ""))))')"
+          binary="$(python -c 'import os; from pathlib import Path; print(Path("visualizer/target/release/herdr-mesh-visualizer" + (".exe" if os.name == "nt" else "")).resolve())')"
           HERDR_VISUALIZER_TEST_BINARY="$binary" go test ./src/internal/meshlocal -run TestRustObserverWireContract -count=1
       - name: Package viewer separately from the Go CLI
         shell: bash

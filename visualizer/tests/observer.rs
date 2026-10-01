@@ -125,6 +125,9 @@ async fn reconnect_after_lease_expiry_replaces_the_complete_scene() {
     until(|| !shared.read().live).await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(2)).await;
+    // Resume before waiting for real TCP/HTTP2 I/O. A paused clock can otherwise
+    // expire network deadlines before the OS delivers its response.
+    tokio::time::resume();
     until(|| shared.read().live && f.calls.load(Ordering::SeqCst) == 2).await;
     let scene = shared.read().scene.unwrap();
     assert_eq!(scene.nodes.len(), 1);
@@ -140,11 +143,17 @@ fn node(id: &str) -> pb::NodeView {
     }
 }
 async fn until(predicate: impl Fn() -> bool) {
-    for _ in 0..10000 {
+    until_for(Duration::from_secs(8), predicate).await;
+}
+async fn until_for(timeout: Duration, predicate: impl Fn() -> bool) {
+    // An iteration budget measures CPU speed, not network progress. Use a real
+    // bounded deadline and yield time to sockets on slower CI platforms.
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
         if predicate() {
             return;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!("condition not observed");
 }
@@ -162,6 +171,7 @@ async fn quiet_stream_retains_live_and_cancellation_joins() {
     until(|| shared.read().live).await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(35)).await;
+    tokio::time::resume();
     tokio::task::yield_now().await;
     assert!(shared.read().live, "quiet healthy watch must remain live");
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
@@ -200,11 +210,9 @@ async fn missing_first_snapshot_has_a_deadline() {
     let (stop, rx) = watch::channel(false);
     let worker = tokio::spawn(client::run(f.port, shared.clone(), rx));
     until(|| f.calls.load(Ordering::SeqCst) == 1).await;
-    // Let response headers reach the client before advancing the first-snapshot deadline.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(11)).await;
-    until(|| {
+    // Exercise the real socket/first-snapshot timeout: sleeping a fixed 20 ms
+    // did not prove headers had arrived before a synthetic clock jump.
+    until_for(Duration::from_secs(15), || {
         shared
             .read()
             .status

@@ -264,7 +264,11 @@ impl UiState {
             self.selected = None;
         }
         if scene.nodes.is_empty() {
-            ui.label("Mesh connected; no nodes observed.");
+            ui.label(if view.live {
+                "Mesh connected; no nodes observed."
+            } else {
+                "Last-known snapshot contains no nodes."
+            });
         }
         if scene.agents == 0 && !scene.nodes.is_empty() {
             ui.small("Nodes observed; no agents reported.");
@@ -793,6 +797,23 @@ mod tests {
         let output = frame(&context, &mut state, &view, 1200., vec![]);
         assert!(state.selected.is_none());
         assert!(text_position(&output, "Observation").is_none());
+    }
+
+    #[test]
+    fn disconnected_empty_snapshot_does_not_claim_mesh_connectivity() {
+        let context = egui::Context::default();
+        let mut state = UiState::default();
+        let mut view = View {
+            scene: Some(Arc::new(Scene::default())),
+            live: false,
+            ..Default::default()
+        };
+        let output = frame(&context, &mut state, &view, 1200., vec![]);
+        assert!(text_position(&output, "Last-known snapshot contains no nodes.").is_some());
+        assert!(text_position(&output, "Mesh connected; no nodes observed.").is_none());
+        view.live = true;
+        let output = frame(&context, &mut state, &view, 1200., vec![]);
+        assert!(text_position(&output, "Mesh connected; no nodes observed.").is_some());
     }
 
     #[test]
