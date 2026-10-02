@@ -248,8 +248,13 @@ func TestNamedSessionsNodeEnsureFailuresAndMissingManager(t *testing.T) {
 			h := newCommandHarness(t, filepath.Join(root, "server"))
 			manager := &namedNodeManager{ensure: func(ctx context.Context, _ string) (herdrsession.Session, error) {
 				if test.err == context.DeadlineExceeded {
-					<-ctx.Done()
-					return herdrsession.Session{}, ctx.Err()
+					// The real manager wraps its own startup timeout as ErrStarting.
+					// Keep the command live so durable result delivery cannot race
+					// the coordinator's independent command-expiry sweep.
+					startup, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+					defer cancel()
+					<-startup.Done()
+					return herdrsession.Session{}, errors.Join(herdrsession.ErrStarting, startup.Err())
 				}
 				return herdrsession.Session{}, test.err
 			}}
@@ -257,9 +262,6 @@ func TestNamedSessionsNodeEnsureFailuresAndMissingManager(t *testing.T) {
 			view := waitNamedNode(t, h, run, func(v *pb.NodeView) bool { return v.CommandReady && v.SessionsReady })
 			assertNoNamedDefault(t, view)
 			request := namedEnsureRequest("failure", "build")
-			if test.err == context.DeadlineExceeded {
-				request.Ttl = durationpb.New(500 * time.Millisecond)
-			}
 			first := submitNamedNode(t, h, request)
 			result := awaitCommand(t, h, first.Command.CommandId, test.status)
 			if result.Detail != test.detail || result.SessionEnsure != nil || run.checks.Load() == 0 {

@@ -1,5 +1,9 @@
 //! Pure, scoped projection of complete replacement snapshots.
 use crate::pb::{HerdrEntity, HerdrState, NodeList};
+use crate::{
+    heartbeat::{Heartbeat, Stamp},
+    summary::{ContextCounts, Counts, NodeCounts},
+};
 use prost_types::Timestamp;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,16 +16,28 @@ const MAX_ENTITIES: usize = 4096;
 const MAX_ID_BYTES: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Freshness {
-    Receipt(i64),
+    Receipt(Stamp),
     Stale,
     Unknown,
     Disconnected,
 }
 impl Freshness {
+    pub fn is_live(self, time: Stamp) -> bool {
+        let stamp = match self {
+            Self::Receipt(t) => t,
+            _ => return false,
+        };
+        (stamp.nanos() - time.nanos()).abs() < 30_000_000_000
+    }
     pub fn label(self, now: i64) -> &'static str {
+        self.label_at(Stamp::seconds(now))
+    }
+    pub fn label_at(self, time: Stamp) -> &'static str {
         match self {
-            Self::Receipt(t) if t >= now + 30 => "freshness unknown (clock ahead)",
-            Self::Receipt(t) if now - t >= 30 => "stale",
+            Self::Receipt(t) if t.nanos() - time.nanos() >= 30_000_000_000 => {
+                "freshness unknown (clock ahead)"
+            }
+            Self::Receipt(_) if !self.is_live(time) => "stale",
             Self::Receipt(_) => "live",
             Self::Stale => "stale",
             Self::Unknown => "freshness unknown",
@@ -35,6 +51,15 @@ pub fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+pub fn wall_now() -> Stamp {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    Stamp {
+        seconds: time.as_secs() as i64,
+        nanos: time.subsec_nanos() as i32,
+    }
+}
 fn receipt(t: Option<&Timestamp>, connected: bool, stale: bool) -> Freshness {
     if !connected {
         return Freshness::Disconnected;
@@ -42,15 +67,8 @@ fn receipt(t: Option<&Timestamp>, connected: bool, stale: bool) -> Freshness {
     if stale {
         return Freshness::Stale;
     }
-    match t {
-        Some(t)
-            if (0..1_000_000_000).contains(&t.nanos)
-                && (0..=253_402_300_799).contains(&t.seconds) =>
-        {
-            Freshness::Receipt(t.seconds)
-        }
-        _ => Freshness::Unknown,
-    }
+    t.and_then(Stamp::parse)
+        .map_or(Freshness::Unknown, Freshness::Receipt)
 }
 pub fn label(s: &str) -> String {
     bounded_text(s, 160)
@@ -86,6 +104,7 @@ pub struct Branch {
     pub details: Vec<String>,
     pub status: String,
     pub freshness: Freshness,
+    pub last_seen: Option<Stamp>,
     pub children: Vec<Branch>,
 }
 fn branch(
@@ -109,17 +128,69 @@ fn branch(
         ],
         status: String::new(),
         freshness,
+        last_seen: None,
         children: vec![],
     }
 }
 #[derive(Debug, Default)]
 pub struct Scene {
+    pub coordinator: Option<Branch>,
     pub nodes: Vec<Branch>,
+    pub heartbeats: Vec<Heartbeat>,
+    pub counts: Vec<NodeCounts>,
+    pub observed_at: Stamp,
     pub projects: Vec<ProjectSummary>,
     pub connected: usize,
     pub agents: usize,
     pub working: usize,
     pub blocked: usize,
+}
+
+pub fn coordinator(info: Option<&crate::pb::ServerInfo>) -> Branch {
+    let verified = info.filter(|i| {
+        !i.instance_id.is_empty()
+            && i.instance_id.len() <= MAX_ID_BYTES
+            && !i.instance_id.chars().any(char::is_control)
+    });
+    let mut root = branch(
+        &vec![],
+        "coordinator",
+        verified.map_or("unknown", |i| i.instance_id.as_str()),
+        verified.map_or("Identity unknown", |i| i.instance_id.as_str()),
+        Freshness::Unknown,
+    );
+    root.status = if verified.is_some() {
+        "verified upstream identity"
+    } else {
+        "identity unavailable"
+    }
+    .into();
+    if let Some(info) = verified {
+        root.details.push(format!(
+            "Coordinator version: {}",
+            label(&info.implementation_version)
+        ));
+    }
+    root.details
+        .push("Logical control root; execution role is counted separately.".into());
+    root
+}
+
+fn context_counts(session: &Branch, state: Option<&HerdrState>) -> ContextCounts {
+    let mut inventory = Counts::default();
+    if let Some(state) = state {
+        inventory.workspaces = state.workspaces.len();
+        inventory.agents = state.agents.len();
+        for agent in &state.agents {
+            inventory.working += usize::from(agent.agent_status == "working");
+            inventory.blocked += usize::from(agent.agent_status == "blocked");
+            inventory.done += usize::from(agent.agent_status == "done");
+        }
+    }
+    ContextCounts {
+        freshness: session.freshness,
+        inventory,
+    }
 }
 
 #[derive(Debug)]
@@ -133,7 +204,10 @@ pub fn project(snapshot: NodeList) -> Result<Scene, String> {
     if snapshot.nodes.len() > MAX_NODES {
         return Err("Node inventory exceeds the protocol bound".into());
     }
-    let mut scene = Scene::default();
+    let mut scene = Scene {
+        observed_at: wall_now(),
+        ..Default::default()
+    };
     let mut ids = HashSet::new();
     for n in snapshot.nodes {
         if n.instance_id.is_empty()
@@ -154,6 +228,16 @@ pub fn project(snapshot: NodeList) -> Result<Scene, String> {
             receipt(n.last_seen.as_ref(), n.connected, false),
         );
         node.status = if n.connected { "connected" } else { "offline" }.into();
+        node.last_seen = n.last_seen.as_ref().and_then(Stamp::parse);
+        scene.heartbeats.push(Heartbeat {
+            key: node.key.clone(),
+            connected: n.connected,
+            seen: node.last_seen,
+        });
+        let mut counts = NodeCounts {
+            connected: n.connected,
+            contexts: vec![],
+        };
         node.details.extend([
             format!("Tailscale stable ID: {}", label(&n.tailscale_stable_id)),
             format!(
@@ -181,6 +265,9 @@ pub fn project(snapshot: NodeList) -> Result<Scene, String> {
             );
             session.key.push(String::new()); // explicit incarnation component
             populate(&mut session, n.herdr.as_ref(), &mut scene)?;
+            counts
+                .contexts
+                .push(context_counts(&session, n.herdr.as_ref()));
             node.children.push(session);
         }
         for s in n.sessions {
@@ -212,10 +299,14 @@ pub fn project(snapshot: NodeList) -> Result<Scene, String> {
             if s.status != "ready" {
                 session.status = label(&s.status);
             }
+            counts
+                .contexts
+                .push(context_counts(&session, s.herdr.as_ref()));
             node.children.push(session);
         }
         sort(&mut node.children);
         scene.nodes.push(node);
+        scene.counts.push(counts);
     }
     sort(&mut scene.nodes);
     // Count scoped workspace observations once; a node with several sessions
@@ -613,9 +704,13 @@ mod tests {
     }
     #[test]
     fn freshness_is_receipt_based() {
-        assert_eq!(Freshness::Receipt(100).label(129), "live");
-        assert_eq!(Freshness::Receipt(100).label(130), "stale");
-        assert!(Freshness::Receipt(200).label(100).contains("clock"));
+        assert_eq!(Freshness::Receipt(Stamp::seconds(100)).label(129), "live");
+        assert_eq!(Freshness::Receipt(Stamp::seconds(100)).label(130), "stale");
+        assert!(
+            Freshness::Receipt(Stamp::seconds(200))
+                .label(100)
+                .contains("clock")
+        );
         assert_eq!(receipt(None, true, false), Freshness::Unknown);
         assert_eq!(receipt(None, false, false), Freshness::Disconnected);
     }

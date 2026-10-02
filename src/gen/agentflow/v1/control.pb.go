@@ -301,9 +301,12 @@ func (AgentControlAction) EnumDescriptor() ([]byte, []int) {
 }
 
 type ObserverInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ApiVersion    uint32                 `protobuf:"varint,1,opt,name=api_version,json=apiVersion,proto3" json:"api_version,omitempty"`
-	DaemonName    string                 `protobuf:"bytes,2,opt,name=daemon_name,json=daemonName,proto3" json:"daemon_name,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	ApiVersion uint32                 `protobuf:"varint,1,opt,name=api_version,json=apiVersion,proto3" json:"api_version,omitempty"`
+	DaemonName string                 `protobuf:"bytes,2,opt,name=daemon_name,json=daemonName,proto3" json:"daemon_name,omitempty"`
+	// Optional verified upstream identity/version. Absent while unavailable or
+	// when served by an older observer; never infer this from daemon_name.
+	Coordinator   *ServerInfo `protobuf:"bytes,3,opt,name=coordinator,proto3" json:"coordinator,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -350,6 +353,13 @@ func (x *ObserverInfo) GetDaemonName() string {
 		return x.DaemonName
 	}
 	return ""
+}
+
+func (x *ObserverInfo) GetCoordinator() *ServerInfo {
+	if x != nil {
+		return x.Coordinator
+	}
+	return nil
 }
 
 type ResolveNamedAgentRequest struct {
@@ -4729,12 +4739,13 @@ var File_agentflow_v1_control_proto protoreflect.FileDescriptor
 
 const file_agentflow_v1_control_proto_rawDesc = "" +
 	"\n" +
-	"\x1aagentflow/v1/control.proto\x12\fagentflow.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"P\n" +
+	"\x1aagentflow/v1/control.proto\x12\fagentflow.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x8c\x01\n" +
 	"\fObserverInfo\x12\x1f\n" +
 	"\vapi_version\x18\x01 \x01(\rR\n" +
 	"apiVersion\x12\x1f\n" +
 	"\vdaemon_name\x18\x02 \x01(\tR\n" +
-	"daemonName\"{\n" +
+	"daemonName\x12:\n" +
+	"\vcoordinator\x18\x03 \x01(\v2\x18.agentflow.v1.ServerInfoR\vcoordinator\"{\n" +
 	"\x18ResolveNamedAgentRequest\x12(\n" +
 	"\x10node_instance_id\x18\x01 \x01(\tR\x0enodeInstanceId\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12!\n" +
@@ -5279,140 +5290,141 @@ var file_agentflow_v1_control_proto_goTypes = []any{
 	(*emptypb.Empty)(nil),            // 62: google.protobuf.Empty
 }
 var file_agentflow_v1_control_proto_depIdxs = []int32{
-	22,  // 0: agentflow.v1.NamedAgentRecord.record:type_name -> agentflow.v1.CommandRecord
-	8,   // 1: agentflow.v1.Hello.protocol:type_name -> agentflow.v1.ProtocolRange
-	0,   // 2: agentflow.v1.Hello.role:type_name -> agentflow.v1.Role
-	59,  // 3: agentflow.v1.Heartbeat.sent_at:type_name -> google.protobuf.Timestamp
-	60,  // 4: agentflow.v1.Snapshot.payload:type_name -> google.protobuf.Struct
-	59,  // 5: agentflow.v1.Event.occurred_at:type_name -> google.protobuf.Timestamp
-	60,  // 6: agentflow.v1.Event.payload:type_name -> google.protobuf.Struct
-	23,  // 7: agentflow.v1.Command.actor:type_name -> agentflow.v1.Actor
-	61,  // 8: agentflow.v1.Command.ttl:type_name -> google.protobuf.Duration
-	60,  // 9: agentflow.v1.Command.preconditions:type_name -> google.protobuf.Struct
-	60,  // 10: agentflow.v1.Command.payload:type_name -> google.protobuf.Struct
-	59,  // 11: agentflow.v1.Command.expires_at:type_name -> google.protobuf.Timestamp
-	17,  // 12: agentflow.v1.Command.workspace_ensure:type_name -> agentflow.v1.WorkspaceEnsure
-	15,  // 13: agentflow.v1.Command.worktree_create:type_name -> agentflow.v1.WorktreeCreate
-	57,  // 14: agentflow.v1.Command.agent_control:type_name -> agentflow.v1.AgentControl
-	19,  // 15: agentflow.v1.Command.submitted_request:type_name -> agentflow.v1.SubmitCommandRequest
-	33,  // 16: agentflow.v1.Command.session_ensure:type_name -> agentflow.v1.SessionEnsure
-	27,  // 17: agentflow.v1.Command.agent_start:type_name -> agentflow.v1.AgentStart
-	28,  // 18: agentflow.v1.Command.agent_stop:type_name -> agentflow.v1.AgentStop
-	59,  // 19: agentflow.v1.Command.execution_expires_at:type_name -> google.protobuf.Timestamp
-	61,  // 20: agentflow.v1.SubmitCommandRequest.ttl:type_name -> google.protobuf.Duration
-	17,  // 21: agentflow.v1.SubmitCommandRequest.workspace_ensure:type_name -> agentflow.v1.WorkspaceEnsure
-	15,  // 22: agentflow.v1.SubmitCommandRequest.worktree_create:type_name -> agentflow.v1.WorktreeCreate
-	57,  // 23: agentflow.v1.SubmitCommandRequest.agent_control:type_name -> agentflow.v1.AgentControl
-	33,  // 24: agentflow.v1.SubmitCommandRequest.session_ensure:type_name -> agentflow.v1.SessionEnsure
-	27,  // 25: agentflow.v1.SubmitCommandRequest.agent_start:type_name -> agentflow.v1.AgentStart
-	28,  // 26: agentflow.v1.SubmitCommandRequest.agent_stop:type_name -> agentflow.v1.AgentStop
-	1,   // 27: agentflow.v1.CommandAudit.status:type_name -> agentflow.v1.CommandStatus
-	59,  // 28: agentflow.v1.CommandAudit.occurred_at:type_name -> google.protobuf.Timestamp
-	14,  // 29: agentflow.v1.CommandRecord.command:type_name -> agentflow.v1.Command
-	1,   // 30: agentflow.v1.CommandRecord.status:type_name -> agentflow.v1.CommandStatus
-	59,  // 31: agentflow.v1.CommandRecord.created_at:type_name -> google.protobuf.Timestamp
-	59,  // 32: agentflow.v1.CommandRecord.updated_at:type_name -> google.protobuf.Timestamp
-	21,  // 33: agentflow.v1.CommandRecord.audit:type_name -> agentflow.v1.CommandAudit
-	18,  // 34: agentflow.v1.CommandRecord.workspace_ensure:type_name -> agentflow.v1.WorkspaceEnsureResult
-	16,  // 35: agentflow.v1.CommandRecord.worktree_create:type_name -> agentflow.v1.WorktreeCreateResult
-	58,  // 36: agentflow.v1.CommandRecord.agent_control:type_name -> agentflow.v1.AgentControlResult
-	36,  // 37: agentflow.v1.CommandRecord.session_ensure:type_name -> agentflow.v1.SessionView
-	31,  // 38: agentflow.v1.CommandRecord.agent_lifecycle:type_name -> agentflow.v1.AgentLifecycleReceipt
-	0,   // 39: agentflow.v1.Actor.role:type_name -> agentflow.v1.Role
-	2,   // 40: agentflow.v1.Actor.origin:type_name -> agentflow.v1.ActorOrigin
-	1,   // 41: agentflow.v1.CommandAck.status:type_name -> agentflow.v1.CommandStatus
-	1,   // 42: agentflow.v1.CommandResult.status:type_name -> agentflow.v1.CommandStatus
-	60,  // 43: agentflow.v1.CommandResult.payload:type_name -> google.protobuf.Struct
-	18,  // 44: agentflow.v1.CommandResult.workspace_ensure:type_name -> agentflow.v1.WorkspaceEnsureResult
-	16,  // 45: agentflow.v1.CommandResult.worktree_create:type_name -> agentflow.v1.WorktreeCreateResult
-	58,  // 46: agentflow.v1.CommandResult.agent_control:type_name -> agentflow.v1.AgentControlResult
-	36,  // 47: agentflow.v1.CommandResult.session_ensure:type_name -> agentflow.v1.SessionView
-	31,  // 48: agentflow.v1.CommandResult.agent_lifecycle:type_name -> agentflow.v1.AgentLifecycleReceipt
-	9,   // 49: agentflow.v1.NodeEnvelope.hello:type_name -> agentflow.v1.Hello
-	10,  // 50: agentflow.v1.NodeEnvelope.hello_ack:type_name -> agentflow.v1.HelloAck
-	11,  // 51: agentflow.v1.NodeEnvelope.heartbeat:type_name -> agentflow.v1.Heartbeat
-	12,  // 52: agentflow.v1.NodeEnvelope.snapshot:type_name -> agentflow.v1.Snapshot
-	13,  // 53: agentflow.v1.NodeEnvelope.event:type_name -> agentflow.v1.Event
-	14,  // 54: agentflow.v1.NodeEnvelope.command:type_name -> agentflow.v1.Command
-	24,  // 55: agentflow.v1.NodeEnvelope.command_ack:type_name -> agentflow.v1.CommandAck
-	25,  // 56: agentflow.v1.NodeEnvelope.command_result:type_name -> agentflow.v1.CommandResult
-	48,  // 57: agentflow.v1.NodeEnvelope.herdr_state:type_name -> agentflow.v1.HerdrState
-	54,  // 58: agentflow.v1.NodeEnvelope.agent_query:type_name -> agentflow.v1.AgentQuery
-	55,  // 59: agentflow.v1.NodeEnvelope.agent_query_result:type_name -> agentflow.v1.AgentQueryResult
-	56,  // 60: agentflow.v1.NodeEnvelope.agent_query_cancel:type_name -> agentflow.v1.AgentQueryCancel
-	41,  // 61: agentflow.v1.NodeEnvelope.project_config:type_name -> agentflow.v1.ProjectConfig
-	42,  // 62: agentflow.v1.NodeEnvelope.project_ack:type_name -> agentflow.v1.ProjectAck
-	45,  // 63: agentflow.v1.NodeEnvelope.legacy_projects:type_name -> agentflow.v1.LegacyProjects
-	37,  // 64: agentflow.v1.NodeEnvelope.session_inventory:type_name -> agentflow.v1.SessionInventory
-	32,  // 65: agentflow.v1.NodeEnvelope.command_progress:type_name -> agentflow.v1.CommandProgress
-	51,  // 66: agentflow.v1.AgentStop.target:type_name -> agentflow.v1.AgentTarget
-	51,  // 67: agentflow.v1.AgentLifecycleHandle.target:type_name -> agentflow.v1.AgentTarget
-	29,  // 68: agentflow.v1.AgentLifecycleReceipt.handle:type_name -> agentflow.v1.AgentLifecycleHandle
-	30,  // 69: agentflow.v1.AgentLifecycleReceipt.stages:type_name -> agentflow.v1.AgentLifecycleStage
-	31,  // 70: agentflow.v1.CommandProgress.agent_lifecycle:type_name -> agentflow.v1.AgentLifecycleReceipt
-	36,  // 71: agentflow.v1.SessionList.sessions:type_name -> agentflow.v1.SessionView
-	48,  // 72: agentflow.v1.SessionView.herdr:type_name -> agentflow.v1.HerdrState
-	59,  // 73: agentflow.v1.SessionView.herdr_received_at:type_name -> google.protobuf.Timestamp
-	36,  // 74: agentflow.v1.SessionInventory.sessions:type_name -> agentflow.v1.SessionView
-	59,  // 75: agentflow.v1.SessionInventory.observed_at:type_name -> google.protobuf.Timestamp
-	41,  // 76: agentflow.v1.ProjectRecord.desired:type_name -> agentflow.v1.ProjectConfig
-	42,  // 77: agentflow.v1.ProjectRecord.applied:type_name -> agentflow.v1.ProjectAck
-	43,  // 78: agentflow.v1.ProjectList.projects:type_name -> agentflow.v1.ProjectRecord
-	38,  // 79: agentflow.v1.LegacyProjects.projects:type_name -> agentflow.v1.RegisterProjectRequest
-	8,   // 80: agentflow.v1.ServerInfo.protocol:type_name -> agentflow.v1.ProtocolRange
-	59,  // 81: agentflow.v1.HerdrState.observed_at:type_name -> google.protobuf.Timestamp
-	47,  // 82: agentflow.v1.HerdrState.workspaces:type_name -> agentflow.v1.HerdrEntity
-	47,  // 83: agentflow.v1.HerdrState.tabs:type_name -> agentflow.v1.HerdrEntity
-	47,  // 84: agentflow.v1.HerdrState.panes:type_name -> agentflow.v1.HerdrEntity
-	47,  // 85: agentflow.v1.HerdrState.agents:type_name -> agentflow.v1.HerdrEntity
-	59,  // 86: agentflow.v1.NodeView.last_seen:type_name -> google.protobuf.Timestamp
-	48,  // 87: agentflow.v1.NodeView.herdr:type_name -> agentflow.v1.HerdrState
-	59,  // 88: agentflow.v1.NodeView.herdr_received_at:type_name -> google.protobuf.Timestamp
-	36,  // 89: agentflow.v1.NodeView.sessions:type_name -> agentflow.v1.SessionView
-	59,  // 90: agentflow.v1.NodeView.sessions_received_at:type_name -> google.protobuf.Timestamp
-	49,  // 91: agentflow.v1.NodeList.nodes:type_name -> agentflow.v1.NodeView
-	51,  // 92: agentflow.v1.AgentView.target:type_name -> agentflow.v1.AgentTarget
-	3,   // 93: agentflow.v1.AgentQueryRequest.kind:type_name -> agentflow.v1.AgentQueryKind
-	51,  // 94: agentflow.v1.AgentQueryRequest.target:type_name -> agentflow.v1.AgentTarget
-	53,  // 95: agentflow.v1.AgentQuery.request:type_name -> agentflow.v1.AgentQueryRequest
-	59,  // 96: agentflow.v1.AgentQuery.expires_at:type_name -> google.protobuf.Timestamp
-	52,  // 97: agentflow.v1.AgentQueryResult.agent:type_name -> agentflow.v1.AgentView
-	4,   // 98: agentflow.v1.AgentControl.action:type_name -> agentflow.v1.AgentControlAction
-	51,  // 99: agentflow.v1.AgentControl.target:type_name -> agentflow.v1.AgentTarget
-	51,  // 100: agentflow.v1.AgentControlResult.target:type_name -> agentflow.v1.AgentTarget
-	26,  // 101: agentflow.v1.NodeControl.Connect:input_type -> agentflow.v1.NodeEnvelope
-	62,  // 102: agentflow.v1.LocalObserver.GetInfo:input_type -> google.protobuf.Empty
-	62,  // 103: agentflow.v1.LocalObserver.WatchNodes:input_type -> google.protobuf.Empty
-	62,  // 104: agentflow.v1.Fleet.GetServerInfo:input_type -> google.protobuf.Empty
-	62,  // 105: agentflow.v1.Fleet.ListNodes:input_type -> google.protobuf.Empty
-	62,  // 106: agentflow.v1.Fleet.WatchNodes:input_type -> google.protobuf.Empty
-	19,  // 107: agentflow.v1.Fleet.SubmitCommand:input_type -> agentflow.v1.SubmitCommandRequest
-	20,  // 108: agentflow.v1.Fleet.GetCommand:input_type -> agentflow.v1.GetCommandRequest
-	53,  // 109: agentflow.v1.Fleet.QueryAgent:input_type -> agentflow.v1.AgentQueryRequest
-	38,  // 110: agentflow.v1.Fleet.RegisterProject:input_type -> agentflow.v1.RegisterProjectRequest
-	40,  // 111: agentflow.v1.Fleet.ListProjects:input_type -> agentflow.v1.ListProjectsRequest
-	39,  // 112: agentflow.v1.Fleet.GetProject:input_type -> agentflow.v1.GetProjectRequest
-	34,  // 113: agentflow.v1.Fleet.ListSessions:input_type -> agentflow.v1.ListSessionsRequest
-	6,   // 114: agentflow.v1.Fleet.ResolveNamedAgent:input_type -> agentflow.v1.ResolveNamedAgentRequest
-	26,  // 115: agentflow.v1.NodeControl.Connect:output_type -> agentflow.v1.NodeEnvelope
-	5,   // 116: agentflow.v1.LocalObserver.GetInfo:output_type -> agentflow.v1.ObserverInfo
-	50,  // 117: agentflow.v1.LocalObserver.WatchNodes:output_type -> agentflow.v1.NodeList
-	46,  // 118: agentflow.v1.Fleet.GetServerInfo:output_type -> agentflow.v1.ServerInfo
-	50,  // 119: agentflow.v1.Fleet.ListNodes:output_type -> agentflow.v1.NodeList
-	50,  // 120: agentflow.v1.Fleet.WatchNodes:output_type -> agentflow.v1.NodeList
-	22,  // 121: agentflow.v1.Fleet.SubmitCommand:output_type -> agentflow.v1.CommandRecord
-	22,  // 122: agentflow.v1.Fleet.GetCommand:output_type -> agentflow.v1.CommandRecord
-	55,  // 123: agentflow.v1.Fleet.QueryAgent:output_type -> agentflow.v1.AgentQueryResult
-	43,  // 124: agentflow.v1.Fleet.RegisterProject:output_type -> agentflow.v1.ProjectRecord
-	44,  // 125: agentflow.v1.Fleet.ListProjects:output_type -> agentflow.v1.ProjectList
-	43,  // 126: agentflow.v1.Fleet.GetProject:output_type -> agentflow.v1.ProjectRecord
-	35,  // 127: agentflow.v1.Fleet.ListSessions:output_type -> agentflow.v1.SessionList
-	7,   // 128: agentflow.v1.Fleet.ResolveNamedAgent:output_type -> agentflow.v1.NamedAgentRecord
-	115, // [115:129] is the sub-list for method output_type
-	101, // [101:115] is the sub-list for method input_type
-	101, // [101:101] is the sub-list for extension type_name
-	101, // [101:101] is the sub-list for extension extendee
-	0,   // [0:101] is the sub-list for field type_name
+	46,  // 0: agentflow.v1.ObserverInfo.coordinator:type_name -> agentflow.v1.ServerInfo
+	22,  // 1: agentflow.v1.NamedAgentRecord.record:type_name -> agentflow.v1.CommandRecord
+	8,   // 2: agentflow.v1.Hello.protocol:type_name -> agentflow.v1.ProtocolRange
+	0,   // 3: agentflow.v1.Hello.role:type_name -> agentflow.v1.Role
+	59,  // 4: agentflow.v1.Heartbeat.sent_at:type_name -> google.protobuf.Timestamp
+	60,  // 5: agentflow.v1.Snapshot.payload:type_name -> google.protobuf.Struct
+	59,  // 6: agentflow.v1.Event.occurred_at:type_name -> google.protobuf.Timestamp
+	60,  // 7: agentflow.v1.Event.payload:type_name -> google.protobuf.Struct
+	23,  // 8: agentflow.v1.Command.actor:type_name -> agentflow.v1.Actor
+	61,  // 9: agentflow.v1.Command.ttl:type_name -> google.protobuf.Duration
+	60,  // 10: agentflow.v1.Command.preconditions:type_name -> google.protobuf.Struct
+	60,  // 11: agentflow.v1.Command.payload:type_name -> google.protobuf.Struct
+	59,  // 12: agentflow.v1.Command.expires_at:type_name -> google.protobuf.Timestamp
+	17,  // 13: agentflow.v1.Command.workspace_ensure:type_name -> agentflow.v1.WorkspaceEnsure
+	15,  // 14: agentflow.v1.Command.worktree_create:type_name -> agentflow.v1.WorktreeCreate
+	57,  // 15: agentflow.v1.Command.agent_control:type_name -> agentflow.v1.AgentControl
+	19,  // 16: agentflow.v1.Command.submitted_request:type_name -> agentflow.v1.SubmitCommandRequest
+	33,  // 17: agentflow.v1.Command.session_ensure:type_name -> agentflow.v1.SessionEnsure
+	27,  // 18: agentflow.v1.Command.agent_start:type_name -> agentflow.v1.AgentStart
+	28,  // 19: agentflow.v1.Command.agent_stop:type_name -> agentflow.v1.AgentStop
+	59,  // 20: agentflow.v1.Command.execution_expires_at:type_name -> google.protobuf.Timestamp
+	61,  // 21: agentflow.v1.SubmitCommandRequest.ttl:type_name -> google.protobuf.Duration
+	17,  // 22: agentflow.v1.SubmitCommandRequest.workspace_ensure:type_name -> agentflow.v1.WorkspaceEnsure
+	15,  // 23: agentflow.v1.SubmitCommandRequest.worktree_create:type_name -> agentflow.v1.WorktreeCreate
+	57,  // 24: agentflow.v1.SubmitCommandRequest.agent_control:type_name -> agentflow.v1.AgentControl
+	33,  // 25: agentflow.v1.SubmitCommandRequest.session_ensure:type_name -> agentflow.v1.SessionEnsure
+	27,  // 26: agentflow.v1.SubmitCommandRequest.agent_start:type_name -> agentflow.v1.AgentStart
+	28,  // 27: agentflow.v1.SubmitCommandRequest.agent_stop:type_name -> agentflow.v1.AgentStop
+	1,   // 28: agentflow.v1.CommandAudit.status:type_name -> agentflow.v1.CommandStatus
+	59,  // 29: agentflow.v1.CommandAudit.occurred_at:type_name -> google.protobuf.Timestamp
+	14,  // 30: agentflow.v1.CommandRecord.command:type_name -> agentflow.v1.Command
+	1,   // 31: agentflow.v1.CommandRecord.status:type_name -> agentflow.v1.CommandStatus
+	59,  // 32: agentflow.v1.CommandRecord.created_at:type_name -> google.protobuf.Timestamp
+	59,  // 33: agentflow.v1.CommandRecord.updated_at:type_name -> google.protobuf.Timestamp
+	21,  // 34: agentflow.v1.CommandRecord.audit:type_name -> agentflow.v1.CommandAudit
+	18,  // 35: agentflow.v1.CommandRecord.workspace_ensure:type_name -> agentflow.v1.WorkspaceEnsureResult
+	16,  // 36: agentflow.v1.CommandRecord.worktree_create:type_name -> agentflow.v1.WorktreeCreateResult
+	58,  // 37: agentflow.v1.CommandRecord.agent_control:type_name -> agentflow.v1.AgentControlResult
+	36,  // 38: agentflow.v1.CommandRecord.session_ensure:type_name -> agentflow.v1.SessionView
+	31,  // 39: agentflow.v1.CommandRecord.agent_lifecycle:type_name -> agentflow.v1.AgentLifecycleReceipt
+	0,   // 40: agentflow.v1.Actor.role:type_name -> agentflow.v1.Role
+	2,   // 41: agentflow.v1.Actor.origin:type_name -> agentflow.v1.ActorOrigin
+	1,   // 42: agentflow.v1.CommandAck.status:type_name -> agentflow.v1.CommandStatus
+	1,   // 43: agentflow.v1.CommandResult.status:type_name -> agentflow.v1.CommandStatus
+	60,  // 44: agentflow.v1.CommandResult.payload:type_name -> google.protobuf.Struct
+	18,  // 45: agentflow.v1.CommandResult.workspace_ensure:type_name -> agentflow.v1.WorkspaceEnsureResult
+	16,  // 46: agentflow.v1.CommandResult.worktree_create:type_name -> agentflow.v1.WorktreeCreateResult
+	58,  // 47: agentflow.v1.CommandResult.agent_control:type_name -> agentflow.v1.AgentControlResult
+	36,  // 48: agentflow.v1.CommandResult.session_ensure:type_name -> agentflow.v1.SessionView
+	31,  // 49: agentflow.v1.CommandResult.agent_lifecycle:type_name -> agentflow.v1.AgentLifecycleReceipt
+	9,   // 50: agentflow.v1.NodeEnvelope.hello:type_name -> agentflow.v1.Hello
+	10,  // 51: agentflow.v1.NodeEnvelope.hello_ack:type_name -> agentflow.v1.HelloAck
+	11,  // 52: agentflow.v1.NodeEnvelope.heartbeat:type_name -> agentflow.v1.Heartbeat
+	12,  // 53: agentflow.v1.NodeEnvelope.snapshot:type_name -> agentflow.v1.Snapshot
+	13,  // 54: agentflow.v1.NodeEnvelope.event:type_name -> agentflow.v1.Event
+	14,  // 55: agentflow.v1.NodeEnvelope.command:type_name -> agentflow.v1.Command
+	24,  // 56: agentflow.v1.NodeEnvelope.command_ack:type_name -> agentflow.v1.CommandAck
+	25,  // 57: agentflow.v1.NodeEnvelope.command_result:type_name -> agentflow.v1.CommandResult
+	48,  // 58: agentflow.v1.NodeEnvelope.herdr_state:type_name -> agentflow.v1.HerdrState
+	54,  // 59: agentflow.v1.NodeEnvelope.agent_query:type_name -> agentflow.v1.AgentQuery
+	55,  // 60: agentflow.v1.NodeEnvelope.agent_query_result:type_name -> agentflow.v1.AgentQueryResult
+	56,  // 61: agentflow.v1.NodeEnvelope.agent_query_cancel:type_name -> agentflow.v1.AgentQueryCancel
+	41,  // 62: agentflow.v1.NodeEnvelope.project_config:type_name -> agentflow.v1.ProjectConfig
+	42,  // 63: agentflow.v1.NodeEnvelope.project_ack:type_name -> agentflow.v1.ProjectAck
+	45,  // 64: agentflow.v1.NodeEnvelope.legacy_projects:type_name -> agentflow.v1.LegacyProjects
+	37,  // 65: agentflow.v1.NodeEnvelope.session_inventory:type_name -> agentflow.v1.SessionInventory
+	32,  // 66: agentflow.v1.NodeEnvelope.command_progress:type_name -> agentflow.v1.CommandProgress
+	51,  // 67: agentflow.v1.AgentStop.target:type_name -> agentflow.v1.AgentTarget
+	51,  // 68: agentflow.v1.AgentLifecycleHandle.target:type_name -> agentflow.v1.AgentTarget
+	29,  // 69: agentflow.v1.AgentLifecycleReceipt.handle:type_name -> agentflow.v1.AgentLifecycleHandle
+	30,  // 70: agentflow.v1.AgentLifecycleReceipt.stages:type_name -> agentflow.v1.AgentLifecycleStage
+	31,  // 71: agentflow.v1.CommandProgress.agent_lifecycle:type_name -> agentflow.v1.AgentLifecycleReceipt
+	36,  // 72: agentflow.v1.SessionList.sessions:type_name -> agentflow.v1.SessionView
+	48,  // 73: agentflow.v1.SessionView.herdr:type_name -> agentflow.v1.HerdrState
+	59,  // 74: agentflow.v1.SessionView.herdr_received_at:type_name -> google.protobuf.Timestamp
+	36,  // 75: agentflow.v1.SessionInventory.sessions:type_name -> agentflow.v1.SessionView
+	59,  // 76: agentflow.v1.SessionInventory.observed_at:type_name -> google.protobuf.Timestamp
+	41,  // 77: agentflow.v1.ProjectRecord.desired:type_name -> agentflow.v1.ProjectConfig
+	42,  // 78: agentflow.v1.ProjectRecord.applied:type_name -> agentflow.v1.ProjectAck
+	43,  // 79: agentflow.v1.ProjectList.projects:type_name -> agentflow.v1.ProjectRecord
+	38,  // 80: agentflow.v1.LegacyProjects.projects:type_name -> agentflow.v1.RegisterProjectRequest
+	8,   // 81: agentflow.v1.ServerInfo.protocol:type_name -> agentflow.v1.ProtocolRange
+	59,  // 82: agentflow.v1.HerdrState.observed_at:type_name -> google.protobuf.Timestamp
+	47,  // 83: agentflow.v1.HerdrState.workspaces:type_name -> agentflow.v1.HerdrEntity
+	47,  // 84: agentflow.v1.HerdrState.tabs:type_name -> agentflow.v1.HerdrEntity
+	47,  // 85: agentflow.v1.HerdrState.panes:type_name -> agentflow.v1.HerdrEntity
+	47,  // 86: agentflow.v1.HerdrState.agents:type_name -> agentflow.v1.HerdrEntity
+	59,  // 87: agentflow.v1.NodeView.last_seen:type_name -> google.protobuf.Timestamp
+	48,  // 88: agentflow.v1.NodeView.herdr:type_name -> agentflow.v1.HerdrState
+	59,  // 89: agentflow.v1.NodeView.herdr_received_at:type_name -> google.protobuf.Timestamp
+	36,  // 90: agentflow.v1.NodeView.sessions:type_name -> agentflow.v1.SessionView
+	59,  // 91: agentflow.v1.NodeView.sessions_received_at:type_name -> google.protobuf.Timestamp
+	49,  // 92: agentflow.v1.NodeList.nodes:type_name -> agentflow.v1.NodeView
+	51,  // 93: agentflow.v1.AgentView.target:type_name -> agentflow.v1.AgentTarget
+	3,   // 94: agentflow.v1.AgentQueryRequest.kind:type_name -> agentflow.v1.AgentQueryKind
+	51,  // 95: agentflow.v1.AgentQueryRequest.target:type_name -> agentflow.v1.AgentTarget
+	53,  // 96: agentflow.v1.AgentQuery.request:type_name -> agentflow.v1.AgentQueryRequest
+	59,  // 97: agentflow.v1.AgentQuery.expires_at:type_name -> google.protobuf.Timestamp
+	52,  // 98: agentflow.v1.AgentQueryResult.agent:type_name -> agentflow.v1.AgentView
+	4,   // 99: agentflow.v1.AgentControl.action:type_name -> agentflow.v1.AgentControlAction
+	51,  // 100: agentflow.v1.AgentControl.target:type_name -> agentflow.v1.AgentTarget
+	51,  // 101: agentflow.v1.AgentControlResult.target:type_name -> agentflow.v1.AgentTarget
+	26,  // 102: agentflow.v1.NodeControl.Connect:input_type -> agentflow.v1.NodeEnvelope
+	62,  // 103: agentflow.v1.LocalObserver.GetInfo:input_type -> google.protobuf.Empty
+	62,  // 104: agentflow.v1.LocalObserver.WatchNodes:input_type -> google.protobuf.Empty
+	62,  // 105: agentflow.v1.Fleet.GetServerInfo:input_type -> google.protobuf.Empty
+	62,  // 106: agentflow.v1.Fleet.ListNodes:input_type -> google.protobuf.Empty
+	62,  // 107: agentflow.v1.Fleet.WatchNodes:input_type -> google.protobuf.Empty
+	19,  // 108: agentflow.v1.Fleet.SubmitCommand:input_type -> agentflow.v1.SubmitCommandRequest
+	20,  // 109: agentflow.v1.Fleet.GetCommand:input_type -> agentflow.v1.GetCommandRequest
+	53,  // 110: agentflow.v1.Fleet.QueryAgent:input_type -> agentflow.v1.AgentQueryRequest
+	38,  // 111: agentflow.v1.Fleet.RegisterProject:input_type -> agentflow.v1.RegisterProjectRequest
+	40,  // 112: agentflow.v1.Fleet.ListProjects:input_type -> agentflow.v1.ListProjectsRequest
+	39,  // 113: agentflow.v1.Fleet.GetProject:input_type -> agentflow.v1.GetProjectRequest
+	34,  // 114: agentflow.v1.Fleet.ListSessions:input_type -> agentflow.v1.ListSessionsRequest
+	6,   // 115: agentflow.v1.Fleet.ResolveNamedAgent:input_type -> agentflow.v1.ResolveNamedAgentRequest
+	26,  // 116: agentflow.v1.NodeControl.Connect:output_type -> agentflow.v1.NodeEnvelope
+	5,   // 117: agentflow.v1.LocalObserver.GetInfo:output_type -> agentflow.v1.ObserverInfo
+	50,  // 118: agentflow.v1.LocalObserver.WatchNodes:output_type -> agentflow.v1.NodeList
+	46,  // 119: agentflow.v1.Fleet.GetServerInfo:output_type -> agentflow.v1.ServerInfo
+	50,  // 120: agentflow.v1.Fleet.ListNodes:output_type -> agentflow.v1.NodeList
+	50,  // 121: agentflow.v1.Fleet.WatchNodes:output_type -> agentflow.v1.NodeList
+	22,  // 122: agentflow.v1.Fleet.SubmitCommand:output_type -> agentflow.v1.CommandRecord
+	22,  // 123: agentflow.v1.Fleet.GetCommand:output_type -> agentflow.v1.CommandRecord
+	55,  // 124: agentflow.v1.Fleet.QueryAgent:output_type -> agentflow.v1.AgentQueryResult
+	43,  // 125: agentflow.v1.Fleet.RegisterProject:output_type -> agentflow.v1.ProjectRecord
+	44,  // 126: agentflow.v1.Fleet.ListProjects:output_type -> agentflow.v1.ProjectList
+	43,  // 127: agentflow.v1.Fleet.GetProject:output_type -> agentflow.v1.ProjectRecord
+	35,  // 128: agentflow.v1.Fleet.ListSessions:output_type -> agentflow.v1.SessionList
+	7,   // 129: agentflow.v1.Fleet.ResolveNamedAgent:output_type -> agentflow.v1.NamedAgentRecord
+	116, // [116:130] is the sub-list for method output_type
+	102, // [102:116] is the sub-list for method input_type
+	102, // [102:102] is the sub-list for extension type_name
+	102, // [102:102] is the sub-list for extension extendee
+	0,   // [0:102] is the sub-list for field type_name
 }
 
 func init() { file_agentflow_v1_control_proto_init() }

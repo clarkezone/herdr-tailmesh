@@ -1,7 +1,7 @@
 # Herdr mesh visualizer
 
 A standalone Rust viewer for the managed Herdr mesh daemon. The first cut draws
-a spatial node → session → workspace → agent tree using GPU
+a spatial coordinator → node → session → workspace → agent tree using GPU
 text and lines, with selection, expand/collapse and vertical scrolling (wheel or
 middle-button drag). Children stack beneath their parents with a rightward
 indent that adapts to the available width; long labels wrap into taller rows.
@@ -20,6 +20,31 @@ are not individually morphed. Scrolling follows input directly.
 It opens even when the daemon is offline, reconnects automatically, and retains
 the last good observations while disconnected. Receipt timestamps become stale
 after 30 seconds; a quiet, healthy stream remains connected.
+
+The logical coordinator root shows the verified upstream instance ID/version,
+separately from the local serving daemon. Its execution role remains an ordinary
+node, counted once. Older observers show an explicit unknown coordinator root.
+Coordinator data is an optional property of the existing observation response;
+the service, RPC methods and API version remain unchanged. Rebuild/restart the
+Go daemon as well as the viewer to obtain verified coordinator metadata.
+
+Newly observed advancing node last-seen timestamps trigger a 3 second eased
+purple heartbeat pulse from the child junction, through the node, up to the
+coordinator. Pulses follow moving connectors, use a compact root/legend cue when
+paths are hidden, and clear on disconnect. Initial snapshots, reconnects,
+duplicates and invalid/future timestamps do not replay activity. The stream
+coalesces snapshots, so this is observed heartbeat receipt rather than a
+lossless animation of every heartbeat. Node rows/details show last-seen age.
+
+Fleet pulse cards above the tree show connected nodes, fresh Herdr nodes,
+reported workspaces, total agents across workspaces (including idle/unknown and
+unresolved placement), and agents working/blocked/done. Fresh inventory follows
+the dashboard's session/readiness/30-second rules; the control root and orphan
+workspace placeholders do not inflate counts. Default/named contexts remain
+scoped observations. Unavailable live counts show em dashes with explicitly
+last-known notes; a valid empty live fleet shows zero. Cards wrap and animate
+their layout over 400 ms. Summary/overview scrolling stays separate from tree
+scrolling; the overview and narrow observation pane are bounded on short windows.
 
 The native winit/wgpu/egui-wgpu shell is adapted from
 [clarkezone/wgputests](https://github.com/clarkezone/wgputests/tree/56551e298420764e43d6851efc9a2702273af0e1)
