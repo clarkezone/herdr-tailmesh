@@ -28,13 +28,18 @@ struct Service {
     api: u32,
     receiver: FixtureStreams,
     calls: Arc<AtomicUsize>,
+    coordinator: Arc<Mutex<Option<pb::ServerInfo>>>,
 }
 #[tonic::async_trait]
 impl LocalObserver for Service {
     async fn get_info(&self, _: Request<()>) -> Result<Response<pb::ObserverInfo>, Status> {
+        if self.api == u32::MAX {
+            return Err(Status::resource_exhausted("fixture capacity"));
+        }
         Ok(Response::new(pb::ObserverInfo {
             api_version: self.api,
             daemon_name: "fixture".into(),
+            coordinator: self.coordinator.lock().unwrap().clone(),
         }))
     }
     type WatchNodesStream = Pin<Box<dyn Stream<Item = Result<pb::NodeList, Status>> + Send>>;
@@ -58,6 +63,7 @@ struct Fixture {
     calls: Arc<AtomicUsize>,
     receiver: FixtureStreams,
     stop: Option<oneshot::Sender<()>>,
+    coordinator: Arc<Mutex<Option<pb::ServerInfo>>>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -73,10 +79,12 @@ async fn fixture(api: u32) -> Fixture {
     let calls = Arc::new(AtomicUsize::new(0));
     let (stop, stopped) = oneshot::channel();
     let receiver = Arc::new(Mutex::new(VecDeque::from([rx])));
+    let coordinator = Arc::new(Mutex::new(None));
     let service = Service {
         api,
         receiver: receiver.clone(),
         calls: calls.clone(),
+        coordinator: coordinator.clone(),
     };
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -96,6 +104,7 @@ async fn fixture(api: u32) -> Fixture {
         calls,
         receiver,
         stop: Some(stop),
+        coordinator,
     }
 }
 
@@ -225,6 +234,13 @@ async fn missing_first_snapshot_has_a_deadline() {
 }
 #[tokio::test]
 async fn wrong_api_and_oversized_snapshot_are_rejected() {
+    let busy = fixture(u32::MAX).await;
+    assert!(
+        client::check(busy.port)
+            .await
+            .unwrap_err()
+            .contains("capacity")
+    );
     let f = fixture(2).await;
     assert!(
         client::check(f.port)
@@ -244,4 +260,56 @@ async fn wrong_api_and_oversized_snapshot_are_rejected() {
             .unwrap_err()
             .contains("size limit")
     );
+}
+
+#[tokio::test]
+async fn coordinator_properties_follow_accepted_scene_not_pending_handshake() {
+    let f = fixture(1).await;
+    *f.coordinator.lock().unwrap() = Some(pb::ServerInfo {
+        instance_id: "first-coordinator".into(),
+        ..Default::default()
+    });
+    let (next_tx, next_rx) = mpsc::channel(4);
+    f.receiver.lock().unwrap().push_back(next_rx);
+    f.tx.send(Ok(pb::NodeList {
+        nodes: vec![node("same-node")],
+    }))
+    .await
+    .unwrap();
+    let shared = Shared::new(|| {});
+    let (stop, rx) = watch::channel(false);
+    let worker = tokio::spawn(client::run(f.port, shared.clone(), rx));
+    until(|| shared.read().live).await;
+    let first = shared.read();
+    let original = first.scene.unwrap();
+    assert_eq!(
+        original.coordinator.as_ref().unwrap().label,
+        "first-coordinator"
+    );
+    *f.coordinator.lock().unwrap() = Some(pb::ServerInfo {
+        instance_id: "second-coordinator".into(),
+        ..Default::default()
+    });
+    f.tx.send(Err(Status::deadline_exceeded("lease expired")))
+        .await
+        .unwrap();
+    until(|| shared.read().epoch > first.epoch).await;
+    let pending = shared.read();
+    assert!(!pending.live);
+    assert!(Arc::ptr_eq(&original, &pending.scene.unwrap()));
+    next_tx
+        .send(Ok(pb::NodeList {
+            nodes: vec![node("same-node")],
+        }))
+        .await
+        .unwrap();
+    until(|| shared.read().live).await;
+    let accepted = shared.read();
+    assert!(accepted.revision > first.revision);
+    assert_eq!(
+        accepted.scene.unwrap().coordinator.as_ref().unwrap().label,
+        "second-coordinator"
+    );
+    stop.send(true).unwrap();
+    worker.await.unwrap();
 }

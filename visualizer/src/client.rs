@@ -1,6 +1,6 @@
 use crate::{
     pb::local_observer_client::LocalObserverClient,
-    projection::{Scene, project},
+    projection::{Scene, coordinator, project},
 };
 use std::sync::{
     Arc, Mutex,
@@ -21,6 +21,8 @@ pub struct View {
     pub daemon: String,
     pub scene: Option<Arc<Scene>>,
     pub received: Option<Instant>,
+    pub epoch: u64,
+    pub revision: u64,
 }
 impl Default for View {
     fn default() -> Self {
@@ -30,6 +32,8 @@ impl Default for View {
             daemon: String::new(),
             scene: None,
             received: None,
+            epoch: 0,
+            revision: 0,
         }
     }
 }
@@ -59,7 +63,13 @@ impl Shared {
 }
 async fn connect(
     port: u16,
-) -> Result<(LocalObserverClient<tonic::transport::Channel>, String), String> {
+) -> Result<
+    (
+        LocalObserverClient<tonic::transport::Channel>,
+        crate::pb::ObserverInfo,
+    ),
+    String,
+> {
     let channel = Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
         .unwrap()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -71,7 +81,16 @@ async fn connect(
     let info = tokio::time::timeout(CONNECT_TIMEOUT, client.get_info(()))
         .await
         .map_err(|_| "Local endpoint did not answer the observer handshake".to_string())?
-        .map_err(|_| "Incompatible local endpoint — expected LocalObserver API 1".to_string())?
+        .map_err(|e| match e.code() {
+            Code::ResourceExhausted => {
+                "Observer information capacity reached; retrying".to_string()
+            }
+            Code::DeadlineExceeded => {
+                "Local endpoint did not answer the observer handshake".to_string()
+            }
+            Code::Unavailable => "Local observer temporarily unavailable; retrying".to_string(),
+            _ => "Incompatible local endpoint — expected LocalObserver API 1".to_string(),
+        })?
         .into_inner();
     if info.api_version != 1 {
         return Err(format!(
@@ -79,7 +98,7 @@ async fn connect(
             info.api_version
         ));
     }
-    Ok((client, crate::projection::label(&info.daemon_name)))
+    Ok((client, info))
 }
 fn rpc_error(code: Code) -> String {
     match code {
@@ -93,9 +112,10 @@ fn rpc_error(code: Code) -> String {
     .into()
 }
 async fn observe(port: u16, shared: &Shared) -> Result<(), String> {
-    let (mut client, name) = connect(port).await?;
+    let (mut client, info) = connect(port).await?;
     shared.update(|v| {
-        v.daemon = name;
+        v.daemon = crate::projection::label(&info.daemon_name);
+        v.epoch = v.epoch.wrapping_add(1);
         v.live = false;
         v.status = "Local daemon connected; waiting for mesh snapshot…".into();
     });
@@ -118,13 +138,16 @@ async fn observe(port: u16, shared: &Shared) -> Result<(), String> {
         let snapshot = next
             .map_err(|e| rpc_error(e.code()))?
             .ok_or_else(|| "Observation stream ended; reconnecting".to_string())?;
-        let scene = Arc::new(project(snapshot).map_err(|_| {
+        let mut scene = project(snapshot).map_err(|_| {
             "Invalid replacement snapshot — retaining last good observations".to_string()
-        })?);
+        })?;
+        scene.coordinator = Some(coordinator(info.coordinator.as_ref()));
+        let scene = Arc::new(scene);
         shared.update(|v| {
             v.scene = Some(scene);
             v.received = Some(Instant::now());
             v.live = true;
+            v.revision = v.revision.wrapping_add(1);
             v.status = "Live mesh observation stream".into();
         });
         first = false;
@@ -153,7 +176,7 @@ pub async fn run(port: u16, shared: Arc<Shared>, mut shutdown: watch::Receiver<b
 
 /// Headless wire-contract check; shares the viewer's handshake and decode path.
 pub async fn check(port: u16) -> Result<Scene, String> {
-    let (mut client, _) = connect(port).await?;
+    let (mut client, info) = connect(port).await?;
     let mut request = Request::new(());
     request.set_timeout(FIRST_SNAPSHOT_TIMEOUT);
     let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, client.watch_nodes(request))
@@ -166,5 +189,7 @@ pub async fn check(port: u16) -> Result<Scene, String> {
         .map_err(|_| "First snapshot timed out".to_string())?
         .map_err(|e| rpc_error(e.code()))?
         .ok_or_else(|| "Empty stream".to_string())?;
-    project(snapshot)
+    let mut scene = project(snapshot)?;
+    scene.coordinator = Some(coordinator(info.coordinator.as_ref()));
+    Ok(scene)
 }

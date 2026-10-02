@@ -8,7 +8,10 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	pb "github.com/clarkezone/herdr-distributed-mesh/src/gen/agentflow/v1"
 	"google.golang.org/grpc"
@@ -46,16 +49,33 @@ type observer struct {
 	name    string
 	fleet   pb.FleetClient
 	watches chan struct{}
+	infos   chan struct{}
 }
 
 func newObserver(upstream grpc.ClientConnInterface, name string) *grpc.Server {
 	server := grpc.NewServer(grpc.MaxRecvMsgSize(1024), grpc.MaxSendMsgSize(maxResponse), grpc.MaxConcurrentStreams(16))
-	pb.RegisterLocalObserverServer(server, &observer{name: name, fleet: pb.NewFleetClient(upstream), watches: make(chan struct{}, 4)})
+	pb.RegisterLocalObserverServer(server, &observer{name: name, fleet: pb.NewFleetClient(upstream), watches: make(chan struct{}, 4), infos: make(chan struct{}, 4)})
 	return server
 }
 
-func (o *observer) GetInfo(context.Context, *emptypb.Empty) (*pb.ObserverInfo, error) {
-	return &pb.ObserverInfo{ApiVersion: 1, DaemonName: o.name}, nil
+func (o *observer) GetInfo(ctx context.Context, _ *emptypb.Empty) (*pb.ObserverInfo, error) {
+	info := &pb.ObserverInfo{ApiVersion: 1, DaemonName: o.name}
+	if !acquire(o.infos) {
+		return nil, status.Error(codes.ResourceExhausted, "local observer info capacity reached")
+	}
+	defer release(o.infos)
+	ctx, cancel := context.WithTimeout(metadata.NewOutgoingContext(ctx, metadata.MD{}), time.Second)
+	defer cancel()
+	remote, err := o.fleet.GetServerInfo(ctx, &emptypb.Empty{}, grpc.MaxCallRecvMsgSize(64*1024))
+	if err == nil && remote.GetInstanceId() != "" && len(remote.GetInstanceId()) <= 128 && utf8.ValidString(remote.GetInstanceId()) && strings.IndexFunc(remote.GetInstanceId(), unicode.IsControl) < 0 {
+		// Only copy observation properties; never forward arbitrary capabilities
+		// or diagnostics. The local endpoint still identifies itself when offline.
+		info.Coordinator = &pb.ServerInfo{InstanceId: remote.GetInstanceId()}
+		if len(remote.GetImplementationVersion()) <= 256 {
+			info.Coordinator.ImplementationVersion = remote.GetImplementationVersion()
+		}
+	}
+	return info, nil
 }
 
 func (o *observer) WatchNodes(_ *emptypb.Empty, stream grpc.ServerStreamingServer[pb.NodeList]) error {

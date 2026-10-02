@@ -2,7 +2,8 @@ use crate::animation::{DURATION, Motion, ease_in_out};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use herdr_mesh_visualizer::{
     client::View,
-    projection::{Branch, Key, Scene, now},
+    heartbeat::{Pulses, Stamp},
+    projection::{Branch, Key, Scene, wall_now},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -18,6 +19,10 @@ pub struct UiState {
     initialized: bool,
     details_key: Option<Key>,
     canvas_origin: Option<Pos2>,
+    source: Option<Key>,
+    epoch: u64,
+    pulses: Pulses,
+    fleet_panel: crate::fleet_panel::FleetPanel,
 }
 struct AnimatedRow {
     motion: Motion,
@@ -73,7 +78,7 @@ fn layout_rows(
     width: f32,
     painter: &egui::Painter,
     live: bool,
-    time: i64,
+    time: Stamp,
 ) -> Vec<PositionedRow> {
     let max_depth = rows.iter().map(|r| r.depth).max().unwrap_or(0);
     let indent = indent_for_width(width, max_depth);
@@ -93,12 +98,8 @@ fn layout_rows(
             let status = painter.layout(
                 format!(
                     "{} · {}",
-                    r.branch.status,
-                    if live {
-                        r.branch.freshness.label(time)
-                    } else {
-                        "last known"
-                    }
+                    status_label(r.branch, time),
+                    freshness_label(r.branch, live, time)
                 ),
                 egui::FontId::proportional(12.),
                 Color32::WHITE,
@@ -114,6 +115,46 @@ fn layout_rows(
             }
         })
         .collect()
+}
+
+fn has_children(branch: &Branch, scene: &Scene) -> bool {
+    !branch.children.is_empty() || branch.kind == "coordinator" && !scene.nodes.is_empty()
+}
+fn status_label(branch: &Branch, time: Stamp) -> String {
+    if branch.kind != "node" {
+        return branch.status.clone();
+    }
+    let age = match branch.last_seen {
+        None => "last seen unknown".into(),
+        Some(t) if t > time => "last seen unknown (clock ahead)".into(),
+        Some(t) => format!(
+            "last seen {}s ago",
+            (time.nanos() - t.nanos()) / 1_000_000_000
+        ),
+    };
+    format!("{} · {age}", branch.status)
+}
+fn contained(mut rect: Rect, width: f32) -> Rect {
+    rect.min.x = rect.min.x.clamp(0., width);
+    rect.max.x = rect.max.x.clamp(rect.min.x, width);
+    rect
+}
+fn connector(parent: Rect, node: Rect) -> [Pos2; 3] {
+    let start = Pos2::new((parent.min.x + 6.).min(parent.max.x), parent.max.y - 4.);
+    let end = Pos2::new((node.min.x + 6.).min(node.max.x), node.min.y + 10.);
+    [start, Pos2::new(start.x, end.y), end]
+}
+fn point_on_path(points: &[Pos2], progress: f32) -> Pos2 {
+    let total: f32 = points.windows(2).map(|p| p[0].distance(p[1])).sum();
+    let mut distance = total * progress.clamp(0., 1.);
+    for pair in points.windows(2) {
+        let length = pair[0].distance(pair[1]);
+        if length > 0. && distance <= length {
+            return pair[0].lerp(pair[1], distance / length);
+        }
+        distance -= length;
+    }
+    *points.last().unwrap_or(&Pos2::ZERO)
 }
 
 fn row_label(branch: &Branch) -> String {
@@ -145,13 +186,25 @@ fn keys(branches: &[Branch], set: &mut HashSet<Key>) {
         keys(&b.children, set);
     }
 }
-fn color(b: &Branch, live: bool, time: i64) -> Color32 {
-    if !live || b.freshness.label(time) != "live" {
+fn freshness_label(branch: &Branch, live: bool, time: Stamp) -> &'static str {
+    if !live {
+        "last known"
+    } else if branch.kind == "coordinator" {
+        "control connection live"
+    } else {
+        branch.freshness.label_at(time)
+    }
+}
+fn color(b: &Branch, live: bool, time: Stamp) -> Color32 {
+    if live && b.kind == "coordinator" && b.status == "verified upstream identity" {
+        return Color32::from_rgb(99, 216, 239);
+    }
+    if !live || b.freshness.label_at(time) != "live" {
         return Color32::from_rgb(142, 150, 168);
     }
     match b.status.as_str() {
         "blocked" => Color32::from_rgb(255, 171, 90),
-        "working" => Color32::from_rgb(99, 216, 239),
+        "working" => Color32::from_rgb(139, 188, 255),
         "offline" | "unavailable" => Color32::from_rgb(231, 111, 131),
         _ => Color32::from_rgb(165, 226, 182),
     }
@@ -184,6 +237,40 @@ impl UiState {
 
     fn draw_contents(&mut self, ui: &mut egui::Ui, view: &View, port: u16) -> Option<Rect> {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        let time = wall_now();
+        if let Some(scene) = &view.scene {
+            let source = scene.coordinator.as_ref().map(|b| b.key.clone());
+            if source != self.source
+                || source
+                    .as_ref()
+                    .is_some_and(|k| k.last().is_some_and(|id| id == "unknown"))
+                    && self.epoch != view.epoch
+            {
+                self.selected = None;
+                self.collapsed.clear();
+                self.animated.clear();
+                self.initialized = false;
+                self.details_key = None;
+                self.canvas_origin = None;
+                self.scroll_offset = 0.;
+            }
+            self.source = source;
+            self.epoch = view.epoch;
+            self.pulses.update(
+                scene,
+                view.live,
+                view.epoch,
+                view.revision,
+                wall_now(),
+                ui.input(|i| i.time),
+            );
+        }
+        // Bound the entire overview as well as its cards: wrapped connection,
+        // legends and project text must leave a usable tree on short windows.
+        let available_height = ui.available_height().max(0.);
+        let overview_height =
+            (available_height * if available_height < 400. { 0.45 } else { 0.55 }).max(1.);
+        egui::ScrollArea::vertical().id_salt("mesh-overview").max_height(overview_height).auto_shrink([false, true]).show(ui, |ui| {
         ui.heading("Herdr mesh");
         ui.label(format!(
             "127.0.0.1:{port} · {} · {}",
@@ -194,46 +281,13 @@ impl UiState {
             },
             view.status
         ));
-        let Some(scene) = &view.scene else {
-            ui.add_space(40.);
-            ui.label(
-                "Waiting for observations. The window stays available while the daemon is offline.",
-            );
-            return None;
-        };
-        let time = now();
-        let stale = scene
-            .nodes
-            .iter()
-            .flat_map(|n| n.children.iter())
-            .any(|s| s.freshness.label(time) != "live");
-        let fresh_nodes = if view.live {
-            scene
-                .nodes
-                .iter()
-                .filter(|n| n.children.iter().any(|s| s.freshness.label(time) == "live"))
-                .count()
-        } else {
-            0
-        };
-        ui.label(format!(
-            "{} connected nodes · {} with fresh Herdr observations · {} observed agents · {} working · {} blocked{}",
-            scene.connected,
-            fresh_nodes,
-            scene.agents,
-            scene.working,
-            scene.blocked,
-            if !view.live || stale {
-                " · counts include last-known observations"
-            } else {
-                ""
-            }
-        ));
+        self.fleet_panel.draw(ui, view);
+            if let Some(scene) = &view.scene {
         if let Some(received) = view.received {
             ui.small(format!("Last snapshot {}s ago · expand/collapse with the branch marker · select text for details · wheel to scroll · middle-drag to scroll vertically",received.elapsed().as_secs()));
         }
         ui.horizontal_wrapped(|ui| {
-            ui.colored_label(Color32::from_rgb(99, 216, 239), "● working");
+            ui.colored_label(Color32::from_rgb(139, 188, 255), "● working");
             ui.colored_label(Color32::from_rgb(255, 171, 90), "● blocked");
             ui.colored_label(
                 Color32::from_rgb(142, 150, 168),
@@ -253,8 +307,26 @@ impl UiState {
                     });
                 });
         }
+            }
+        });
+        let Some(scene) = &view.scene else {
+            ui.add_space(16.);
+            ui.label(
+                "Waiting for observations. The window stays available while the daemon is offline.",
+            );
+            return None;
+        };
+        ui.label(egui::RichText::new(if self.pulses.is_active() {
+            "● Heartbeat receipt"
+        } else {
+            "○ Heartbeat receipt"
+        }).small().color(Color32::from_rgb(218, 175, 255)))
+        .on_hover_text("Newly observed node last-seen advances travel to the coordinator. Snapshots coalesce receipts; initial and reconnect baselines do not replay activity.");
         let mut valid = HashSet::new();
         keys(&scene.nodes, &mut valid);
+        if let Some(root) = &scene.coordinator {
+            valid.insert(root.key.clone());
+        }
         self.collapsed.retain(|k| valid.contains(k));
         if self
             .selected
@@ -323,7 +395,10 @@ impl UiState {
             Some(details_rect)
         } else {
             let (region, _) = ui.allocate_exact_size(
-                Vec2::new(ui.available_width(), 180. * progress),
+                Vec2::new(
+                    ui.available_width(),
+                    180_f32.min(ui.available_height().max(0.) * 0.4) * progress,
+                ),
                 Sense::hover(),
             );
             let full_rect = Rect::from_min_size(region.min, Vec2::new(region.width(), 180.));
@@ -348,10 +423,13 @@ impl UiState {
         }
     }
 
-    fn draw_tree(&mut self, ui: &mut egui::Ui, scene: &Scene, live: bool, time: i64) {
+    fn draw_tree(&mut self, ui: &mut egui::Ui, scene: &Scene, live: bool, time: Stamp) {
         let mut pan_delta = 0.;
+        let viewport_height = ui.available_height().max(0.);
         let output = egui::ScrollArea::vertical()
             .id_salt("mesh-canvas")
+            .max_height(viewport_height)
+            .min_scrolled_height(0.)
             .auto_shrink([false, false])
             .vertical_scroll_offset(self.scroll_offset)
             .show(ui, |ui| {
@@ -366,7 +444,18 @@ impl UiState {
                 }
                 self.canvas_origin = Some(origin);
                 let mut visible = vec![];
-                rows(&scene.nodes, 0, None, &self.collapsed, &mut visible);
+                if let Some(root) = &scene.coordinator {
+                    visible.push(Row {
+                        branch: root,
+                        depth: 0,
+                        parent: None,
+                    });
+                    if !self.collapsed.contains(&root.key) {
+                        rows(&scene.nodes, 1, Some(0), &self.collapsed, &mut visible);
+                    }
+                } else {
+                    rows(&scene.nodes, 0, None, &self.collapsed, &mut visible);
+                }
                 let width = ui.available_width().max(0.);
                 let layout = layout_rows(&visible, width, ui.painter(), live, time);
                 let clock = ui.input(|i| i.time);
@@ -410,7 +499,7 @@ impl UiState {
                     entry.status = placed.status.clone();
                     entry.parent = parent;
                     entry.color = color(row.branch, live, time);
-                    entry.marker = if row.branch.children.is_empty() {
+                    entry.marker = if !has_children(row.branch, scene) {
                         "·"
                     } else if self.collapsed.contains(&row.branch.key) {
                         "+"
@@ -488,8 +577,7 @@ impl UiState {
                     let (mut animated_rect, alpha) = placed.motion.sample(clock);
                     // Immediate containment on window shrink; motion still uses
                     // the unmodified interpolated geometry for future retargets.
-                    animated_rect.min.x = animated_rect.min.x.clamp(0., width);
-                    animated_rect.max.x = animated_rect.max.x.clamp(animated_rect.min.x, width);
+                    animated_rect = contained(animated_rect, width);
                     let item = animated_rect.translate(rect.min.to_vec2());
                     if alpha <= 0. || !ui.clip_rect().intersects(item) {
                         continue;
@@ -509,11 +597,9 @@ impl UiState {
                         .as_ref()
                         .and_then(|key| self.animated.get(key))
                     {
-                        let parent_rect =
-                            parent.motion.sample(clock).0.translate(rect.min.to_vec2());
-                        let start = Pos2::new(parent_rect.min.x + 6., parent_rect.max.y - 4.);
-                        let end = Pos2::new(pos.x + 6., pos.y + 10.);
-                        let bend = Pos2::new(start.x, end.y);
+                        let parent_rect = contained(parent.motion.sample(clock).0, width)
+                            .translate(rect.min.to_vec2());
+                        let [start, bend, end] = connector(parent_rect, item);
                         let stroke = Stroke::new(1., Color32::from_gray(65).gamma_multiply(alpha));
                         painter.line_segment([start, bend], stroke);
                         painter.line_segment([bend, end], stroke);
@@ -552,7 +638,7 @@ impl UiState {
                             if hit
                                 .interact_pointer_pos()
                                 .is_some_and(|p| p.x < pos.x + 20.)
-                                && !branch.children.is_empty()
+                                && has_children(branch, scene)
                             {
                                 if !self.collapsed.remove(key) {
                                     self.collapsed.insert(key.clone());
@@ -564,6 +650,7 @@ impl UiState {
                         }
                     }
                 }
+                self.draw_pulses(ui, rect, width, clock, scene);
                 if response.clicked() {
                     self.selected = None;
                 }
@@ -572,21 +659,70 @@ impl UiState {
         self.scroll_offset = (output.state.offset.y - pan_delta).clamp(0., maximum);
     }
 
-    fn draw_details(&self, ui: &mut egui::Ui, scene: &Scene, live: bool, time: i64, height: f32) {
-        if let Some(b) = self
-            .details_key
+    fn draw_pulses(&self, ui: &egui::Ui, canvas: Rect, width: f32, clock: f64, scene: &Scene) {
+        if self.pulses.is_active() {
+            ui.ctx().request_repaint();
+        }
+        let Some(root) = scene
+            .coordinator
             .as_ref()
-            .and_then(|k| find(&scene.nodes, k))
-        {
+            .and_then(|b| self.animated.get(&b.key))
+            .filter(|r| r.present)
+        else {
+            return;
+        };
+        let root_rect =
+            contained(root.motion.sample(clock).0, width).translate(canvas.min.to_vec2());
+        let root_visible = ui.clip_rect().intersects(root_rect);
+        let painter = ui.painter().with_clip_rect(ui.clip_rect());
+        for (key, progress) in self.pulses.iter(clock) {
+            let accent = Color32::from_rgb(218, 175, 255);
+            let Some(node) = self.animated.get(key).filter(|r| r.present) else {
+                if root_visible {
+                    painter.circle_stroke(
+                        root_rect.min + Vec2::splat(6.),
+                        6. + 8. * progress,
+                        Stroke::new(2., accent.gamma_multiply(1. - progress)),
+                    );
+                }
+                continue;
+            };
+            let node_rect =
+                contained(node.motion.sample(clock).0, width).translate(canvas.min.to_vec2());
+            let [end, bend, anchor] = connector(root_rect, node_rect);
+            let path = [Pos2::new(anchor.x, node_rect.max.y - 4.), anchor, bend, end];
+            let head = point_on_path(&path, ease_in_out(progress));
+            if !ui.clip_rect().contains(head) && root_visible {
+                painter.circle_stroke(
+                    root_rect.min + Vec2::splat(6.),
+                    6. + 8. * progress,
+                    Stroke::new(2., accent.gamma_multiply(1. - progress)),
+                );
+            }
+            for i in (0..8).rev() {
+                let distance = (ease_in_out(progress) - i as f32 * 0.025).max(0.);
+                painter.circle_filled(
+                    point_on_path(&path, distance),
+                    if i == 0 { 4. } else { 2.5 },
+                    accent.gamma_multiply((1. - progress) * (1. - i as f32 / 8.)),
+                );
+            }
+        }
+    }
+
+    fn draw_details(&self, ui: &mut egui::Ui, scene: &Scene, live: bool, time: Stamp, height: f32) {
+        if let Some(b) = self.details_key.as_ref().and_then(|k| {
+            scene
+                .coordinator
+                .as_ref()
+                .filter(|b| &b.key == k)
+                .or_else(|| find(&scene.nodes, k))
+        }) {
             ui.label(&b.label);
             ui.label(format!(
                 "{} · {}",
-                b.status,
-                if live {
-                    b.freshness.label(time)
-                } else {
-                    "last known"
-                }
+                status_label(b, time),
+                freshness_label(b, live, time)
             ));
             egui::ScrollArea::vertical()
                 .id_salt("details")
@@ -609,7 +745,7 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use herdr_mesh_visualizer::projection::Freshness;
+    use herdr_mesh_visualizer::projection::{Freshness, now};
 
     fn branch(depth: usize, path: &str) -> Branch {
         Branch {
@@ -619,7 +755,8 @@ mod tests {
             project_id: (depth == 2).then(|| "a_long_reported_project_identifier_".repeat(8)),
             details: vec![format!("Identifier: {}", "long_identifier_".repeat(80))],
             status: "working".into(),
-            freshness: Freshness::Receipt(now()),
+            freshness: Freshness::Receipt(Stamp::seconds(now())),
+            last_seen: None,
             children: if depth == 0 {
                 vec![]
             } else {
@@ -686,6 +823,186 @@ mod tests {
             frame(context, state, view, width, vec![]);
         }
         frame(context, state, view, width, vec![])
+    }
+
+    #[test]
+    fn short_window_keeps_tree_usable_with_wrapped_overview_and_observation() {
+        use herdr_mesh_visualizer::{
+            pb,
+            projection::{coordinator, project},
+        };
+        let context = egui::Context::default();
+        let mut state = UiState::default();
+        let mut scene = project(pb::NodeList {
+            nodes: vec![pb::NodeView {
+                instance_id: "node".into(),
+                hostname: "Execution".into(),
+                herdr: Some(pb::HerdrState {
+                    status: "ready".into(),
+                    workspaces: (0..12)
+                        .map(|i| pb::HerdrEntity {
+                            id: format!("workspace{i}"),
+                            project_id: format!("project{i}"),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        })
+        .unwrap();
+        scene.coordinator = Some(coordinator(None));
+        let view = View {
+            scene: Some(Arc::new(scene)),
+            live: true,
+            ..Default::default()
+        };
+        for (width, height) in [(280., 260.), (480., 320.), (1200., 320.), (280., 600.)] {
+            for step in 0..32 {
+                if step == 1 {
+                    state.selected = Some(vec!["node".into(), "node".into()]);
+                }
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, height))),
+                    time: Some(context.input(|i| i.time) + 1. / 60.),
+                    ..Default::default()
+                };
+                let mut output = context.run_ui(input, |ui| {
+                    state.draw(ui, &view, 8790);
+                    assert!(ui.min_rect().max.x <= width + 0.1);
+                    assert!(
+                        ui.min_rect().max.y <= height + 0.1,
+                        "content height at {width}x{height}, step {step}: {:?}",
+                        ui.min_rect()
+                    );
+                });
+                if step == 31 {
+                    let (_, clip) =
+                        text_position(&output, "coordinator  Identity unknown").unwrap();
+                    assert!(clip.height() > 40., "tree retains a usable viewport");
+                }
+                output.textures_delta.clear();
+            }
+        }
+    }
+
+    #[test]
+    fn last_seen_age_preserves_subsecond_receipts() {
+        let mut node = branch(0, "node");
+        node.kind = "node";
+        node.status = "connected".into();
+        node.last_seen = Some(Stamp {
+            seconds: 100,
+            nanos: 900_000_000,
+        });
+        assert_eq!(
+            status_label(
+                &node,
+                Stamp {
+                    seconds: 101,
+                    nanos: 100_000_000
+                }
+            ),
+            "connected · last seen 0s ago"
+        );
+        assert_eq!(
+            status_label(
+                &node,
+                Stamp {
+                    seconds: 101,
+                    nanos: 900_000_000
+                }
+            ),
+            "connected · last seen 1s ago"
+        );
+        assert_eq!(
+            status_label(&node, Stamp::seconds(100)),
+            "connected · last seen unknown (clock ahead)"
+        );
+    }
+
+    #[test]
+    fn coordinator_selection_collapse_pulse_and_source_reset() {
+        use herdr_mesh_visualizer::{
+            pb,
+            projection::{coordinator, project},
+        };
+        let make = |id: &str, seen: i64, revision: u64| {
+            let mut scene = project(pb::NodeList {
+                nodes: vec![pb::NodeView {
+                    instance_id: "node".into(),
+                    connected: true,
+                    hostname: "Execution".into(),
+                    last_seen: Some(prost_types::Timestamp {
+                        seconds: seen,
+                        nanos: 0,
+                    }),
+                    ..Default::default()
+                }],
+            })
+            .unwrap();
+            scene.coordinator = Some(coordinator(Some(&pb::ServerInfo {
+                instance_id: id.into(),
+                implementation_version: "test".into(),
+                ..Default::default()
+            })));
+            View {
+                scene: Some(Arc::new(scene)),
+                live: true,
+                epoch: 1,
+                revision,
+                ..Default::default()
+            }
+        };
+        let context = egui::Context::default();
+        let mut state = UiState::default();
+        let initial = make("coordinator-id", 100, 1);
+        let output = frame(&context, &mut state, &initial, 1200., vec![]);
+        let (root, _) = text_position(&output, "coordinator  coordinator-id").unwrap();
+        let (node, _) = text_position(&output, "node  Execution").unwrap();
+        assert!(node.x > root.x && node.y > root.y);
+        assert!(!state.pulses.is_active());
+        let next = make("coordinator-id", 101, 2);
+        frame(&context, &mut state, &next, 1200., vec![]);
+        assert!(state.pulses.is_active());
+        let key = vec!["coordinator".into(), "coordinator-id".into()];
+        state.collapsed.insert(key.clone());
+        frame(&context, &mut state, &next, 1200., vec![]);
+        assert!(!state.animated[&vec!["node".into(), "node".into()]].present);
+        assert!(
+            state.pulses.is_active(),
+            "collapsed root retains activity cue"
+        );
+        state.collapsed.clear();
+        let output = click(&context, &mut state, &next, 1200., root + Vec2::splat(5.));
+        assert_eq!(state.selected, Some(key));
+        assert!(text_position(&output, "Observation").is_some());
+        for _ in 0..(herdr_mesh_visualizer::heartbeat::PULSE_DURATION * 60.).ceil() as usize + 1 {
+            frame(&context, &mut state, &next, 1200., vec![]);
+        }
+        assert!(!state.pulses.is_active());
+        let different = make("other-coordinator", 102, 3);
+        frame(&context, &mut state, &different, 1200., vec![]);
+        assert!(state.selected.is_none());
+        assert!(state.collapsed.is_empty());
+        assert!(!state.pulses.is_active());
+    }
+    #[test]
+    fn pulse_path_travels_from_child_junction_to_parent_using_sampled_geometry() {
+        let parent = Rect::from_min_size(Pos2::new(10., 20.), Vec2::new(200., 50.));
+        let node = Rect::from_min_size(Pos2::new(50., 140.), Vec2::new(150., 50.));
+        let [end, bend, anchor] = connector(parent, node);
+        let path = [Pos2::new(anchor.x, node.max.y - 4.), anchor, bend, end];
+        assert_eq!(point_on_path(&path, 0.), path[0]);
+        assert_eq!(point_on_path(&path, 1.), end);
+        let mut previous = point_on_path(&path, 0.);
+        for i in 1..=100 {
+            let p = point_on_path(&path, i as f32 / 100.);
+            assert!(p.y <= previous.y + 0.001 && p.x <= previous.x + 0.001);
+            previous = p;
+        }
+        assert_eq!(point_on_path(&[end, end], 0.5), end);
     }
 
     #[test]
@@ -836,7 +1153,7 @@ mod tests {
         };
         let mut output = context.run_ui(input, |ui| {
             ui.heading("Observation");
-            state.draw_details(ui, &scene, true, now(), 180.);
+            state.draw_details(ui, &scene, true, wall_now(), 180.);
             assert!(
                 ui.min_rect().max.y <= 180. + 0.01,
                 "the scroll viewport must fit below the heading and status summary"
@@ -986,7 +1303,7 @@ mod tests {
             for width in [120., 280., 480., 800., 1200., 2000.] {
                 let context = egui::Context::default();
                 let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-                    let layout = layout_rows(&visible, width, ui.painter(), true, now());
+                    let layout = layout_rows(&visible, width, ui.painter(), true, wall_now());
                     for (index, placed) in layout.iter().enumerate() {
                         assert!(placed.rect.is_finite());
                         assert!(placed.rect.min.x >= 0.);

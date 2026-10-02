@@ -1,6 +1,7 @@
 //! Native shell adapted from clarkezone/wgputests commit
 //! 56551e298420764e43d6851efc9a2702273af0e1 (see README).
 mod animation;
+mod fleet_panel;
 mod ui;
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
 use herdr_mesh_visualizer::client::{self, Shared};
@@ -297,6 +298,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scene.working,
             scene.blocked
         );
+        if let Some(coordinator) = scene.coordinator {
+            println!("coordinator: {}", coordinator.label);
+        }
         return Ok(());
     }
     let event_loop = EventLoop::<()>::with_user_event().build()?;

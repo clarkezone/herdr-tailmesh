@@ -23,6 +23,9 @@ service LocalObserver {
 message ObserverInfo {
   uint32 api_version = 1;
   string daemon_name = 2;
+  // Optional verified upstream identity/version. Absent while unavailable or
+  // when served by an older observer; never infer this from daemon_name.
+  ServerInfo coordinator = 3;
 }
 
 service Fleet {
