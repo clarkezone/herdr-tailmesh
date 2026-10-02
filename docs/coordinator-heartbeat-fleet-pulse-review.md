@@ -28,6 +28,10 @@ No new service, sidecar, remote listener or enrollment is introduced.
 - Final PR review fixed last-seen ages crossing a wall-clock second before a
   full elapsed second. Age display now uses complete timestamp differences;
   boundary tests also preserve explicit future-clock states.
+- Windows CI exposed an existing session-startup fixture racing command expiry
+  against node result delivery. The fixture now models the manager's own
+  startup deadline and wrapped ErrStarting result while retaining a live
+  command budget, matching production manager behavior. No runtime change.
 - Counts come from actual validated records, excluding orphan workspace
   placeholders and aggregate branch statuses. Fresh contexts and retained raw
   counts remain separate; default/named aliases are scoped observations.
