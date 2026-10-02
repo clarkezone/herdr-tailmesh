@@ -25,6 +25,7 @@ func runOnboardingWith(ctx context.Context, command string, args []string, strea
 	options := onboard.Options{Coordinator: command == "init", HerdrExecutable: "herdr"}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	visualizerPort := flags.Int("visualizer-port", meshlocal.DefaultVisualizerPort, "local read-only visualizer port for this launch (1..65535)")
 	flags.StringVar(&options.Name, "name", "", "override the mesh node label (default: normalized machine hostname)")
 	flags.StringVar(&options.HerdrExecutable, "herdr", "herdr", "existing Herdr executable (default: herdr from PATH)")
 	if options.Coordinator {
@@ -44,12 +45,20 @@ func runOnboardingWith(ctx context.Context, command string, args []string, strea
 	if flags.NArg() != 0 {
 		return fmt.Errorf("%s does not accept positional arguments", command)
 	}
+	if err := meshlocal.ValidateVisualizerPort(*visualizerPort); err != nil {
+		return err
+	}
 	var err error
 	options, err = options.Normalize()
 	if err != nil {
 		return err
 	}
 	deps := onboard.DefaultDependencies(streams.In, streams.Out)
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "visualizer-port" {
+			deps.VisualizerPort = *visualizerPort
+		}
+	})
 	deps.Dir = func() (string, error) { return meshlocal.StateDir(ctx) }
 	return run(ctx, options, streams.Out, deps)
 }
@@ -58,6 +67,7 @@ func runStart(ctx context.Context, args []string, streams IO) error {
 	flags := flag.NewFlagSet("start", flag.ContinueOnError)
 	flags.SetOutput(streams.Err)
 	timeout := flags.Duration("timeout", 2*time.Minute, "readiness wait; cancellation leaves the background daemon running")
+	visualizerPort := flags.Int("visualizer-port", meshlocal.DefaultVisualizerPort, "local read-only visualizer port for this launch (1..65535)")
 	flags.Usage = func() {
 		fmt.Fprintln(flags.Output(), "Usage: herdr-mesh [--state-dir <absolute-directory>] start [--timeout 2m]\nStart this computer's saved mesh connection. No need to repeat init or join.")
 		flags.PrintDefaults()
@@ -68,9 +78,17 @@ func runStart(ctx context.Context, args []string, streams IO) error {
 	if flags.NArg() != 0 || *timeout <= 0 || *timeout > 10*time.Minute {
 		return errors.New("start accepts no positional arguments; --timeout must be greater than zero and at most 10m")
 	}
+	if err := meshlocal.ValidateVisualizerPort(*visualizerPort); err != nil {
+		return err
+	}
 	op, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 	deps := onboard.DefaultDependencies(streams.In, streams.Out)
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "visualizer-port" {
+			deps.VisualizerPort = *visualizerPort
+		}
+	})
 	deps.Dir = func() (string, error) { return meshlocal.StateDir(op) }
 	return onboard.Start(op, streams.Out, deps)
 }

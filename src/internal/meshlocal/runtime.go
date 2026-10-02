@@ -100,6 +100,10 @@ func (s *statusWriter) login(message string) {
 }
 
 func run(ctx context.Context, dir string, output io.Writer, deps runtimeDependencies) (result error) {
+	observerPort, err := visualizerPort()
+	if err != nil {
+		return err
+	}
 	config, err := Load(dir)
 	if err != nil {
 		return err
@@ -287,6 +291,8 @@ func run(ctx context.Context, dir string, output io.Writer, deps runtimeDependen
 		return nil
 	})
 	group.Go(func() error { <-groupCtx.Done(); proxy.Stop(); return nil })
+	stopObserver := startObserver(upstream, config.Name, observerPort, output)
+	defer stopObserver()
 	if err := writer.update(func(status *Status) { status.State = "ready" }); err != nil {
 		return err
 	}

@@ -295,6 +295,11 @@ go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
 
 ## Monitoring dashboard
 
+The separate native [Rust mesh visualizer](visualizer/README.md) presents the
+same node and agent observations as a GPU text tree. It reads a managed daemon
+on `127.0.0.1:8790` without another Tailscale enrollment. Build/run instructions,
+port overrides and cross-platform validation are described in its README.
+
 The read-only dashboard uses the existing fleet inventory. It is embedded in
 the Go binary; no frontend server, npm install, or system Tailscale client is
 needed. Use the same mesh build on the controller and execution nodes.

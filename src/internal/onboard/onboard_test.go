@@ -44,7 +44,7 @@ func newFixture(t *testing.T) *fixture {
 		Executable: func() (string, error) { return filepath.Join(t.TempDir(), "herdr-mesh.exe"), nil },
 		Start: func(_ string, _ string, env []string) error {
 			f.starts++
-			if !reflect.DeepEqual(env, []string{"PATH=provider", "ANTHROPIC_API_KEY=provider-secret"}) {
+			if !reflect.DeepEqual(env, []string{"PATH=provider", "ANTHROPIC_API_KEY=provider-secret", meshlocal.VisualizerPortEnv + "=8790"}) {
 				t.Fatalf("daemon env = %v", env)
 			}
 			return nil

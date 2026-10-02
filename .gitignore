@@ -50,3 +50,6 @@ dist/
 # Editor/IDE
 # .idea/
 # .vscode/
+# Local build outputs
+/.build/
+/visualizer/target/

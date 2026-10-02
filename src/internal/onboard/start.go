@@ -13,6 +13,11 @@ import (
 
 // Start resumes saved configuration without enrollment setup or policy changes.
 func Start(ctx context.Context, output io.Writer, d Dependencies) (result error) {
+	if d.VisualizerPort != 0 {
+		if err := meshlocal.ValidateVisualizerPort(d.VisualizerPort); err != nil {
+			return err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
