@@ -96,6 +96,52 @@ workspace are not in this stream. Missing references stay unresolved. Agent proj
 details without relocating an observed workspace. Names are display labels;
 identities remain scoped by node, native session/incarnation, workspace and tab.
 
+## Windows screensaver
+
+The Windows screensaver uses the same shell, renderer and observer worker.
+Normal `.exe` behavior and Linux/macOS builds remain unchanged. Build it with:
+
+```powershell
+cargo build --manifest-path visualizer\Cargo.toml --locked --release --features screensaver --bin herdr-mesh-screensaver
+Copy-Item visualizer\target\release\herdr-mesh-screensaver.exe visualizer\target\release\herdr-mesh-visualizer.scr
+Start-Process -FilePath .\visualizer\target\release\herdr-mesh-visualizer.scr -ArgumentList /s -NoNewWindow
+```
+
+`/s` covers every monitor, hides the cursor and exits on keyboard, mouse button,
+wheel/touch, or mouse movement of 8 physical pixels after a one-second startup
+grace period. Focus loss outside its own windows, suspend, session lock and
+display-topology changes also close it.
+The live tree automatically scrolls. If no live stream is available, it shows
+only **Daemon not available**, never retained fleet data. Reconnection is automatic.
+
+`/p HWND` (or `/p:HWND`) embeds a non-activating preview in a Windows-provided
+parent window and follows its size/lifetime. `/c [HWND]` (also `/c:HWND`) shows
+configuration information; no settings are persisted in this first cut. A `.scr`
+without arguments shows configuration; a normal `.exe` without arguments opens
+the interactive viewer. Switches are case-insensitive; manual launches can
+append `--port N`. Windows-configured launches use default port 8790.
+For manual `.scr` switch tests, use direct process execution as above: a
+ShellExecute launch can invoke the registered file association with `/S`
+instead of the requested arguments. Windows passive modes use opaque
+Direct3D 12 HWND surfaces; the regular viewer keeps its existing backend selection.
+
+For a separate screensaver archive/checksum:
+
+```powershell
+python scripts\package-visualizer.py --binary visualizer\target\release\herdr-mesh-screensaver.exe --version 0.1.0 --screensaver
+```
+
+Extract the single `.scr` to a stable location. Right-click **Install** to open
+Windows Screen Saver Settings, then explicitly select the saver, wait time and
+sign-in-on-resume policy. System-wide deployment into `%WINDIR%\System32` requires
+administrator approval; builds do not install or activate anything. Windows,
+not this app, handles secure resume. The saver never starts/enrolls the daemon.
+Live fleet names and statuses are visible while running: consider this before
+enabling it on a publicly visible display.
+
+See [the screensaver specification](../docs/visualizer-screensaver.md) for scope,
+error behavior, compatibility and acceptance requirements.
+
 ## Verification
 
 ```sh
