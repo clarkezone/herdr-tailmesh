@@ -44,6 +44,16 @@ jobs:
         run: cargo test --manifest-path visualizer/Cargo.toml --locked
       - name: Build native viewer
         run: cargo build --manifest-path visualizer/Cargo.toml --locked --release
+      - name: Windows screensaver lint, tests and build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo clippy --manifest-path visualizer/Cargo.toml --locked --features screensaver --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --manifest-path visualizer/Cargo.toml --locked --features screensaver
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --manifest-path visualizer/Cargo.toml --locked --features screensaver --bin herdr-mesh-screensaver --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Go to Rust observer contract (including a 5 MiB snapshot)
         shell: bash
         run: |
@@ -52,9 +62,13 @@ jobs:
       - name: Package viewer separately from the Go CLI
         shell: bash
         run: |
+          python scripts/test-package-visualizer.py
           binary="$PWD/visualizer/target/release/herdr-mesh-visualizer"
           if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
           python scripts/package-visualizer.py --binary "$binary" --version 0.1.0
+      - name: Package Windows screensaver separately
+        if: runner.os == 'Windows'
+        run: python scripts/package-visualizer.py --binary visualizer/target/release/herdr-mesh-screensaver.exe --version 0.1.0 --screensaver
       - uses: actions/upload-artifact@v4
         with:
           name: herdr-mesh-visualizer-${{ runner.os }}-${{ runner.arch }}
