@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	pb "github.com/clarkezone/herdr-distributed-mesh/src/gen/agentflow/v1"
@@ -287,39 +288,50 @@ func TestWorktreeDeadlineAndIndependentCompletion(t *testing.T) {
 	for _, absoluteFirst := range []bool{false, true} {
 		t.Run(map[bool]string{false: "ttl", true: "absolute"}[absoluteFirst], func(t *testing.T) {
 			journal := testJournal(t)
-			command := worktreeCommand()
-			receivedAt := time.Now()
-			command.Ttl = durationpb.New(200 * time.Millisecond)
-			want := receivedAt.Add(command.Ttl.AsDuration())
-			if absoluteFirst {
-				want = receivedAt.Add(100 * time.Millisecond)
-				command.ExpiresAt = timestamppb.New(want)
-			}
-			completed := false
-			handler := &commandHandler{nodeID: "test-node", workspacePolicy: policy, worktreeNegotiated: true,
-				journal: observedJournal{commandJournal: journal, onComplete: func(ctx context.Context, _ *pb.CommandResult) {
-					completed = true
-					if ctx.Err() != nil {
-						t.Error("journal completion inherited expired effect context")
-					}
-				}},
-				verifyCoordinator: func(ctx context.Context) error {
-					if got, ok := ctx.Deadline(); !ok || !got.Equal(want) {
-						t.Errorf("verification deadline=%v want=%v", got, want)
-					}
-					return nil
-				},
-				createWorktree: func(ctx context.Context, _ herdr.Config, _ projects.Binding, _ *pb.WorktreeCreate) (*pb.WorktreeCreateResult, error) {
-					if got, ok := ctx.Deadline(); !ok || !got.Equal(want) {
-						t.Errorf("effect deadline=%v want=%v", got, want)
-					}
-					<-ctx.Done()
-					return nil, herdr.ErrWorkspaceIndeterminate
-				}}
-			result, err := handler.handle(context.Background(), command, receivedAt)
-			if err != nil || !completed || result.GetStatus() != pb.CommandStatus_COMMAND_STATUS_INDETERMINATE {
-				t.Fatalf("partial effect not durably uncertain: %v %v", result, err)
-			}
+			// Advance fake time at the effect deadline, not during journal or filesystem setup.
+			synctest.Test(t, func(t *testing.T) {
+				command := worktreeCommand()
+				receivedAt := time.Now()
+				command.Ttl = durationpb.New(200 * time.Millisecond)
+				want := receivedAt.Add(command.Ttl.AsDuration())
+				if absoluteFirst {
+					want = receivedAt.Add(100 * time.Millisecond)
+					command.ExpiresAt = timestamppb.New(want)
+				}
+				entered, completed := false, false
+				handler := &commandHandler{nodeID: "test-node", workspacePolicy: policy, worktreeNegotiated: true,
+					journal: observedJournal{commandJournal: journal, onComplete: func(ctx context.Context, _ *pb.CommandResult) {
+						completed = true
+						if ctx.Err() != nil {
+							t.Error("journal completion inherited expired effect context")
+						}
+					}},
+					verifyCoordinator: func(ctx context.Context) error {
+						if got, ok := ctx.Deadline(); !ok || !got.Equal(want) {
+							t.Errorf("verification deadline=%v want=%v", got, want)
+						}
+						return nil
+					},
+					createWorktree: func(ctx context.Context, _ herdr.Config, _ projects.Binding, _ *pb.WorktreeCreate) (*pb.WorktreeCreateResult, error) {
+						entered = true
+						if got, ok := ctx.Deadline(); !ok || !got.Equal(want) {
+							t.Errorf("effect deadline=%v want=%v", got, want)
+						}
+						<-ctx.Done()
+						if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+							t.Fatal("effect must reach its deadline after entry")
+						}
+						return nil, herdr.ErrWorkspaceIndeterminate
+					}}
+				result, err := handler.handle(context.Background(), command, receivedAt)
+				if err != nil || !entered || !completed || result.GetStatus() != pb.CommandStatus_COMMAND_STATUS_INDETERMINATE {
+					t.Fatalf("partial effect not durably uncertain: entered=%t completed=%t result=%v err=%v", entered, completed, result, err)
+				}
+				stored, claimed, err := journal.Claim(context.Background(), command)
+				if err != nil || claimed || !proto.Equal(stored, result) {
+					t.Fatalf("expired effect outcome was not durable: %v %v", stored, err)
+				}
+			})
 		})
 	}
 }
