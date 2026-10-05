@@ -1160,6 +1160,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "wgpu",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

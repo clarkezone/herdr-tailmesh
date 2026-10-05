@@ -23,6 +23,7 @@ pub struct UiState {
     epoch: u64,
     pulses: Pulses,
     fleet_panel: crate::fleet_panel::FleetPanel,
+    automatic_scroll: bool,
 }
 struct AnimatedRow {
     motion: Motion,
@@ -210,6 +211,37 @@ fn color(b: &Branch, live: bool, time: Stamp) -> Color32 {
     }
 }
 impl UiState {
+    pub fn draw_screensaver(&mut self, ui: &mut egui::Ui, view: &View, port: u16) {
+        self.automatic_scroll = true;
+        self.selected = None;
+        self.collapsed.clear();
+        if !view.live {
+            self.pulses = Default::default();
+            let rect = ui.max_rect().intersect(ui.clip_rect());
+            let color = Color32::from_gray(210);
+            let mut galley = ui.painter().layout_no_wrap(
+                "Daemon not available".into(),
+                egui::FontId::proportional(24.),
+                color,
+            );
+            let fit = ((rect.width() - 16.).max(1.) / galley.size().x)
+                .min((rect.height() - 16.).max(1.) / galley.size().y)
+                .min(1.);
+            if fit < 1. {
+                galley = ui.painter().layout_no_wrap(
+                    "Daemon not available".into(),
+                    egui::FontId::proportional(24. * fit),
+                    color,
+                );
+            }
+            ui.painter()
+                .galley(rect.center() - galley.size() / 2., galley, color);
+        } else {
+            self.draw(ui, view, port);
+        }
+        self.automatic_scroll = false;
+    }
+
     pub fn draw(&mut self, ui: &mut egui::Ui, view: &View, port: u16) {
         let selection_before = self.selected.clone();
         // Register behind all content so entity clicks and scrollbar interactions
@@ -656,7 +688,11 @@ impl UiState {
                 }
             });
         let maximum = (output.content_size.y - output.inner_rect.height()).max(0.);
-        self.scroll_offset = (output.state.offset.y - pan_delta).clamp(0., maximum);
+        self.scroll_offset = if self.automatic_scroll {
+            crate::launch::automatic_scroll(ui.input(|i| i.time), maximum)
+        } else {
+            (output.state.offset.y - pan_delta).clamp(0., maximum)
+        };
     }
 
     fn draw_pulses(&self, ui: &egui::Ui, canvas: Rect, width: f32, clock: f64, scene: &Scene) {
@@ -746,6 +782,101 @@ impl UiState {
 mod tests {
     use super::*;
     use herdr_mesh_visualizer::projection::{Freshness, now};
+
+    #[test]
+    fn screensaver_hides_retained_data_when_stream_is_unavailable() {
+        let context = egui::Context::default();
+        let mut state = UiState::default();
+        let view = View {
+            scene: Some(Arc::new(Scene {
+                nodes: vec![branch(0, "retained-node")],
+                ..Default::default()
+            })),
+            live: false,
+            ..Default::default()
+        };
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
+                ..Default::default()
+            },
+            |ui| state.draw_screensaver(ui, &view, 8790),
+        );
+        output.textures_delta.clear();
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["Daemon not available"]);
+        assert!(!state.automatic_scroll);
+        let output = frame(&context, &mut state, &view, 800., vec![]);
+        assert!(text_position(&output, "Herdr mesh").is_some());
+        assert!(text_position(&output, "Daemon not available").is_none());
+        assert!(
+            !state.animated.is_empty(),
+            "normal viewer retains observations"
+        );
+    }
+
+    #[test]
+    fn unavailable_message_fits_small_preview_and_full_screen() {
+        let context = egui::Context::default();
+        let mut state = UiState::default();
+        for (width, height) in [(136., 73.), (152., 112.), (800., 600.), (3440., 1440.)] {
+            let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, height));
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                },
+                |ui| state.draw_screensaver(ui, &View::default(), 8790),
+            );
+            output.textures_delta.clear();
+            let texts: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(texts.len(), 1);
+            assert_eq!(texts[0].galley.text(), "Daemon not available");
+            let bounds = texts[0].galley.rect.translate(texts[0].pos.to_vec2());
+            assert!(viewport.contains_rect(bounds), "{viewport:?}: {bounds:?}");
+        }
+    }
+
+    #[test]
+    fn screensaver_live_view_reuses_mesh_and_does_not_select_entities() {
+        let context = egui::Context::default();
+        let mut state = UiState::default();
+        let view = View {
+            scene: Some(Arc::new(Scene {
+                nodes: vec![branch(0, "live-node")],
+                ..Default::default()
+            })),
+            live: true,
+            ..Default::default()
+        };
+        state.selected = Some(vec!["live-node".into()]);
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
+                ..Default::default()
+            },
+            |ui| state.draw_screensaver(ui, &view, 8790),
+        );
+        output.textures_delta.clear();
+        assert!(text_position(&output, "Herdr mesh").is_some());
+        assert!(text_position(&output, "Daemon not available").is_none());
+        assert!(state.selected.is_none());
+        assert!(!state.animated.is_empty());
+    }
 
     fn branch(depth: usize, path: &str) -> Branch {
         Branch {
