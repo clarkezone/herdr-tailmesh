@@ -56,6 +56,10 @@ session lock, or monitor-topology change. Windows session notifications and
 power messages supplement winit lifecycle events. Ignore initial/synthetic
 pointer movement for one second; subsequent movement of at least 8 physical
 pixels dismisses.
+Defer startup focus-loss checks until both the one-second grace period and
+100 ms activation-settling delay have elapsed. Then check whether any saver
+window owns the foreground; a persistent external focus loss must dismiss
+without requiring another focus event.
 Preview mode never dismisses on pointer input or steals focus.
 On exit, stop and join the existing observer worker and release GPU/windows.
 Do not enroll, restart, stop or mutate the daemon. Do not implement passwords

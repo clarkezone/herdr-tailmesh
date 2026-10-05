@@ -277,6 +277,15 @@ struct App {
     next_tick: Instant,
     error: Option<String>,
 }
+fn take_due_focus_loss(pending: &mut Option<Instant>, started: Instant, now: Instant) -> bool {
+    if now.duration_since(started).as_secs_f64() < launch::INPUT_GRACE_SECONDS
+        || !pending.is_some_and(|deadline| now >= deadline)
+    {
+        return false;
+    }
+    *pending = None;
+    true
+}
 impl ApplicationHandler<()> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if !self.renderers.is_empty() {
@@ -359,11 +368,7 @@ impl ApplicationHandler<()> for App {
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Native activation briefly clears focus while transferring between monitors.
-        if self
-            .focus_loss_pending
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            self.focus_loss_pending = None;
+        if take_due_focus_loss(&mut self.focus_loss_pending, self.started, Instant::now()) {
             #[cfg(target_os = "windows")]
             let owns_focus = match windows_screensaver::owns_foreground(
                 self.renderers.iter().map(|r| r.window.as_ref()),
@@ -377,7 +382,7 @@ impl ApplicationHandler<()> for App {
             };
             #[cfg(not(target_os = "windows"))]
             let owns_focus = self.renderers.iter().any(|r| r.window.has_focus());
-            if self.started.elapsed().as_secs_f64() >= launch::INPUT_GRACE_SECONDS && !owns_focus {
+            if !owns_focus {
                 log::info!("Screensaver dismissed by external focus loss");
                 event_loop.exit();
                 return;
@@ -539,6 +544,7 @@ impl App {
         Ok(())
     }
 }
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let scr = std::env::current_exe()?
@@ -627,4 +633,55 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_focus_loss_remains_pending_until_grace_expires() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        let mut pending = Some(deadline);
+        for millis in [200, 299, 300, 330, 999] {
+            assert!(!take_due_focus_loss(
+                &mut pending,
+                started,
+                started + Duration::from_millis(millis),
+            ));
+            assert_eq!(pending, Some(deadline));
+        }
+        assert!(take_due_focus_loss(
+            &mut pending,
+            started,
+            started + Duration::from_secs(1),
+        ));
+        assert_eq!(pending, None);
+        assert!(!take_due_focus_loss(
+            &mut pending,
+            started,
+            started + Duration::from_secs(2),
+        ));
+    }
+
+    #[test]
+    fn focus_loss_waits_for_activation_settling_after_startup() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(1300);
+        let mut pending = Some(deadline);
+        assert!(!take_due_focus_loss(
+            &mut pending,
+            started,
+            started + Duration::from_millis(1299),
+        ));
+        assert_eq!(pending, Some(deadline));
+        assert!(take_due_focus_loss(&mut pending, started, deadline));
+        assert_eq!(pending, None);
+
+        let next_deadline = started + Duration::from_secs(2);
+        pending.get_or_insert(next_deadline);
+        assert!(take_due_focus_loss(&mut pending, started, next_deadline));
+        assert_eq!(pending, None);
+    }
 }
