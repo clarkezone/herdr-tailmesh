@@ -176,6 +176,22 @@ This does not substitute for graphical acceptance on the established wgputests
 machines. Test window launch/close, resize/DPI changes, scrolling/selection,
 daemon loss/restart, named sessions, empty fleet and stale snapshots there.
 
+Orb markers, halos and branch widths use logical display points, matching the
+HUD, selection targets and callouts. The active window's pixels-per-point value
+is applied each frame, including fractional scaling, egui zoom and monitor
+changes. Resize still fits the world-space constellation to the available area.
+
+An opt-in native GPU regression reads rendered pixels at 100%, 125%, 150%, 200%,
+300% and 400% scaling to check marker area and branch width:
+
+```sh
+cargo test --manifest-path visualizer/Cargo.toml --locked --bin herdr-mesh-visualizer gpu_marker_area_and_branch_width_follow_display_scale -- --ignored
+```
+
+The regular tests cover logical marker size limits, projected positions and
+clipped fractional-DPI viewports without needing a GPU. Actual monitor changes
+and Windows preview/fullscreen presentation remain manual acceptance checks.
+
 Package the host release binary with
 `python scripts/package-visualizer.py --binary <path> --version <version>`.
 Viewer archives and checksums go into `dist/visualizer/`, separately from the

@@ -150,3 +150,33 @@ maximum-density performance profiling remain platform acceptance work. PR CI
 builds/tests the three native platforms; CI compilation is separate from graphical
 acceptance. No daemon upgrade, enrollment, listener configuration or OS screensaver
 activation was performed. The PR is intentionally left unmerged.
+
+## DPI follow-up
+
+The user confirmed that the native Windows viewer works, then reported agent
+markers appearing too small on a scaled display. The marker scale was capped in
+physical pixels, while egui geometry and text were in logical display points.
+Branch lines used native one-physical-pixel LineList rasterization.
+
+The physical viewport now carries the current frame's pixels-per-point value.
+Marker-size limits are applied to logical viewport dimensions, then converted to
+physical pixels exactly once. This covers every particle glyph, halo and receipt
+effect. The same camera projection still places the world geometry and logical
+selection/callout anchors. Branches, including workspace diamonds and decorative
+rings, now use instanced screen-space triangle quads with one-logical-point
+width and a physical-pixel antialias fringe. Existing per-window egui scale-factor
+events provide the scale for viewer, preview and fullscreen surfaces each frame.
+
+Adversarial checks cover the small-preview lower size limit and large-window
+upper size limit; fractional scaling and viewport/scissor clipping; CPU/GPU
+projection agreement; every agent state; and the unchanged fixed line-buffer
+budget. Each segment reuses two adjacent geometry vertices as one instance, with
+an explicit even-length check and no additional CPU geometry allocation. A
+view-aligned/zero-length segment cannot introduce a normalization NaN.
+
+The native GPU readback regression passed on Linux at 100%, 125%, 150%, 200%,
+300% and 400%: normalized marker area stays within 6% of the 100% raster sample,
+and branch coverage stays within 5% of one logical point. The portable camera
+regression checks marker size and projected anchors from tiny previews through
+large fullscreen views at all six scales. Actual Windows DPI and mixed-monitor
+interaction need a user retest; cross-platform rendering uses the shared path.

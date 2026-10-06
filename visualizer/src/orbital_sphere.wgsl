@@ -64,29 +64,53 @@ fn particle_color(input: ParticleOutput) -> vec4<f32> {
 }
 
 struct LineInput {
-    @location(0) position: vec3<f32>,
-    @location(1) color: vec4<f32>,
+    @location(0) corner: vec2<f32>,
+    @location(1) start: vec3<f32>,
+    @location(2) start_color: vec4<f32>,
+    @location(3) end: vec3<f32>,
+    @location(4) end_color: vec4<f32>,
 };
 
 struct LineOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) world: vec3<f32>,
+    @location(2) @interpolate(linear) side: f32,
 };
 
 @vertex
 fn line_vs(input: LineInput) -> LineOutput {
     var output: LineOutput;
-    let world = scene.group_model * vec4<f32>(input.position, 1.0);
-    output.clip_position = scene.view_projection * world;
+    let start = scene.group_model * vec4<f32>(input.start, 1.0);
+    let end = scene.group_model * vec4<f32>(input.end, 1.0);
+    let clip_start = scene.view_projection * start;
+    let clip_end = scene.view_projection * end;
+    let t = input.corner.x * 0.5 + 0.5;
+    let world = mix(start, end, t);
+    var clip = mix(clip_start, clip_end, t);
+    let direction = (clip_end.xy / clip_end.w - clip_start.xy / clip_start.w)
+        * scene.viewport_brightness.xy;
+    // Avoid NaNs for zero-length or view-aligned segments.
+    let normal = vec2<f32>(-direction.y, direction.x) / max(length(direction), 0.00001);
+    // One logical point, plus a physical-pixel antialias fringe on both edges.
+    let half_width = (scene.camera_depth.w + 1.0) * 0.5;
+    clip.x += normal.x * input.corner.y * half_width * 2.0 / scene.viewport_brightness.x * clip.w;
+    clip.y += normal.y * input.corner.y * half_width * 2.0 / scene.viewport_brightness.y * clip.w;
+    output.clip_position = clip;
     output.world = world.xyz;
-    output.color = input.color;
+    output.color = mix(input.start_color, input.end_color, t);
+    output.side = input.corner.y;
     return output;
 }
 
 @fragment
 fn line_fs(input: LineOutput) -> @location(0) vec4<f32> {
-    return input.color * scene.viewport_brightness.z;
+    return input.color * scene.viewport_brightness.z * line_coverage(input);
+}
+
+fn line_coverage(input: LineOutput) -> f32 {
+    let half_width = (scene.camera_depth.w + 1.0) * 0.5;
+    return clamp(half_width * (1.0 - abs(input.side)), 0.0, 1.0);
 }
 
 
@@ -121,7 +145,7 @@ fn front_particle_fs(input: ParticleOutput) -> @location(0) vec4<f32> {
 fn line_layer(input: LineOutput, front: bool) -> vec4<f32> {
     let rear = rear_weight(input.world);
     let weight = select(rear, 1.0-rear, front);
-    return input.color * scene.viewport_brightness.z * mix(1.0, 0.35, rear) * weight;
+    return input.color * scene.viewport_brightness.z * mix(1.0, 0.35, rear) * weight * line_coverage(input);
 }
 @fragment
 fn rear_line_fs(input: LineOutput) -> @location(0) vec4<f32> {

@@ -64,7 +64,12 @@ pub fn camera(time: f32, viewport: Viewport) -> (Mat4, Mat4, f32) {
     (
         projection * view,
         model,
-        (viewport.height * 1.1 / (2.0 * z * half) / 105.0).clamp(0.25, 1.5),
+        // Size limits are logical points, just like the HUD and hit targets.
+        // Clamp before converting to pixels or high-DPI markers hit the cap
+        // early and shrink relative to the sphere and text.
+        (viewport.height / viewport.pixels_per_point * 1.1 / (2.0 * z * half) / 105.0)
+            .clamp(0.25, 1.5)
+            * viewport.pixels_per_point,
     )
 }
 fn orbit_rotation(index: usize, time: f32) -> Quat {
@@ -372,6 +377,7 @@ pub fn project(pos: Vec3, time: f32, rect: egui::Rect) -> Option<egui::Pos2> {
             y: rect.top(),
             width: rect.width(),
             height: rect.height(),
+            pixels_per_point: 1.0,
         },
     );
     let clip = vp * model * pos.extend(1.0);
@@ -384,6 +390,7 @@ pub fn project(pos: Vec3, time: f32, rect: egui::Rect) -> Option<egui::Pos2> {
         rect.center().y - p.y * rect.height() * 0.5,
     ))
 }
+
 // Grow cards to their text and stack independently in the two edge columns.
 // The reserved margin also contains their +/-9 px animated drift.
 fn callout_rect(
@@ -544,4 +551,60 @@ pub fn overlay(ui: &egui::Ui, sim: &Simulation, rect: egui::Rect) {
     // Paint last so moving leader lines cannot obscure the key.
     crate::mesh_legend::draw(&painter, &legend, sim.time);
     crate::mesh_stats::draw(&painter, &stats);
+}
+
+#[cfg(test)]
+mod dpi_tests {
+    use super::*;
+
+    #[test]
+    fn marker_sizes_and_projected_geometry_are_uniform_in_logical_points() {
+        // Tiny preview, normal window, portrait and large fullscreen exercise
+        // both marker size limits and the camera's aspect-dependent distance.
+        for size in [(180., 88.), (1280., 720.), (480., 960.), (2560., 1440.)] {
+            let rect = egui::Rect::from_min_size(egui::pos2(24., 40.), egui::vec2(size.0, size.1));
+            let base = Viewport::physical(rect, 1., 4000, 4000).unwrap();
+            let (base_camera, base_model, base_size) = camera(3.0, base);
+            for dpi in [1.0, 1.25, 1.5, 2.0, 3.0, 4.0] {
+                let viewport = Viewport::physical(rect, dpi, 12000, 12000).unwrap();
+                let (vp, model, marker_pixels) = camera(3.0, viewport);
+                assert!((marker_pixels / dpi - base_size).abs() < 0.00001);
+                assert!(vp.abs_diff_eq(base_camera, 0.00001));
+                assert!(model.abs_diff_eq(base_model, 0.00001));
+                for glyph in [
+                    Glyph::Coordinator,
+                    Glyph::Node,
+                    Glyph::Session,
+                    Glyph::Workspace,
+                    Glyph::Agent(AgentState::Working),
+                    Glyph::Agent(AgentState::Blocked),
+                    Glyph::Agent(AgentState::Completed),
+                    Glyph::Agent(AgentState::Idle),
+                    Glyph::Agent(AgentState::Unknown),
+                ] {
+                    for particle in glyph_geometry(glyph, 3.0).particles {
+                        let logical_radius = particle.position_size[3] * marker_pixels / dpi;
+                        let expected = particle.position_size[3] * base_size;
+                        assert!((logical_radius - expected).abs() < 0.00001);
+                    }
+                }
+                for id in [
+                    Id::Node(0),
+                    Id::Session(0, 1),
+                    Id::Workspace(0, 1, 2),
+                    Id::Agent(0, 1, 2, 3),
+                ] {
+                    let pos = position(id, 3.0);
+                    let clip = vp * model * pos.extend(1.0);
+                    let ndc = clip.truncate() / clip.w;
+                    let physical = egui::pos2(
+                        viewport.x + (ndc.x + 1.) * viewport.width / 2.,
+                        viewport.y + (1. - ndc.y) * viewport.height / 2.,
+                    );
+                    let logical = egui::pos2(physical.x / dpi, physical.y / dpi);
+                    assert!(logical.distance(project(pos, 3.0, rect).unwrap()) < 0.001);
+                }
+            }
+        }
+    }
 }

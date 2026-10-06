@@ -61,14 +61,24 @@ pub(crate) struct LineVertex {
     pub color: [f32; 4],
 }
 
-impl LineVertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+/// Adjacent geometry vertices are one segment instance. Expand the segment
+/// into a screen-space quad: native LineList rasterization is always one
+/// physical pixel wide, regardless of display scaling.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LineSegment {
+    endpoints: [LineVertex; 2],
+}
+
+impl LineSegment {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+        1 => Float32x3, 2 => Float32x4, 3 => Float32x3, 4 => Float32x4
+    ];
 
     fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
+            step_mode: wgpu::VertexStepMode::Instance,
             attributes: &Self::ATTRIBUTES,
         }
     }
@@ -191,7 +201,7 @@ impl OrbitalSphereScene {
                     module: &shader,
                     entry_point: Some("line_vs"),
                     compilation_options: Default::default(),
-                    buffers: &[Some(LineVertex::layout())],
+                    buffers: &[Some(QuadVertex::layout()), Some(LineSegment::layout())],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
@@ -204,7 +214,6 @@ impl OrbitalSphereScene {
                     })],
                 }),
                 primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::LineList,
                     cull_mode: None,
                     ..Default::default()
                 },
@@ -346,7 +355,7 @@ impl OrbitalSphereScene {
                     crate::mesh_orb::camera_distance(viewport),
                     SPHERE_RADIUS * 1.1,
                     1.0,
-                    0.0,
+                    viewport.pixels_per_point,
                 ],
             }),
         );
@@ -357,7 +366,10 @@ impl OrbitalSphereScene {
             return Err("Orb geometry exceeded fixed GPU capacity".into());
         }
         self.node_count = geometry.particles.len() as u32;
-        self.line_count = geometry.lines.len() as u32;
+        if !geometry.lines.len().is_multiple_of(2) {
+            return Err("Orb line geometry contains an incomplete segment".into());
+        }
+        self.line_count = (geometry.lines.len() / 2) as u32;
         if !geometry.particles.is_empty() {
             queue.write_buffer(
                 &self.node_buffer,
@@ -435,8 +447,10 @@ impl OrbitalSphereScene {
         particles: &'a wgpu::RenderPipeline,
     ) {
         pass.set_pipeline(lines);
-        pass.set_vertex_buffer(0, self.orbit_buffer.slice(..));
-        pass.draw(0..self.line_count, 0..1);
+        pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
+        pass.set_vertex_buffer(1, self.orbit_buffer.slice(..));
+        pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..6, 0, 0..self.line_count);
         pass.set_pipeline(particles);
         pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
         pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -480,4 +494,156 @@ fn srgb_to_linear(color: Vec3) -> Vec3 {
             ((channel + 0.055) / 1.055).powf(2.4)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a native GPU adapter; run with --ignored"]
+    fn gpu_marker_area_and_branch_width_follow_display_scale() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut scene = OrbitalSphereScene::new(&device, format, wgpu::TextureFormat::Depth32Float);
+        // Isolated probes use the actual production pipelines, buffers and
+        // shader. Red marker and green branch let us measure them independently.
+        scene.atmosphere_count = 0;
+        scene.node_count = 1;
+        scene.line_count = 1;
+        queue.write_buffer(
+            &scene.node_buffer,
+            0,
+            bytemuck::bytes_of(&Particle {
+                position_size: [-0.5, 0.0, 1.0, 8.0],
+                color_softness: [1.0, 0.0, 0.0, 0.92],
+            }),
+        );
+        queue.write_buffer(
+            &scene.orbit_buffer,
+            0,
+            bytemuck::cast_slice(&[
+                LineVertex {
+                    position: [0.0, 0.0, 1.0],
+                    color: [0.0, 0.7, 0.0, 1.0],
+                },
+                LineVertex {
+                    position: [0.75, 0.0, 1.0],
+                    color: [0.0, 0.7, 0.0, 1.0],
+                },
+            ]),
+        );
+        let mut base_marker_area = 0.0;
+        for scale in [1.0, 1.25, 1.5, 2.0, 3.0, 4.0] {
+            let width = (128.0 * scale) as u32;
+            let size = wgpu::Extent3d {
+                width,
+                height: width,
+                depth_or_array_layers: 1,
+            };
+            let make_texture = |format, usage| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("DPI render probe"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+            };
+            let color = make_texture(
+                format,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            );
+            let depth = make_texture(
+                wgpu::TextureFormat::Depth32Float,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            );
+            queue.write_buffer(
+                &scene.uniform_buffer,
+                0,
+                bytemuck::bytes_of(&SceneUniforms {
+                    view_projection: Mat4::IDENTITY.to_cols_array_2d(),
+                    group_model: Mat4::IDENTITY.to_cols_array_2d(),
+                    viewport_brightness: [width as f32, width as f32, 1.0, scale],
+                    camera_depth: [10.0, 2.0, 1.0, scale],
+                }),
+            );
+            let stride = (width * 4).div_ceil(256) * 256;
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("DPI readback"),
+                size: (stride * width) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            scene.render(
+                &mut encoder,
+                &color.create_view(&Default::default()),
+                &depth.create_view(&Default::default()),
+                None,
+            );
+            encoder.copy_texture_to_buffer(
+                color.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(stride),
+                        rows_per_image: Some(width),
+                    },
+                },
+                size,
+            );
+            let submission = queue.submit([encoder.finish()]);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    sender.send(result).unwrap()
+                });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: Some(std::time::Duration::from_secs(10)),
+                })
+                .unwrap();
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            let pixels = readback.slice(..).get_mapped_range().unwrap();
+            let mut marker_area = 0.0;
+            let mut branch_width = 0.0;
+            for y in 0..width {
+                for x in 0..width {
+                    let index = (y * stride + x * 4) as usize;
+                    if x < width / 2 && pixels[index] > 20 {
+                        marker_area += f32::from(pixels[index]) / 255.0 / scale.powi(2);
+                    }
+                    // Center column excludes endpoints and the isolated marker.
+                    if x == width * 3 / 4 {
+                        branch_width += f32::from(pixels[index + 1]) / 255.0 / 0.7 / scale;
+                    }
+                }
+            }
+            if scale == 1.0 {
+                base_marker_area = marker_area;
+            }
+            assert!(base_marker_area > 50.0);
+            assert!(
+                (marker_area / base_marker_area - 1.0).abs() < 0.06,
+                "{scale}x marker area: {marker_area}, base: {base_marker_area}"
+            );
+            assert!(
+                (branch_width - 1.0).abs() < 0.05,
+                "{scale}x branch logical width: {branch_width}"
+            );
+        }
+    }
 }
