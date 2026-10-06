@@ -18,6 +18,8 @@ path = "src/screensaver_main.rs"
 required-features = ["screensaver"]
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+glam = "0.33.9"
 egui = "=0.36.2"
 egui-wgpu = "=0.36.2"
 env_logger = "0.11"
@@ -42,7 +44,7 @@ tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Preserve wgputests' Wayland startup fix: no eager arboard X11 connection.
-egui-winit = { version = "=0.36.2", default-features = false, features = ["links", "wayland", "x11", "smithay-clipboard"] }
+egui-winit = { version = "=0.36.2", default-features = false, features = ["links", "wayland", "x11"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 egui-winit = "=0.36.2"
