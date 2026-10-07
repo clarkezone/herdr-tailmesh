@@ -55,12 +55,15 @@ Block and floating-panel specifications. It changes the Orb viewer only.
   existing scoped activities from the complete observation before prioritized
   admission. Update downgraded states before eviction so they immediately release
   capacity for new blocked attention. Regression tests cover both cases.
+- Final PR review excludes unanchorable agents from pending admission demand:
+  agents on nodes awaiting a free rendered-node slot during churn cannot displace visible cards
+  and restart their entrances. Their capacity omission remains explicit.
 - Source/removal identity and Focus exit remain independent of card persistence.
 
 ## Validation
 
 - Formatting and strict screensaver-feature all-target clippy passed.
-- 96 distinct portable Rust tests passed (174 executions across both launchers);
+- 97 distinct portable Rust tests passed (176 executions across both launchers);
   optional native GPU readback tests were excluded.
 - Optimized Linux viewer and screensaver builds passed.
 - A temporary synthetic variant of the existing Go observer window fixture supplied
@@ -70,4 +73,3 @@ Block and floating-panel specifications. It changes the Orb viewer only.
   cleanly and the graphical smoke passed. The temporary fixture was removed.
 - Windows/macOS native graphical, mixed-DPI and screensaver acceptance remain
   manual. Final-head platform CI must pass before merge; see the PR for receipts.
-

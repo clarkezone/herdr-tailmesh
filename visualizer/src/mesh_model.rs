@@ -689,9 +689,15 @@ impl Simulation {
             }
         }
         let mut incoming = [0usize; 4];
-        for (branch, _, _) in &agents {
+        for (branch, _, node) in &agents {
             let state = AgentState::observed(&branch.status);
-            if state.persistent() && !self.activities.contains_key(&branch.key) {
+            if state.persistent()
+                && !self.activities.contains_key(&branch.key)
+                && self
+                    .id(&branch.key)
+                    .or_else(|| self.id(&node.key))
+                    .is_some()
+            {
                 incoming[state.priority() as usize] += 1;
             }
         }
@@ -1188,6 +1194,45 @@ pub mod tests {
                 .all(|(key, a)| key[1] == "two" && a.persistent && a.state == AgentState::Blocked)
         );
         assert_eq!(sim.omitted_activities, 16380 - MAX_ENTITIES);
+    }
+    #[test]
+    fn agents_without_a_rendered_node_do_not_evict_visible_completed_cards() {
+        let mut nodes: Vec<_> = (0..MAX_NODES)
+            .map(|n| node(&n.to_string(), "done", 1))
+            .collect();
+        let mut sim = Simulation::default();
+        sim.update(&view(nodes.clone(), 1), Stamp::seconds(201), 0.);
+        let removed = nodes.remove(0).instance_id;
+        let serials: BTreeMap<_, _> = sim
+            .activities
+            .iter()
+            .filter(|(k, _)| k[1] != removed)
+            .map(|(k, a)| (k.clone(), a.event.serial))
+            .collect();
+        nodes.push(node("replacement", "blocked", 4095));
+        let changed = view(nodes, 2);
+        // Old node geometry occupies all 128 slots until its exit finishes.
+        sim.update(&changed, Stamp::seconds(202), 0.1);
+        assert!(sim.id(&vec!["node".into(), "replacement".into()]).is_none());
+        assert_eq!(
+            sim.activities.values().filter(|a| a.persistent).count(),
+            serials.len()
+        );
+        assert!(
+            sim.activities
+                .iter()
+                .filter(|(_, a)| a.persistent)
+                .all(|(k, a)| a.state == AgentState::Completed
+                    && serials.get(k) == Some(&a.event.serial))
+        );
+        assert_eq!(sim.omitted_activities, 8190);
+        sim.update(&changed, Stamp::seconds(202), 1.31);
+        assert_eq!(sim.activities.len(), MAX_ENTITIES);
+        assert!(
+            sim.activities
+                .values()
+                .all(|a| a.state == AgentState::Blocked)
+        );
     }
     #[test]
     fn concurrent_work_and_completion_persist_then_idle_notices_expire_independently() {
