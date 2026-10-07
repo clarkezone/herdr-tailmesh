@@ -35,13 +35,19 @@ replaces attention with work. Completed cards remain until the agent changes sta
 or disappears, including agents already done at startup/reconnect. A bracketed **×**
 beside the Focus reticle acknowledges that card's completion locally and retracts
 it. The control glows on hover/keyboard focus; hover help identifies Dismiss.
-The acknowledgement lasts for that observed Completed episode, across unchanged
+The acknowledgement is scoped to the agent's full node/session/incarnation/
+workspace/tab identity **and its current completion instance**. Each accepted
+snapshot is tracked before the UI reads the latest scene, so receiving Working
+then Done rearms its banner even if Working was never drawn. A new completion
+restarts its reveal; unchanged Done/reconnect does not. The acknowledgement lasts for that observed Completed episode, across unchanged
 snapshots/reconnects, until a state change/removal/source reset; a later completion
 appears again. Counts and agent state stay unchanged; selection and Focus remain
 available. Dismissals are local to this viewer launch. A fresh observed
 transition to idle or unknown shows that actual state for ten seconds. Reconnect/stale
 comparisons never invent transition events; retained cards are marked LAST KNOWN. Live removal has a truthful
 no-longer-observed notice. Multiple cards remain pageable without expiring off-page.
+The viewer cannot detect a new task if the observation stream reports Done twice
+without any intervening state/removal or a distinct completion ID.
 
 Fresh blocked agents cause a gentle amber node beacon and a repeating circuit/ripple
 inside their surface cluster. This uses full observations even when geometry is
