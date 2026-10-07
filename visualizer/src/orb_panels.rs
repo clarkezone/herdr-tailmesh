@@ -8,6 +8,7 @@ use crate::{
 };
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Ui, UiBuilder, pos2, vec2};
 use herdr_mesh_visualizer::{client::View, projection::Key};
+use std::collections::{BTreeMap, BTreeSet};
 
 const CYAN: Color32 = Color32::from_rgb(90, 216, 235);
 
@@ -16,6 +17,8 @@ pub struct Panels {
     pub page: usize,
     pub projects: bool,
     pub focus: Option<Key>,
+    dismissed: BTreeMap<Key, f64>,
+    dismissal_revision: Option<(u64, u64)>,
     controls: Controls,
     key_motion: Option<Motion>,
     count_motion: Option<Motion>,
@@ -32,6 +35,40 @@ impl Panels {
         self.membership.clear();
         self.projects = false;
         self.focus = None;
+        self.dismissed.clear();
+        self.dismissal_revision = None;
+    }
+    fn refresh_dismissals(&mut self, view: &View) {
+        let revision = (view.epoch, view.revision);
+        if self.dismissal_revision == Some(revision) {
+            return;
+        }
+        self.dismissal_revision = Some(revision);
+        if self.dismissed.is_empty() {
+            return;
+        }
+        let mut retained = BTreeSet::new();
+        fn scan(
+            branch: &herdr_mesh_visualizer::projection::Branch,
+            dismissed: &BTreeMap<Key, f64>,
+            retained: &mut BTreeSet<Key>,
+        ) {
+            if branch.kind == "agent"
+                && branch.status == "done"
+                && dismissed.contains_key(&branch.key)
+            {
+                retained.insert(branch.key.clone());
+            }
+            for child in &branch.children {
+                scan(child, dismissed, retained);
+            }
+        }
+        if let Some(scene) = &view.scene {
+            for node in &scene.nodes {
+                scan(node, &self.dismissed, &mut retained);
+            }
+        }
+        self.dismissed.retain(|key, _| retained.contains(key));
     }
     pub fn handle_input(&mut self, ui: &Ui, clock: f64, passive: bool) {
         self.controls.update(clock);
@@ -310,6 +347,12 @@ fn title(card: &Card<'_>, sim: &Simulation) -> String {
 }
 fn card_reveal(card: &Card<'_>, context: &Context<'_>, state: &Panels) -> Reveal {
     let own = Reveal::event(context.sim.clock - card.event.started, card.persistent);
+    if let Some(since) = card.key.and_then(|key| state.dismissed.get(key)) {
+        return Reveal::new(
+            own.amount()
+                .min((1. - (context.sim.clock - since) / crate::orb_hud::RETRACT) as f32),
+        );
+    }
     if card.working {
         Reveal::new(
             own.amount()
@@ -463,7 +506,25 @@ fn page_controls(
     }
 }
 
+fn dismiss_completed(ui: &mut Ui, key: &Key, state: &mut Panels, clock: f64, compact: bool) {
+    let response = ui.small_button(if compact { "×" } else { "Dismiss" });
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            "Dismiss completed notification",
+        )
+    });
+    if response
+        .on_hover_text("Acknowledge this completion; a later completion will appear again")
+        .clicked()
+    {
+        state.dismissed.insert(key.clone(), clock);
+    }
+}
+
 pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response {
+    state.refresh_dismissals(context.view);
     let rect = context.rect;
     let painter = ui.painter().with_clip_rect(rect);
     let docks = dock_layout(context, state);
@@ -473,14 +534,8 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         .and_then(|key| crate::orb_ui::selected_branch(context.view, key));
     let mut reserved: Vec<_> = docks.iter().map(|d| d.bounds).collect();
     if !context.passive
-        && let Some(bounds) = crate::orb_focus::panel(
-            ui,
-            context.sim,
-            context.view,
-            rect,
-            &mut state.focus,
-            &reserved,
-        )
+        && let Some(bounds) =
+            crate::orb_focus::panel(ui, context.view, rect, &mut state.focus, &reserved)
     {
         reserved.push(bounds);
         response.blocked.push(bounds);
@@ -495,6 +550,10 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
     let candidates: Vec<_> = cards(context.sim)
         .into_iter()
         .filter(|c| !c.working || state.controls.workers.occupies(context.sim.clock))
+        .filter(|c| {
+            card_reveal(c, context, state).active()
+                || c.key.is_none_or(|key| !state.dismissed.contains_key(key))
+        })
         .collect();
     if !state
         .membership
@@ -558,6 +617,27 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
     // Capture this frame's cursor: clicking a pager changes only the next frame.
     let page_start = state.page_start;
     let pager = page_start > 0 || page_start + capacity < candidates.len();
+    // All current overlay geometry must be known before projecting names.
+    let mut label_obstacles = reserved.clone();
+    label_obstacles.extend(slots.iter().zip(candidates.iter().skip(page_start)).map(
+        |(slot, card)| {
+            slot.translate(vec2(
+                0.,
+                drift(context.sim.clock, (card.event.serial % 3) as f64, 8.),
+            ))
+            .expand(3.)
+        },
+    ));
+    if !context.passive {
+        crate::orb_focus::labels(
+            ui,
+            context.sim,
+            context.view,
+            rect,
+            &state.focus,
+            &label_obstacles,
+        );
+    }
     if let Some(anchor) = mesh_orb::project_sim(
         mesh_orb::coordinator(context.sim.motion_time()),
         context.sim,
@@ -651,7 +731,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         );
         let mut child = ui.new_child(
             UiBuilder::new()
-                .id_salt(("orb-activity", card.event.serial))
+                .id(ui.id().with(("orb-activity", card.event.serial)))
                 .max_rect(body),
         );
         child.set_clip_rect(body.intersect(aperture));
@@ -684,7 +764,8 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             );
             let mut child = ui.new_child(
                 UiBuilder::new()
-                    .id_salt(("orb-activity-focus", card.event.serial))
+                    // Hierarchy/observation insertion must not change these widget IDs.
+                    .id(ui.id().with(("orb-activity-focus", card.event.serial)))
                     .max_rect(footer),
             );
             child.set_clip_rect(footer.intersect(aperture));
@@ -692,12 +773,27 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                 child.disable();
             }
             child.set_opacity(opacity);
-            if let Some(key) = card.key.or_else(|| context.sim.key(card.event.origin)) {
-                // Removed activity keys do not inherit a recycled geometry slot.
-                if context.sim.anchor(key).is_some() {
-                    crate::orb_focus::checkbox(&mut child, context.view, key, &mut state.focus);
+            child.horizontal(|ui| {
+                if let Some(key) = card.key.or_else(|| context.sim.key(card.event.origin)) {
+                    let completed = card.persistent
+                        && context
+                            .sim
+                            .activities
+                            .get(key)
+                            .is_some_and(|a| a.state == AgentState::Completed);
+                    let compact = ui.available_width() < 100.;
+                    if completed && compact {
+                        dismiss_completed(ui, key, state, context.sim.clock, true);
+                    }
+                    // Removed activity keys do not inherit a recycled geometry slot.
+                    if context.sim.anchor(key).is_some() {
+                        crate::orb_focus::checkbox(ui, context.view, key, &mut state.focus);
+                    }
+                    if completed && !compact {
+                        dismiss_completed(ui, key, state, context.sim.clock, false);
+                    }
                 }
-            }
+            });
         }
         if has_pager {
             let footer = Rect::from_min_max(
@@ -706,7 +802,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             );
             let mut child = ui.new_child(
                 UiBuilder::new()
-                    .id_salt("orb-activity-page")
+                    .id(ui.id().with("orb-activity-page"))
                     .max_rect(footer),
             );
             child.set_clip_rect(footer.intersect(aperture));
@@ -733,7 +829,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         let body = card.shrink(12.).intersect(rect);
         let mut child = ui.new_child(
             UiBuilder::new()
-                .id_salt("orb-observation-callout")
+                .id(ui.id().with("orb-observation-callout"))
                 .max_rect(body),
         );
         child.set_clip_rect(body);
@@ -824,11 +920,11 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             );
             let mut child = ui.new_child(
                 UiBuilder::new()
-                    .id_salt(if dock.panel == Panel::Key {
+                    .id(ui.id().with(if dock.panel == Panel::Key {
                         "orb-key-controls"
                     } else {
                         "orb-count-controls"
-                    })
+                    }))
                     .max_rect(header),
             );
             child.set_clip_rect(header.intersect(aperture));
@@ -1122,6 +1218,282 @@ mod tests {
         output.textures_delta.clear();
     }
     #[test]
+    fn startup_key_and_callouts_cannot_hide_focused_names_or_hierarchy() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "done", 2)], 1);
+        let mut sim = Simulation::default();
+        let mut state = Panels {
+            focus: Some(v.scene.as_ref().unwrap().nodes[0].key.clone()),
+            ..Default::default()
+        };
+        let mut controller = crate::orb_focus::Controller::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 600.));
+        sim.update(&v, Stamp::seconds(201), 0.);
+        controller.update(&mut sim, &mut state.focus, rect);
+        for clock in [2., 4., 30., 59.9, 60.5, 62.] {
+            sim.update(&v, Stamp::seconds(201), clock);
+            controller.update(&mut sim, &mut state.focus, rect);
+            let names: BTreeSet<_> = sim
+                .entities
+                .keys()
+                .map(|id| sim.name(*id).to_owned())
+                .collect();
+            let mut blocked = Vec::new();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    blocked = draw(
+                        ui,
+                        &Context {
+                            sim: &sim,
+                            view: &v,
+                            rect,
+                            selected: None,
+                            passive: false,
+                        },
+                        &mut state,
+                    )
+                    .blocked;
+                },
+            );
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text().contains("Rotation paused"))), "hierarchy missing at {clock}");
+            let projected: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if names.contains(t.galley.text()) => {
+                        Some(Rect::from_min_size(t.pos, t.galley.size()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(!projected.is_empty(), "names missing at {clock}");
+            assert!(
+                projected.iter().all(|label| rect.contains_rect(*label)
+                    && blocked.iter().all(|r| !r.intersects(*label))),
+                "projected name behind overlay at {clock}"
+            );
+            output.textures_delta.clear();
+        }
+    }
+    #[test]
+    fn keyboard_focus_survives_the_hierarchy_appearing_before_activity_controls() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "done", 1)], 1);
+        let mut sim = Simulation::default();
+        let mut state = Panels::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 600.));
+        sim.update(&v, Stamp::seconds(201), 0.);
+        sim.update(&v, Stamp::seconds(201), 2.);
+        let run = |state: &mut Panels, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    draw(
+                        ui,
+                        &Context {
+                            sim: &sim,
+                            view: &v,
+                            rect,
+                            selected: None,
+                            passive: false,
+                        },
+                        state,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+        };
+        run(&mut state, vec![]);
+        for _ in 0..12 {
+            run(&mut state, vec![key(egui::Key::Tab, true, false)]);
+            run(&mut state, vec![key(egui::Key::Tab, false, false)]);
+            run(&mut state, vec![key(egui::Key::Space, true, false)]);
+            run(&mut state, vec![key(egui::Key::Space, false, false)]);
+            if state.focus.is_some() {
+                break;
+            }
+        }
+        assert!(state.focus.is_some(), "Tab must reach a reticle");
+        let focused = ctx.memory(|m| m.focused());
+        assert!(
+            focused.is_some(),
+            "reticle must retain keyboard focus after hierarchy appears"
+        );
+        run(&mut state, vec![]);
+        assert_eq!(ctx.memory(|m| m.focused()), focused);
+        run(&mut state, vec![key(egui::Key::Enter, true, false)]);
+        assert!(
+            state.focus.is_none(),
+            "Enter must still toggle the same reticle off"
+        );
+        run(&mut state, vec![key(egui::Key::Enter, false, false)]);
+        run(&mut state, vec![key(egui::Key::Space, true, false)]);
+        run(&mut state, vec![key(egui::Key::Space, false, false)]);
+        assert!(state.focus.is_some());
+        run(&mut state, vec![key(egui::Key::Tab, true, false)]);
+        run(&mut state, vec![key(egui::Key::Tab, false, false)]);
+        run(&mut state, vec![key(egui::Key::Enter, true, false)]);
+        assert_eq!(
+            state.dismissed.len(),
+            1,
+            "Tab must reach Dismiss beside the active reticle"
+        );
+        assert!(
+            state.focus.is_some(),
+            "acknowledgement must leave Focus active"
+        );
+    }
+    #[test]
+    fn dismiss_click_acknowledges_one_completion_without_hiding_counts_or_focus() {
+        let ctx = egui::Context::default();
+        let mut v = view(vec![node("one", "done", 1)], 1);
+        let mut sim = Simulation::default();
+        let mut state = Panels {
+            focus: Some(v.scene.as_ref().unwrap().nodes[0].key.clone()),
+            ..Default::default()
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
+        sim.update(&v, Stamp::seconds(201), 0.);
+        sim.update(&v, Stamp::seconds(201), 2.);
+        let draw_frame = |sim: &Simulation, v: &View, state: &mut Panels, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    draw(
+                        ui,
+                        &Context {
+                            sim,
+                            view: v,
+                            rect,
+                            selected: None,
+                            passive: false,
+                        },
+                        state,
+                    );
+                },
+            );
+            let dismiss = output.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Dismiss" => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            });
+            let count = output.shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "AGENT COMPLETED")).count();
+            output.textures_delta.clear();
+            (dismiss, count)
+        };
+        let (button, count) = draw_frame(&sim, &v, &mut state, vec![]);
+        assert_eq!(count, 2);
+        let p = button.unwrap();
+        for pressed in [true, false] {
+            draw_frame(
+                &sim,
+                &v,
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(p),
+                    egui::Event::PointerButton {
+                        pos: p,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        assert_eq!(state.dismissed.len(), 1);
+        let key = state.dismissed.keys().next().unwrap().clone();
+        sim.update(&v, Stamp::seconds(201), 2.8);
+        assert!(
+            card_reveal(
+                &cards(&sim)
+                    .into_iter()
+                    .find(|c| c.key == Some(&key))
+                    .unwrap(),
+                &Context {
+                    sim: &sim,
+                    view: &v,
+                    rect,
+                    selected: None,
+                    passive: false
+                },
+                &state
+            )
+            .active()
+        );
+        sim.update(&v, Stamp::seconds(201), 4.);
+        assert_eq!(draw_frame(&sim, &v, &mut state, vec![]).1, 1);
+        assert_eq!(sim.activities.len(), 2);
+        assert!(
+            !state
+                .membership
+                .contains(&sim.activities[&key].event.serial),
+            "acknowledged card must leave pagination and hit masks"
+        );
+        assert_eq!(sim.summary().states[2], 2);
+        assert!(state.focus.is_some());
+        v.epoch = 2;
+        v.revision = 2;
+        sim.update(&v, Stamp::seconds(202), 5.);
+        assert_eq!(draw_frame(&sim, &v, &mut state, vec![]).1, 1);
+        assert!(state.dismissed.contains_key(&key));
+        let mut changed = node("one", "done", 1);
+        let inventory = if key[3].is_empty() {
+            changed.herdr.as_mut().unwrap()
+        } else {
+            changed.sessions[0].herdr.as_mut().unwrap()
+        };
+        inventory.agents[0].agent_status = "working".into();
+        let mut working = view(vec![changed], 3);
+        working.epoch = 2;
+        sim.update(&working, Stamp::seconds(202), 6.);
+        draw_frame(&sim, &working, &mut state, vec![]);
+        assert!(state.dismissed.is_empty());
+        v.revision = 4;
+        sim.update(&v, Stamp::seconds(202), 7.);
+        sim.update(&v, Stamp::seconds(202), 9.);
+        assert_eq!(draw_frame(&sim, &v, &mut state, vec![]).1, 2);
+    }
+    #[test]
+    fn acknowledgements_survive_sampled_history_readmission_but_not_removal_or_source_reset() {
+        let mut sim = Simulation::default();
+        let mut v = view(vec![node("one", "done", 3999)], 1);
+        sim.update(&v, Stamp::seconds(201), 0.);
+        let key = sim
+            .activities
+            .keys()
+            .find(|k| sim.id(k).is_none())
+            .unwrap()
+            .clone();
+        let mut state = Panels::default();
+        state.dismissed.insert(key.clone(), 0.);
+        state.refresh_dismissals(&v);
+        let serial = sim.activities.remove(&key).unwrap().event.serial;
+        v.revision = 2;
+        sim.update(&v, Stamp::seconds(202), 10.);
+        state.refresh_dismissals(&v);
+        assert!(sim.activities[&key].event.serial > serial);
+        assert!(state.dismissed.contains_key(&key));
+        assert_eq!(sim.summary().agents, 7998);
+        state.refresh_dismissals(&view(vec![], 3));
+        assert!(state.dismissed.is_empty());
+        state.dismissed.insert(key, 0.);
+        state.reset_source();
+        assert!(state.dismissed.is_empty());
+    }
+    #[test]
     fn completed_startup_cards_render_after_one_minute_with_work_hidden_and_focus_available() {
         let ctx = egui::Context::default();
         let v = view(vec![node("one", "done", 1)], 1);
@@ -1152,7 +1524,6 @@ mod tests {
         );
         for expected in [
             "AGENT COMPLETED",
-            "Focus",
             "Actual node one",
             "Actual workspace",
             "Actual agent 0",

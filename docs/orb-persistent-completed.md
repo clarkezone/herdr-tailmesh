@@ -1,5 +1,9 @@
 # Persistent Completed callouts
 
+[Completion acknowledgement](orb-focus-and-dismissal.md) adds local Dismiss:
+unacknowledged cards persist; acknowledging a current completion retracts its card
+until a state change/removal/source reset. Observations and counts stay unchanged.
+
 This follow-up supersedes the ten-second completion lifetime in the Persistent
 Block and floating-panel specifications. It changes the Orb viewer only.
 
