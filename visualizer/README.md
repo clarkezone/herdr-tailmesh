@@ -43,9 +43,10 @@ pulses. Sampled agent callouts anchor to their owning node. Callout history is c
 at 8,000, with attention ahead of working cards and old timed history; capacity
 omissions are disclosed independently of K/N/W, while totals remain complete.
 
-Every activity callout and selected node/descendant observation offers **Focus**.
+Every activity callout and selected node/descendant observation offers a compact
+illuminated reticle **Focus** toggle.
 Checking it pauses orbital motion and eases that node's surface cluster forward
-with zoom over 1.5 seconds. Another node transfers focus; uncheck, **Escape**, or
+with zoom over 1.5 seconds; focus framing has a further 20% magnification boost. Another node transfers focus; uncheck, **Escape**, or
 **Return to fleet** restores the rotating overview without a camera jump. Focus
 survives callout expiry and W hiding, but releases on node removal/source replacement.
 Live data, attention and heartbeat effects keep running while motion is paused.

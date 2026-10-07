@@ -11,6 +11,7 @@ use herdr_mesh_visualizer::{
 };
 
 const DURATION: f64 = 1.5;
+const MAX_FOCUS_ZOOM: f32 = 7.2;
 const COLOR: Color32 = Color32::from_rgb(90, 216, 235);
 #[derive(Clone, Copy, Debug)]
 pub struct Pose {
@@ -148,7 +149,8 @@ fn focused(sim: &Simulation, node: usize, orbit_time: f32, rect: Rect) -> Pose {
     Pose {
         rotation,
         center,
-        zoom: (mesh_orb::camera_distance(viewport) / distance.max(1.5)).clamp(1., 6.),
+        zoom: (1.2 * mesh_orb::camera_distance(viewport) / distance.max(1.5))
+            .clamp(1., MAX_FOCUS_ZOOM),
         orbit_time,
     }
 }
@@ -161,16 +163,104 @@ pub fn node_for<'a>(view: &'a View, key: &Key) -> Option<&'a Branch> {
         .find(|n| key.starts_with(&n.key))
 }
 pub fn checkbox(ui: &mut Ui, view: &View, key: &Key, focus: &mut Option<Key>) {
-    if let Some(node) = node_for(view, key) {
-        let mut checked = focus.as_ref() == Some(&node.key);
-        if ui
-            .checkbox(&mut checked, "Focus")
-            .on_hover_text("Bring this node's cluster forward and pause rotation")
-            .changed()
-        {
-            *focus = checked.then(|| node.key.clone());
-        }
+    let Some(node) = node_for(view, key) else {
+        return;
+    };
+    let mut checked = focus.as_ref() == Some(&node.key);
+    let (rect, mut response) = ui.allocate_exact_size(
+        vec2(76_f32.min(ui.available_width().max(1.)), 20.),
+        egui::Sense::click(),
+    );
+    if response.clicked() {
+        checked = !checked;
+        *focus = checked.then(|| node.key.clone());
+        response.mark_changed();
     }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            ui.is_enabled(),
+            checked,
+            "Focus",
+        )
+    });
+    let amount = ui.ctx().animate_bool_with_time(response.id, checked, 0.4);
+    let strength = if response.hovered() || response.has_focus() {
+        1.
+    } else {
+        0.55 + 0.45 * amount
+    };
+    let color = COLOR.gamma_multiply(strength);
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        2.,
+        Color32::from_rgba_unmultiplied(8, 35, 47, (35. + 50. * amount) as u8),
+    );
+    // Cut-corner rails and a lit targeting reticle instead of a stock tickbox.
+    let r = rect.shrink(1.);
+    for (corner, dx, dy) in [
+        (r.left_top(), 1., 1.),
+        (r.right_top(), -1., 1.),
+        (r.left_bottom(), 1., -1.),
+        (r.right_bottom(), -1., -1.),
+    ] {
+        painter.line_segment(
+            [corner + vec2(dx * 7., 0.), corner],
+            egui::Stroke::new(0.8, color),
+        );
+        painter.line_segment(
+            [corner, corner + vec2(0., dy * 5.)],
+            egui::Stroke::new(0.8, color),
+        );
+    }
+    let center = egui::pos2(
+        rect.left() + 13_f32.min(rect.width() * 0.5),
+        rect.center().y,
+    );
+    let diamond = [
+        center + vec2(0., -5.),
+        center + vec2(5., 0.),
+        center + vec2(0., 5.),
+        center + vec2(-5., 0.),
+    ];
+    painter.add(egui::Shape::closed_line(
+        diamond.to_vec(),
+        egui::Stroke::new(0.8, color),
+    ));
+    for (a, b) in [
+        (vec2(-8., 0.), vec2(-6., 0.)),
+        (vec2(6., 0.), vec2(8., 0.)),
+        (vec2(0., -8.), vec2(0., -6.)),
+        (vec2(0., 6.), vec2(0., 8.)),
+    ] {
+        painter.line_segment([center + a, center + b], egui::Stroke::new(0.8, color));
+    }
+    if amount > 0.001 {
+        painter.circle_filled(center, 4., COLOR.gamma_multiply(amount * 0.15));
+        painter.circle_filled(center, 1.7, COLOR.gamma_multiply(amount));
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + 27., rect.bottom() - 3.),
+                egui::pos2(rect.left() + 27. + 38. * amount, rect.bottom() - 3.),
+            ],
+            egui::Stroke::new(0.8, COLOR.gamma_multiply(amount)),
+        );
+    }
+    if rect.width() >= 62. {
+        painter.text(
+            egui::pos2(rect.left() + 27., rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            "Focus",
+            FontId::monospace(10.),
+            color,
+        );
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(
+            "Bring this node's cluster forward and pause rotation; click again to return",
+        );
 }
 /// Always-available exit and virtualized complete hierarchy, including sampled detail.
 pub fn panel(
@@ -410,7 +500,7 @@ mod tests {
             let pose = sim.camera.unwrap();
             assert!(pose.center.is_finite());
             assert!(pose.rotation.is_finite());
-            assert!((1. ..=6.).contains(&pose.zoom));
+            assert!((1. ..=MAX_FOCUS_ZOOM).contains(&pose.zoom));
             let id = *sim
                 .entities
                 .keys()
@@ -488,6 +578,40 @@ mod tests {
             );
             output.textures_delta.clear();
         }
+    }
+    #[test]
+    fn custom_reticle_keeps_tab_space_and_enter_checkbox_semantics() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "blocked", 1)], 1);
+        let mut focus = None;
+        let key = &v.scene.as_ref().unwrap().nodes[0].key;
+        let run = |focus: &mut Option<Key>, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| checkbox(ui, &v, key, focus),
+            );
+            output.textures_delta.clear();
+        };
+        let event = |key, pressed| {
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: Default::default(),
+            }]
+        };
+        run(&mut focus, vec![]);
+        run(&mut focus, event(egui::Key::Tab, true));
+        run(&mut focus, event(egui::Key::Tab, false));
+        run(&mut focus, event(egui::Key::Space, true));
+        assert_eq!(focus.as_ref(), Some(key));
+        run(&mut focus, event(egui::Key::Space, false));
+        run(&mut focus, event(egui::Key::Enter, true));
+        assert!(focus.is_none());
     }
     #[test]
     fn real_checkbox_input_sets_scoped_focus_and_unchecks_it() {
