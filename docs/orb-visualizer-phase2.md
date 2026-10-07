@@ -1,5 +1,9 @@
 # Live Orb visualizer: phase 2 plan and review
 
+PR #11 subsequently merged as `3a5ed89` after the user approved merge. The
+original plan/review below is historical; [floating panels and persistent
+activity](orb-floating-panels.md) describes the next presentation revision.
+
 ## Result and scope
 
 Make the accepted Mesh Orb experience from wgputests main (`3c0eb41`) the

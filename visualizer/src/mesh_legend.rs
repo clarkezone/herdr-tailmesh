@@ -62,59 +62,26 @@ pub struct Layout {
     icon_width: f32,
 }
 
-// Keep hierarchy and agent states on separate rows; wrap each group on narrow windows.
+// A vertical hierarchy with indented agent states and their ownership bracket.
 pub fn layout(painter: &Painter, viewport: Rect, bottom: f32) -> Layout {
-    let bottom = bottom.clamp(viewport.top(), viewport.bottom());
-    let width = (viewport.width() - 40.0).max(1.0);
-    let inner_width = (width - 16.0).max(1.0);
-    let icon_width = if inner_width >= 360.0 && viewport.height() >= 280.0 {
-        48.0
-    } else {
-        32.0
-    };
-    let row_height = icon_width - 4.0;
+    let available = (bottom.min(viewport.bottom()) - viewport.top()).max(1.);
+    let bounds = Rect::from_min_size(viewport.min, vec2(viewport.width(), available));
+    let icon_width = 36.;
     let mut cells = Vec::with_capacity(ENTRIES.len());
-    let (mut x, mut y) = (0.0, 0.0);
-    for (i, entry) in ENTRIES.iter().enumerate() {
-        let text =
-            painter.layout_no_wrap(entry.label.into(), FontId::monospace(10.0), entry.color());
-        let cell_width = (text.size().x + icon_width + 6.0).min(inner_width);
-        if i == HIERARCHY_COUNT {
-            x = 14.0;
-            y += row_height + 16.0;
-        } else if x > 0.0 && x + cell_width > inner_width {
-            x = if i > HIERARCHY_COUNT { 14.0 } else { 0.0 };
-            y += row_height + if i > HIERARCHY_COUNT { 12.0 } else { 4.0 };
+    if bounds.width() >= 140. && available >= 180. {
+        let scale = (available / 324.).min(1.);
+        let mut y = bounds.top() + 4. * scale;
+        for (i, entry) in ENTRIES.iter().enumerate() {
+            let indent = if i < HIERARCHY_COUNT { 4. } else { 20. };
+            let height = if i < HIERARCHY_COUNT { 36. } else { 26. } * scale;
+            let text =
+                painter.layout_no_wrap(entry.label.into(), FontId::monospace(10.), entry.color());
+            cells.push(Rect::from_min_size(
+                pos2(bounds.left() + indent, y),
+                vec2(icon_width + text.size().x, height),
+            ));
+            y += height + 4. * scale;
         }
-        cells.push(Rect::from_min_size(
-            pos2(x, y),
-            vec2(cell_width, row_height),
-        ));
-        x += cell_width + 10.0;
-    }
-    let height = y + row_height + 16.0;
-    // Do not overlap the title/footer or squeeze labels on undersized views.
-    if viewport.width() < 220.0 || height + 50.0 > bottom - viewport.top() {
-        let margin = (viewport.width() * 0.05).min(20.0);
-        let hint_height = viewport.height().min(16.0);
-        return Layout {
-            bounds: Rect::from_min_size(
-                pos2(
-                    viewport.left() + margin,
-                    (bottom - hint_height).max(viewport.top()),
-                ),
-                vec2((viewport.width() - margin * 2.0).max(1.0), hint_height),
-            ),
-            cells: Vec::new(),
-            icon_width: 0.0,
-        };
-    }
-    let bounds = Rect::from_min_size(
-        pos2(viewport.left() + 20.0, bottom - height),
-        vec2(width, height),
-    );
-    for cell in &mut cells {
-        *cell = cell.translate(bounds.min.to_vec2() + vec2(8.0, 8.0));
     }
     Layout {
         bounds,
@@ -215,13 +182,6 @@ pub fn draw(painter: &Painter, layout: &Layout, time: f32) {
         );
         return;
     }
-    painter.rect_filled(bounds, 4.0, Color32::from_rgba_unmultiplied(4, 12, 24, 230));
-    painter.rect_stroke(
-        bounds,
-        4.0,
-        Stroke::new(0.5, Color32::from_white_alpha(35)),
-        egui::StrokeKind::Inside,
-    );
     for pair in layout.cells[..HIERARCHY_COUNT].windows(2) {
         if pair[0].top() == pair[1].top() {
             let center = pos2(pair[0].right() + 5.0, pair[0].center().y);
@@ -281,64 +241,46 @@ pub fn draw(painter: &Painter, layout: &Layout, time: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn key_wraps_without_overlapping_or_leaving_the_viewport() {
+    fn vertical_key_preserves_order_glyphs_and_indented_state_rows() {
         let context = egui::Context::default();
-        for size in [vec2(280.0, 420.0), vec2(650.0, 460.0), vec2(1200.0, 200.0)] {
-            let viewport = Rect::from_min_size(pos2(45.0, 30.0), size);
-            let mut output = context.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(viewport),
-                    ..Default::default()
-                },
-                |ui| {
-                    let key = layout(ui.painter(), viewport, viewport.bottom() - 40.0);
-                    let Layout {
-                        bounds,
-                        cells,
-                        icon_width,
-                    } = &key;
-                    assert!(viewport.contains_rect(*bounds));
-                    assert_eq!(cells.len(), ENTRIES.len());
-                    for (i, cell) in cells.iter().enumerate() {
-                        assert!(bounds.contains_rect(*cell));
-                        let text = ui.painter().layout_no_wrap(
-                            ENTRIES[i].label.into(),
-                            FontId::monospace(10.0),
-                            ENTRIES[i].color(),
-                        );
-                        assert!(cell.width() >= icon_width + text.size().x);
-                        for other in &cells[i + 1..] {
-                            assert!(!cell.intersects(*other));
-                        }
+        let viewport = Rect::from_min_size(pos2(45., 30.), vec2(176., 248.));
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            },
+            |ui| {
+                let key = layout(ui.painter(), viewport, viewport.bottom());
+                assert_eq!(key.cells.len(), ENTRIES.len());
+                for (i, cell) in key.cells.iter().enumerate() {
+                    assert!(key.bounds.contains_rect(*cell));
+                    assert!(key.cells[..i].iter().all(|other| !other.intersects(*cell)));
+                    if i >= HIERARCHY_COUNT {
+                        assert!(cell.left() > key.cells[0].left());
                     }
-                    assert!(cells[HIERARCHY_COUNT].top() > cells[HIERARCHY_COUNT - 1].top());
-                    draw(ui.painter(), &key, 0.0);
-                },
-            );
-            output.textures_delta.clear();
-        }
+                }
+                draw(ui.painter(), &key, 0.);
+            },
+        );
+        output.textures_delta.clear();
     }
-
     #[test]
     fn undersized_views_show_a_bounded_hint_instead_of_overlapping_labels() {
         let context = egui::Context::default();
-        for size in [vec2(90.0, 240.0), vec2(320.0, 120.0), vec2(280.0, 240.0)] {
-            let viewport = Rect::from_min_size(pos2(45.0, 30.0), size);
-            let mut output = context.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(viewport),
-                    ..Default::default()
-                },
-                |ui| {
-                    let key = layout(ui.painter(), viewport, viewport.bottom() - 40.0);
-                    assert!(viewport.contains_rect(key.bounds));
-                    assert!(key.cells.is_empty());
-                    draw(ui.painter(), &key, 0.0);
-                },
-            );
-            output.textures_delta.clear();
-        }
+        let viewport = Rect::from_min_size(pos2(45., 30.), vec2(90., 120.));
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            },
+            |ui| {
+                let key = layout(ui.painter(), viewport, viewport.bottom());
+                assert!(viewport.contains_rect(key.bounds));
+                assert!(key.cells.is_empty());
+                draw(ui.painter(), &key, 0.);
+            },
+        );
+        output.textures_delta.clear();
     }
 }

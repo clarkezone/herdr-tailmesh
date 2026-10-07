@@ -149,6 +149,10 @@ pub struct Event {
     pub text: String,
     pub color: [f32; 3],
 }
+pub struct Activity {
+    pub event: Event,
+    pub persistent: bool,
+}
 #[derive(Default)]
 pub struct Simulation {
     pub entities: BTreeMap<Id, Life>,
@@ -156,6 +160,8 @@ pub struct Simulation {
     ids: BTreeMap<Key, Id>,
     pub pulses: Vec<Pulse>,
     pub events: VecDeque<Event>,
+    /// Current working agents and their timed stop notices, scoped by identity.
+    pub activities: BTreeMap<Key, Activity>,
     pub time: f32,
     pub clock: f64,
     pub live: bool,
@@ -210,6 +216,9 @@ impl Simulation {
         self.events.retain(|e| {
             self.clock - e.started < CALLOUT_DURATION && self.entities.contains_key(&e.origin)
         });
+        self.activities.retain(|_, activity| {
+            activity.persistent || self.clock - activity.event.started < CALLOUT_DURATION
+        });
         previous != self.entities.len()
     }
 
@@ -249,6 +258,37 @@ impl Simulation {
             self.events.pop_front();
         }
     }
+    fn activity(&mut self, key: &Key, id: Id, state: AgentState, text: String) {
+        let persistent = state == AgentState::Working;
+        if let Some(activity) = self.activities.get_mut(key)
+            && activity.persistent
+            && persistent
+        {
+            activity.event.text = text;
+            return;
+        }
+        self.serial = self.serial.wrapping_add(1);
+        self.activities.insert(
+            key.clone(),
+            Activity {
+                persistent,
+                event: Event {
+                    serial: self.serial,
+                    origin: id,
+                    started: self.clock,
+                    title: match state {
+                        AgentState::Working => "AGENT WORKING",
+                        AgentState::Completed => "AGENT COMPLETED",
+                        AgentState::Blocked => "ATTENTION REQUIRED",
+                        AgentState::Idle => "AGENT IDLE",
+                        AgentState::Unknown => "AGENT STATE UNKNOWN",
+                    },
+                    text,
+                    color: state.color(),
+                },
+            },
+        );
+    }
     pub fn update(&mut self, view: &View, wall: Stamp, clock: f64) {
         self.clock = clock;
         self.time = clock as f32;
@@ -259,6 +299,7 @@ impl Simulation {
             self.live = false;
             self.pulses.clear();
             self.events.clear();
+            self.activities.clear();
             self.receipts = Default::default();
             self.revision = None;
             return;
@@ -275,12 +316,14 @@ impl Simulation {
             self.records.clear();
             self.ids.clear();
             self.events.clear();
+            self.activities.clear();
             self.pulses.clear();
             self.revision = None;
         }
         let baseline = changed_source || self.epoch != Some(view.epoch) || !self.live || !view.live;
         if baseline {
             self.events.clear();
+            self.activities.retain(|_, a| a.persistent);
         }
         self.source = source;
         self.epoch = Some(view.epoch);
@@ -376,7 +419,19 @@ impl Simulation {
                     && branch.freshness.is_live(self.wall)
                     && old.is_some_and(|r| r.state != state && r.freshness.is_live(self.wall));
                 let joined = emit && branch.kind == "node" && existing.is_none();
-                if attention {
+                let working_card = self
+                    .activities
+                    .get(&branch.key)
+                    .is_some_and(|a| a.persistent);
+                if branch.kind == "agent" && state == AgentState::Working
+                    || attention && self.activities.contains_key(&branch.key)
+                {
+                    let text = format!(
+                        "{}\nNode: {}\nSession: {}\nWorkspace: {}\nAgent: {}",
+                        branch.status, names[0], names[1], names[2], names[3]
+                    );
+                    self.activity(&branch.key, id, state, text);
+                } else if attention {
                     let title = match state {
                         AgentState::Blocked => "ATTENTION REQUIRED",
                         AgentState::Working => "AGENT WORKING",
@@ -388,6 +443,9 @@ impl Simulation {
                         branch.status, names[0], names[1], names[2], names[3]
                     );
                     self.event(id, title, text, state.color());
+                } else if branch.kind == "agent" && state != AgentState::Working && working_card {
+                    // Stale/reconnected comparisons cannot fabricate completion.
+                    self.activities.remove(&branch.key);
                 } else if joined {
                     self.event(
                         id,
@@ -455,6 +513,58 @@ impl Simulation {
         for (id, life) in &mut self.entities {
             if !selected.contains(id) {
                 life.retarget(0., self.clock);
+            }
+        }
+        // Rendering admission is not mesh membership. Find still-reported keys only
+        // when an active card loses its geometry slot; sampling must not emit departure.
+        let missing: HashSet<_> = self
+            .activities
+            .iter()
+            .filter(|(key, a)| {
+                a.persistent && !self.ids.get(*key).is_some_and(|id| selected.contains(id))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        fn reported(branches: &[Branch], missing: &HashSet<Key>, present: &mut HashSet<Key>) {
+            for branch in branches {
+                if missing.contains(&branch.key) {
+                    present.insert(branch.key.clone());
+                }
+                reported(&branch.children, missing, present);
+            }
+        }
+        let mut present = HashSet::new();
+        if !missing.is_empty() {
+            reported(&scene.nodes, &missing, &mut present);
+        }
+        self.activities.retain(|key, activity| {
+            if activity.persistent && !self.ids.get(key).is_some_and(|id| selected.contains(id)) {
+                if !emit || present.contains(key) {
+                    return false; // Baselines and render sampling cannot assert departure.
+                }
+                // This is a new timed notice, not the old working-card entrance.
+                self.serial = self.serial.wrapping_add(1);
+                activity.event.serial = self.serial;
+                activity.persistent = false;
+                activity.event.started = self.clock;
+                activity.event.title = "AGENT NO LONGER OBSERVED";
+                activity.event.text.insert_str(0, "Last observed state: ");
+                activity.event.color = AgentState::Unknown.color();
+            }
+            true
+        });
+        // Trim completed history once per snapshot, avoiding repeated full-map scans.
+        let excess = self.activities.len().saturating_sub(MAX_ENTITIES);
+        if excess > 0 {
+            let mut timed: Vec<_> = self
+                .activities
+                .iter()
+                .filter(|(_, a)| !a.persistent)
+                .map(|(key, a)| (a.event.serial, key.clone()))
+                .collect();
+            timed.sort_unstable_by_key(|(serial, _)| *serial);
+            for (_, key) in timed.into_iter().take(excess) {
+                self.activities.remove(&key);
             }
         }
     }
@@ -576,12 +686,13 @@ pub mod tests {
         let mut v = view(vec![changed], 2);
         sim.update(&v, Stamp::seconds(202), 1.);
         assert_eq!(sim.pulses.len(), 1);
-        assert!(!sim.events.is_empty());
+        assert_eq!(sim.activities.len(), 2);
         let text = &sim
-            .events
-            .iter()
-            .find(|e| e.text.contains("Actual session"))
+            .activities
+            .values()
+            .find(|a| a.event.text.contains("Actual session"))
             .unwrap()
+            .event
             .text;
         for name in [
             "Actual node one",
@@ -593,8 +704,9 @@ pub mod tests {
         }
         sim.update(&v, Stamp::seconds(202), 7.);
         assert!(sim.pulses.is_empty());
-        assert!(!sim.events.is_empty());
+        assert_eq!(sim.activities.len(), 2);
         sim.update(&v, Stamp::seconds(202), 11.01);
+        assert!(sim.activities.is_empty());
         assert!(sim.events.is_empty());
         v.epoch = 2;
         v.revision = 3;
@@ -616,6 +728,120 @@ pub mod tests {
         assert!(sim.pulses.is_empty());
         assert!(callout_opacity(6.) > 0.99);
         assert_eq!(callout_opacity(CALLOUT_DURATION as f32), 0.);
+    }
+    #[test]
+    fn concurrent_work_persists_then_each_actual_stop_expires_independently() {
+        let mut sim = Simulation::default();
+        let first = view(
+            vec![node("one", "working", 4), node("two", "working", 2)],
+            1,
+        );
+        sim.update(&first, Stamp::seconds(201), 0.);
+        assert_eq!(sim.activities.len(), 12); // Default and named contexts are distinct.
+        let serials: Vec<_> = sim.activities.values().map(|a| a.event.serial).collect();
+        sim.update(&first, Stamp::seconds(202), 60.);
+        assert!(sim.activities.values().all(|a| a.persistent));
+        assert_eq!(
+            serials,
+            sim.activities
+                .values()
+                .map(|a| a.event.serial)
+                .collect::<Vec<_>>()
+        );
+        let second = view(vec![node("one", "done", 4), node("two", "working", 2)], 2);
+        sim.update(&second, Stamp::seconds(202), 61.);
+        assert_eq!(sim.activities.values().filter(|a| a.persistent).count(), 4);
+        assert_eq!(
+            sim.activities
+                .values()
+                .filter(|a| a.event.title == "AGENT COMPLETED")
+                .count(),
+            8
+        );
+        sim.update(&second, Stamp::seconds(202), 70.9);
+        assert_eq!(sim.activities.len(), 12);
+        sim.update(&second, Stamp::seconds(202), 71.01);
+        assert_eq!(sim.activities.len(), 4);
+        let third = view(vec![node("one", "done", 4), node("two", "idle", 2)], 3);
+        sim.update(&third, Stamp::seconds(202), 72.);
+        assert!(
+            sim.activities
+                .values()
+                .all(|a| !a.persistent && a.event.title == "AGENT IDLE")
+        );
+        sim.update(&third, Stamp::seconds(202), 82.01);
+        assert!(sim.activities.is_empty());
+    }
+    #[test]
+    fn working_disconnect_and_reconnect_do_not_invent_completion_or_reuse_anchors() {
+        let mut sim = Simulation::default();
+        let mut current = view(vec![node("one", "working", 2)], 1);
+        sim.update(&current, Stamp::seconds(201), 0.);
+        let key = sim.activities.keys().next().unwrap().clone();
+        current.live = false;
+        sim.update(&current, Stamp::seconds(202), 20.);
+        assert_eq!(sim.activities.len(), 4);
+        assert!(sim.activities.values().all(|a| a.persistent));
+        assert!(sim.opacity(sim.id(&key).unwrap()) < 0.5);
+        current = view(vec![node("two", "idle", 2)], 2);
+        current.epoch = 2;
+        sim.update(&current, Stamp::seconds(202), 21.);
+        assert!(sim.activities.is_empty());
+        assert!(sim.id(&key).is_none());
+        current = view(vec![node("two", "working", 2)], 3);
+        current.epoch = 2;
+        sim.update(&current, Stamp::seconds(202), 23.);
+        current = view(vec![node("three", "idle", 2)], 4);
+        current.epoch = 2;
+        sim.update(&current, Stamp::seconds(202), 24.);
+        assert!(
+            sim.activities
+                .values()
+                .all(|a| !a.persistent && a.event.title == "AGENT NO LONGER OBSERVED")
+        );
+        assert!(sim.activities.keys().all(|key| sim.id(key).is_none()));
+        sim.update(&current, Stamp::seconds(202), 34.01);
+        assert!(sim.activities.is_empty());
+    }
+    #[test]
+    fn live_removal_gets_a_new_notice_identity_and_priority() {
+        let mut sim = Simulation::default();
+        sim.update(
+            &view(
+                vec![node("gone", "working", 1), node("active", "working", 1)],
+                1,
+            ),
+            Stamp::seconds(201),
+            0.,
+        );
+        sim.update(
+            &view(
+                vec![node("gone", "working", 1), node("active", "blocked", 1)],
+                2,
+            ),
+            Stamp::seconds(202),
+            1.,
+        );
+        let before = sim.serial;
+        sim.update(
+            &view(vec![node("active", "blocked", 1)], 3),
+            Stamp::seconds(203),
+            2.,
+        );
+        let removed: Vec<_> = sim
+            .activities
+            .values()
+            .filter(|a| a.event.title == "AGENT NO LONGER OBSERVED")
+            .collect();
+        assert_eq!(removed.len(), 2);
+        for notice in removed {
+            assert!(!notice.persistent);
+            assert_eq!(notice.event.started, 2.);
+            assert!(
+                notice.event.serial > before,
+                "Removal reused old working-card identity and priority"
+            );
+        }
     }
     #[test]
     fn idle_unknown_stale_and_source_changes_are_honest() {
@@ -666,6 +892,7 @@ pub mod tests {
             assert!(sim.entities.len() <= MAX_ENTITIES);
             assert!(sim.ids.len() <= MAX_ENTITIES);
             assert!(sim.events.len() <= 3);
+            assert!(sim.activities.len() <= MAX_ENTITIES);
         }
         assert!(sim.omitted > 0);
         let v = view(vec![node("299", "working", 1)], 299);
@@ -673,6 +900,24 @@ pub mod tests {
         assert_eq!(sim.omitted, 0);
         assert_eq!(sim.ids.len(), 7);
         assert!(sim.events.is_empty());
+    }
+    #[test]
+    fn geometry_sampling_cannot_claim_a_still_reported_agent_departed() {
+        let mut sim = Simulation::default();
+        let first = view(vec![node("one", "working", 3999)], 1);
+        sim.update(&first, Stamp::seconds(201), 0.);
+        // Adding many ancestor sessions consumes budget previously used by agents.
+        let mut changed = node("one", "working", 3999);
+        let template = changed.sessions[0].clone();
+        changed.sessions.extend((0..63).map(|n| SessionView {
+            name: format!("additional-{n}"),
+            herdr: None,
+            ..template.clone()
+        }));
+        sim.update(&view(vec![changed], 2), Stamp::seconds(201), 0.1);
+        assert!(sim.omitted > 0);
+        assert!(sim.activities.values().all(|a| a.persistent));
+        assert!(sim.activities.len() <= MAX_ENTITIES);
     }
     #[test]
     fn large_live_detail_and_exits_fit_gpu_buffers_and_keep_complete_counts() {
