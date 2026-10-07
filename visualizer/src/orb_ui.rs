@@ -60,11 +60,12 @@ impl OrbUi {
         passive: bool,
         clock: f64,
     ) -> Option<Rect> {
+        self.panels.handle_input(root, clock, passive);
         let generation = self.sim.source_generation;
         self.sim.update(view, wall_now(), clock);
         if self.sim.source_generation != generation {
             self.selected = None;
-            self.panels = Default::default();
+            self.panels.reset_source();
         }
         if self
             .selected

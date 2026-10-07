@@ -7,21 +7,30 @@ accepted orbital geometry, depth cues, role colors, agent states and 3-second
 receipt pulses. There is no simulation or debug lab. Idle/unknown agents use
 neutral gray; stale/offline observations are dimmed.
 
-Orb uses the full, centered viewport with a blank border. A bounded floating
-panel holds the visual key, connection label and all seven counts, with a slow
-48-second vertical drift and a leader to the coordinator. Its background covers
-only that panel. The **entire panel**, including the key, counts and status,
-appears for the first minute of each three-minute cycle, then disappears for two
-minutes. Its 1.8-second holographic reveal sends a cyan beam from the coordinator,
-expands a light rail and scans the panel upwards; the final 1.6 seconds reverse
-the effect. Both transitions are included within the visible minute. Tiny previews
-follow the same cycle with abbreviated counts instead of the full key. Activity
-and selection cards stay independent; overflow page controls move into the first
-activity card while the panel is hidden or transitioning. Hidden panels do not
-intercept clicks, and their reserved space keeps callout placement stable.
+Orb uses the full, centered viewport with a blank border. Two narrow floating
+panels hold the visual key and the seven fleet totals in vertical lists. Their
+backgrounds cover only their own bounds; they gently drift and connect to the
+coordinator. The key appears once for the first minute after launch, then stays
+hidden. **K** toggles it manually, overriding the startup timer indefinitely.
+The separate counts panel starts visible and stays on until **N** toggles it.
+When both are visible they stack without overlap. When either is alone it hugs
+the bottom-left margin; showing the other smoothly moves it up before the new
+panel unfolds beneath it. Held keys do not repeatedly toggle. Reconnecting does
+not reset these preferences or replay the startup key.
+
+Panels and working-agent cards share a holographic reveal: a travelling leader
+beam, expanding light rail, upward unfolding aperture, luminous scan edge,
+circuit ticks and scan lines. The reverse effect hides them. Text and glyphs keep
+their logical sizes throughout. Hidden cards/panels have no clickable footprint.
+Tiny previews use abbreviated vertical counts and a bounded key hint when the
+full visual key cannot fit. Activity pagination remains in the first callout,
+independently of whether the key is showing.
 
 Each observed working agent has an independent persistent callout with its real
-node/session/workspace/agent names. It stays until that scoped agent stops;
+node/session/workspace/agent names. **W** toggles all working-agent callouts
+together, including work that starts while hidden. This only changes visibility:
+agent states and totals remain intact, selection and timed stop notices stay
+independent. Each card stays until that scoped agent stops;
 completion, blocked, idle or unknown then shows the actual reported state for
 ten seconds, including entrance/fade. Starting new work replaces that agent's
 stop notice. Current working observations also appear on an initial snapshot;
@@ -36,7 +45,9 @@ Persistent cards do not expire while off-page. Timed notices still expire after
 ten seconds, so an exceptionally crowded screen is not a lossless event log.
 Other transient events keep their latest-three bound; activity history is bounded
 separately and current working cards take priority over expired/old history.
-Long callout names and selection details scroll within their bounded cards.
+Working boxes fit their actual heading and names, with modest padding. Only
+unusually long content scrolls within a capped card; selection details scroll
+within their bounded observation card.
 
 Use `--tree` to open the independent existing tree renderer, including Fleet pulse
 cards, selection, expand/collapse, scrolling, 400 ms layout easing and conditional
@@ -47,7 +58,7 @@ clear selection. Cards do not resize or move the Orb viewport. Project summaries
 remain available through Projects in the key panel, grouping exact reported IDs
 without inferring Git equivalence or changing project ownership.
 
-The Orb panel counts all observed member nodes, sessions, reported workspaces
+The Orb counts panel counts all observed member nodes, sessions, reported workspaces
 and agents, plus working/blocked/done agents. Idle/unknown agents remain in the
 total, and unresolved workspace placeholders do not inflate workspace counts.
 Session counts include the existing default-context branch when its inventory

@@ -2,142 +2,116 @@
 
 ## Requirements
 
-- Merge the reviewed phase 2/DPI/ring improvements first. PR #11 is squash-merged
-  as `3a5ed89`, after all six platform CI jobs passed on `50231ea`.
-- Remove redundant Orb top cards/title/control area. Center the world viewport
-  with symmetric margins and keep its bounds fixed when a panel appears.
-- Preserve the independent tree presentation through `--tree` for both launchers;
-  keep its header, Fleet pulse, layout, scrolling and observations unchanged.
-- Put the visual key and seven totals into one bounded rectangle. Restrict the
-  semitransparent background to that rectangle and gently move it vertically.
-  The entire panel (key, counts, status and controls) appears for sixty seconds
-  per 180-second cycle, with the reveal/retract transitions inside that minute.
-  Use a staged sci-fi effect: coordinator beam, expanding rail, unfolding aperture,
-  luminous scan edge, circuit ticks and holographic scan lines; reverse to hide.
-  Include a coordinator leader, connection/retained label, project summary access
-  and any detail-sampling disclosure within the same panel.
-- Selection uses a floating observation card and joining line, with no timeout.
-  Toggle by clicking the same object, blank space or Close. Preserve the full
-  scoped path, observed status, freshness, last-seen and reported details.
-- Each working scoped agent has its own persistent callout; simultaneous work
-  must not be replaced by a latest-three queue. On an observed stop, show the
-  actual reported state using the regular ten-second notice/fade and expire it.
-  Never label idle, blocked, disconnected or disappeared agents as completed.
-- Initial/reconnect snapshots may display current working state but cannot
-  invent historical starts/stops. Stale/disconnected working state is last known.
-- Keep panels/cards inside logical-coordinate viewports and prevent overlap or
-  click-through. Provide disclosed pagination when the viewport cannot fit all
-  activity. Passive mode rotates pages and has no interactive controls; without
-  a live stream it still displays only `Daemon not available`.
-- No daemon, observer wire, data model, authentication or enrollment changes.
+- Orb remains centered in a symmetric viewport with a blank outer margin.
+- Preserve the independent existing text/tree renderer and Fleet pulse through
+  `--tree` in both launchers. No observer protocol, daemon or data-model changes.
+- Give the key and counts separate bounded panels with backgrounds restricted
+  to their rectangles, gentle vertical drift and leaders to the coordinator.
+- Show the key once during the first minute after application launch, including
+  its entrance and exit. Then keep it hidden indefinitely. K toggles it manually
+  and permanently overrides that startup timer. Another K toggles it off.
+- Counts start visible indefinitely. N toggles them independently, without timers.
+  Display nodes, sessions, workspaces, agents, working, blocked and complete as
+  a vertical list. The key is vertical, with indented states linked to Agent.
+- Stack the panels without overlap at the bottom left. The single visible panel
+  hugs the margin. When another is requested, slide the existing panel up over
+  400 ms with easing, then reveal the newcomer below. Retraction finishes before
+  the remaining panel slides down. Reversals preserve animation continuity.
+- K/N/W ignore held-key repeats, key releases and command-modified shortcuts.
+  Reconnects and source changes preserve visibility preferences and startup time.
+  Passive/screensaver mode preserves its existing keyboard-dismiss lifecycle.
+- Each currently working scoped agent has a persistent, text-sized callout.
+  Multiple cards coexist, with paging when necessary. W hides/restores all working
+  cards together; new work respects that preference. States, totals, selected
+  observations and timed stop notices are independent of W.
+- Panels and activity cards use the same sci-fi reveal/retract: travelling beam,
+  expanding rail, unfolding aperture, scan edge, circuit ticks and scan lines.
+  Keep text at its normal logical size; hidden UI has no widgets or hit mask.
+- On an observed stop, replace that agent's card with the actual reported state
+  for ten seconds. Do not invent completion from disconnect, disappearance or
+  stale data. Initial/reconnect baselines show current work without replaying
+  historical events. Retained work is explicitly LAST KNOWN.
+- Selection uses a permanent floating observation card/leader, full scoped path
+  and existing freshness/details. Same object, blank space or Close dismisses it.
+- Keep panels/cards bounded and separated, including resize and small previews.
+  Cap unusually long activity text and scroll it; do not allocate fixed large
+  boxes for short names. Disclose sampled geometry independently of hidden HUD.
 
 ## Implementation
 
-`orb_ui` reserves a full symmetric scene rect instead of placing header and side
-panels around it. `orb_panels` owns the bounded HUD, project/selection cards,
-leaders, hit masks and activity placement. The key and stats expose translations
-so their existing measured layout moves as one panel without a full-width strap.
-`orb_hud` computes the 180-second duty cycle from the shared monotonic application
-clock (including every screensaver surface). It reveals for 1.8 seconds, remains
-fully shown until 58.4 seconds, then retracts over 1.6 seconds. The next 120 seconds
-produce no panel widgets, paint or hit mask. Reconnection/snapshot arrival does
-not reset this clock. Text and glyphs retain their logical sizes behind a growing
-clip aperture; the decorative scan uses fixed loop bounds. Controls are disabled
-during transitions. Callout placement still reserves the panel bounds to avoid
-jumping at a visibility edge. If activity overflows, interactive page controls are
-also rendered in the first callout while panel controls are unavailable. Selection,
-working/stop lifetimes and passive page rotation remain independent.
+`orb_ui` holds the fixed Orb viewport and consumes K/N/W input before early
+returns for an unavailable stream. Source reset clears scoped selection and page
+history, while retaining display preferences. `orb_hud::Controls` owns independent
+reversible visibility and the single startup timer. Its normalized f64-clock
+phase drives `Reveal` for both HUD and activity; paint is clipped rather than
+rescaling glyphs or text. The key finishes its first retraction at second 60.
+A manual K cancels that timer, including when pressed before the minute elapses.
 
-Motion uses a 48-second sine cycle: up to twelve logical points for the HUD and
-eight for cards, reduced to available room. Mark sizing, surface-tangent ring
-transforms, shaders, pulse geometry and display-scale handling are unchanged.
+`orb_panels` docks two narrow vertical panels, with retargetable 400 ms motions
+and a common slow drift. Newly requested panels wait for the existing panel to
+move before unfolding. A partly visible reversal keeps its ordering. Reservations
+include outgoing panels until their animation ends; hidden panels paint nothing
+and block no clicks. Bounded previews prefer complete abbreviated counts and a
+key hint to overlapping glyphs. The same beam/rail/scan clips working callouts;
+W filters only persistent cards after their retraction completes.
 
-The Orb presentation adapter keeps activity by scoped projection key, independently
-of the generic transient deque. Existing working cards update names without
-resetting entrance/identity; fresh state deltas replace the scoped card with a
-timed actual-state notice. Reconnect/source changes establish baselines, and
-missing records cannot anchor to reused geometry slots. Activity history is
-bounded to 8,000 cards, trimming oldest timed history once per reconciliation;
-active work has priority. Existing geometry detail sampling still applies and
-complete totals remain independent of rendered detail.
+Activity is still keyed by the existing scoped projection identity, with current
+key lookup for leader anchors. Text measurement determines each visible box's
+width and height, within a 320-point width/240-point height cap. Up to 64 candidates
+per page are packed into separated edge columns around HUD and observation bounds.
+The first card retains a pager while the HUD is hidden. Cursor history provides
+previous/next pages without measuring all fleet text. Timed transitions sort ahead
+of persistent work; membership changes reset to page one. Passive mode rotates
+pages every twelve seconds. Off-page work stays retained; timed notices expire
+at ten seconds even when off-page, so this is not a lossless event log.
 
-Cards occupy edge-column slots outside HUD/observation bounds. Long content
-scrolls; text is laid out only for visible cards. Up to 64 slots are considered,
-and pages disclose the remaining activity. New timed notices reset to page one
-and take precedence there; passive pages otherwise advance every twelve seconds.
-Working state remains retained off-page. Timed notices expire at ten seconds even
-when off-page; this presentation does not claim lossless event delivery. Small
-previews use abbreviated counts; extremely short/narrow views may have no room
-for activity or observation cards.
+Complete totals and activity truth remain in the existing model. W does not
+change either. GPU geometry, surface-tangent rings, DPI sizing, receipt pulses,
+observer data and the separate tree renderer remain unchanged.
 
-## Adversarial review and fixes
+## Adversarial review
 
-- Reconnects and stale comparisons could fabricate completions: preserve working
-  cards as last known, drop superseded baseline state quietly, and emit truthful
-  removal notices only on live deltas.
-- Scoped slots can be reused: resolve activity leaders by current scoped key,
-  rather than a retired numeric slot. Stop notices retain captured names.
-- A later state change could leave contradictory cards: replace the same scoped
-  activity rather than adding another timed notice for it.
-- Persistent work could hide a completion until expiry: give timed notices
-  first-page priority and reset the page when a new notice arrives.
-- Render admission could be mistaken for membership: silently drop cards that
-  lose sampled detail while still reported, and keep the sampling disclosure.
-- All-fleet text measurement and repeated history scans could amplify work:
-  lay out only displayed cards and trim bounded history once per snapshot.
-- Leaders painted after another card could cross its text: draw all leaders
-  first, then cards and the key panel. Include all actual panel bounds in hit masks.
-- Card drift could clip/overlap: reserve margins for drift, use bounded slots and
-  adapt tiny views; long text scrolls inside each card.
-- Observation could shift the sphere or dismiss underneath a panel: keep the
-  centered viewport invariant and mask panel clicks. Same-object toggling and
-  blank-space dismissal are exercised with actual egui pointer events.
-- Legacy presentation could inherit Orb chrome: keep its UI/GPU routing separate.
-  No changes to tree UI, Fleet pulse renderer or launch behavior are required.
-
-## Panel-cycle adversarial review
-
-- Counting animation outside the minute would exceed the requested duty cycle:
-  include reveal and retract inside seconds 0–60, with no panel during 60–180.
-- Using f32 accumulated time could drift in long-lived savers: compute the phase
-  from the f64 application clock, and convert only normalized transition progress.
-- Fading widgets alone could leave ghost controls: do not create hidden HUD UI;
-  disable transition controls, clip paint and mask only the revealed aperture.
-  Preserve paint opacity when disabling controls to avoid a brightness step at
-  the start/end of retraction.
-- Hiding the key could strand activity pagination: keep a callout-local pager.
-- Changing layout reservations could jump active callouts during reveal: retain
-  stable slots and the centered viewport, independently of panel visibility.
-- Applying opacity to the whole Orb could hide observations/activity: isolate
-  panel paint and header UI from all other callouts and the GPU scene.
+- A late first snapshot or reconnect must not replay the intro or reset toggles:
+  use application clock and retain Controls across source reset.
+- Key repeat can flicker or cancel a manual choice: accept only non-repeat key-down
+  events; ignore command modifiers and leave passive input dismissal unchanged.
+- Rapid reversal can jump visibility: sample the current reveal before retargeting.
+  Delay a completely hidden newcomer until docking completes, and do not swap two
+  partly visible panels through one another. Resize clips preserve separation.
+- An outgoing key must not cover a counts panel sliding down: reserve it until
+  fully hidden. Hidden panels/cards must not leave ghost interaction masks.
+- W must not hide completions or change totals: apply it solely to persistent
+  activity presentation. Retain underlying agent observations and states.
+- New work while W is hidden must respect the global setting, and stale work
+  remains LAST KNOWN. Never infer a stop from display visibility.
+- Long names must not escape their frame or impose fleet-wide layout work:
+  measure only the current bounded page, wrap/cap text and scroll exceptional
+  content. Short cards shrink to actual text instead of a fixed large slot.
+- Clicking a pager must not change the candidate iterator halfway through a frame:
+  capture the frame cursor before building widgets; use the new cursor next frame.
+- Touching inclusive rectangle edges can stall placement retries: advance beyond
+  the reserved clearance edge, with bounded packing and a regression for it.
+- A short stack can consume all drift room: reserve a small motion envelope
+  before compacting rows, so both panels still move gently.
+- Leaders crossing text are distracting: paint all leaders before any frames/UI.
+- Counts must remain visible when the key times out, and pagination must stay
+  accessible independently. Geometry sampling disclosure remains outside toggles.
 
 ## Validation
 
-- Formatting and strict all-target clippy with the screensaver feature passed.
-- All 68 distinct portable tests passed (118 executions across library, both
-  launchers and observer integration). Two launcher copies of the optional GPU
-  readback test remain ignored; shader/scaling code is unchanged in this revision.
-- New regressions cover concurrent working cards beyond sixty seconds, independent
-  stop expiry/status, reconnect/departure honesty, admission sampling, bounded HUD
-  motion, slot separation, compact totals, persistent observation, centered bounds
-  and same-object/blank-space pointer toggling. Existing identity, GPU budget,
-  receipt, tree and screensaver lifecycle tests remain green.
-- Native Linux live-stream screenshots show the centered Orb, bounded key/count
-  background, readable working callout and connected leader. Real fleet captures
-  stay local and are not committed. Native Windows/macOS graphical, mixed-DPI and
-  screensaver/preview acceptance remain manual platform checks.
-- Optimized Linux builds for both launchers passed. The real local observer
-  handshake/snapshot check passed, and a separately launched `--tree` native
-  window confirmed the preserved text/tree presentation and Fleet pulse cards.
-  Platform PR CI runs separately; graphical Windows/macOS acceptance remains open.
+The preceding Orb/DPI and persistent-activity changes were verified with portable
+Rust checks and native Linux captures. This follow-up adds regressions for actual
+K/N/W events, repeat/release/passive behavior, once-only timing and manual overrides,
+source-reset preferences, rapidly reversing bounded docks, text-sized packing,
+W-independent totals/stops, and pointer-driven pagination with the key hidden.
+Native Windows/macOS mixed-DPI, graphics and screensaver acceptance remain manual
+platform checks; platform compilation and portable checks run in PR CI.
 
-Panel-cycle follow-up: format and strict screensaver-feature all-target clippy
-passed, and all 71 distinct portable tests passed (124 executions across both
-launchers). Regressions exercise exact repeat/boundary timing, long-running clocks,
-continuous bounded reveal/retraction, hidden text/hit masks, persistent callouts
-and real pointer-driven pagination while the key/status panel is hidden. Optimized
-Linux builds for both launchers passed. Native live-stream captures at reveal,
-scan, fully shown, retraction and hidden phases were inspected; the entire panel
-and its leader disappear while the working-agent callout remains. Real fleet
-captures stay local. Updated platform CI runs on the pushed head; native
-Windows/macOS graphics and mixed-DPI/screensaver acceptance remain open.
+Final follow-up checks passed: 75 distinct portable Rust tests (132 executions
+across both launchers), strict screensaver-feature all-target clippy, formatting
+and optimized Linux viewer/screensaver builds. Native live-stream inspection
+confirmed the adaptive vertical key, separate complete totals and a content-sized
+working card; real W key presses showed its scan/retraction, fully hidden state
+and restoration while counts stayed unchanged. The capture helper stopped if
+focus left its owned window; remaining K/N docking checks use portable egui tests.
+Real fleet screenshots remain local and are not committed.
