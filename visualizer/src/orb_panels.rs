@@ -22,7 +22,8 @@ pub struct Panels {
     pub projects: bool,
     pub focus: Option<Key>,
     dismissed: BTreeMap<Key, Dismissal>,
-    dismissal_revision: Option<(u64, u64)>,
+    dismissal_revision: Option<(u64, u64, u64)>,
+    pending_dismissals: Vec<(Key, u64)>,
     controls: Controls,
     key_motion: Option<Motion>,
     count_motion: Option<Motion>,
@@ -41,13 +42,31 @@ impl Panels {
         self.focus = None;
         self.dismissed.clear();
         self.dismissal_revision = None;
+        self.pending_dismissals.clear();
     }
     fn refresh_dismissals(&mut self, view: &View) {
-        let revision = (view.epoch, view.revision);
+        let revision = (view.epoch, view.revision, view.acknowledgement_revision);
         if self.dismissal_revision == Some(revision) {
             return;
         }
         self.dismissal_revision = Some(revision);
+        for (key, episode) in view.acknowledged_completions.iter() {
+            if view.completion_episodes.get(key) == Some(episode)
+                && !self
+                    .dismissed
+                    .get(key)
+                    .is_some_and(|d| d.episode == Some(*episode))
+            {
+                self.dismissed.insert(
+                    key.clone(),
+                    Dismissal {
+                        episode: Some(*episode),
+                        // A restored acknowledgement has already finished retracting.
+                        at: f64::NEG_INFINITY,
+                    },
+                );
+            }
+        }
         if self.dismissed.is_empty() {
             return;
         }
@@ -81,6 +100,9 @@ impl Panels {
             }
         }
         self.dismissed.retain(|key, _| retained.contains(key));
+    }
+    pub fn take_dismissals(&mut self) -> Vec<(Key, u64)> {
+        std::mem::take(&mut self.pending_dismissals)
     }
     pub fn handle_input(&mut self, ui: &Ui, clock: f64, passive: bool) {
         self.controls.update(clock);
@@ -534,6 +556,9 @@ fn dismiss_completed(ui: &mut Ui, key: &Key, state: &mut Panels, clock: f64, epi
         state
             .dismissed
             .insert(key.clone(), Dismissal { episode, at: clock });
+        if let Some(episode) = episode {
+            state.pending_dismissals.push((key.clone(), episode));
+        }
     }
     let glow = ui.ctx().animate_bool_with_time(
         response.id.with("glow"),
@@ -1422,6 +1447,63 @@ mod tests {
         );
     }
     #[test]
+    fn restored_acknowledgement_is_hidden_from_first_frame_in_both_launchers() {
+        for passive in [false, true] {
+            let mut v = view(vec![node("one", "done", 1)], 1);
+            let mut sim = Simulation::default();
+            sim.update(&v, Stamp::seconds(201), 0.);
+            v.completion_episodes = std::sync::Arc::new(
+                sim.activities
+                    .keys()
+                    .enumerate()
+                    .map(|(i, key)| (key.clone(), i as u64 + 10))
+                    .collect(),
+            );
+            let key = v.completion_episodes.keys().next().unwrap().clone();
+            v.acknowledged_completions =
+                std::sync::Arc::new(BTreeMap::from([(key.clone(), v.completion_episodes[&key])]));
+            sim = Simulation::default();
+            sim.update(&v, Stamp::seconds(201), 0.);
+            sim.update(&v, Stamp::seconds(201), 2.);
+            let ctx = egui::Context::default();
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
+            let mut state = Panels::default();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    draw(
+                        ui,
+                        &Context {
+                            sim: &sim,
+                            view: &v,
+                            rect,
+                            selected: None,
+                            passive,
+                        },
+                        &mut state,
+                    );
+                },
+            );
+            assert_eq!(output.shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "AGENT COMPLETED")).count(), 1);
+            assert_eq!(sim.summary().states[2], 2);
+            assert!(
+                !state
+                    .membership
+                    .contains(&sim.activities[&key].event.serial)
+            );
+            output.textures_delta.clear();
+            // A new instance acknowledged in another renderer replaces the old local ID.
+            std::sync::Arc::make_mut(&mut v.completion_episodes).insert(key.clone(), 99);
+            std::sync::Arc::make_mut(&mut v.acknowledged_completions).insert(key.clone(), 99);
+            v.acknowledgement_revision += 1;
+            state.refresh_dismissals(&v);
+            assert_eq!(state.dismissed[&key].episode, Some(99));
+        }
+    }
+    #[test]
     fn dismiss_click_acknowledges_one_completion_without_hiding_counts_or_focus() {
         let ctx = egui::Context::default();
         let mut v = view(vec![node("one", "done", 1)], 1);
@@ -1496,6 +1578,11 @@ mod tests {
         }
         assert_eq!(state.dismissed.len(), 1);
         let key = state.dismissed.keys().next().unwrap().clone();
+        assert_eq!(
+            state.take_dismissals(),
+            vec![(key.clone(), v.completion_episodes[&key])]
+        );
+        assert!(state.take_dismissals().is_empty());
         assert_eq!(
             state.dismissed[&key].episode,
             v.completion_episodes.get(&key).copied()

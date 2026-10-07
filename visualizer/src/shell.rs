@@ -222,6 +222,9 @@ impl Renderer {
                 self.ui.draw(root, &view, port);
             }
         });
+        for (key, episode) in self.orb_ui.take_dismissals() {
+            shared.acknowledge(&key, episode);
+        }
         if output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -667,9 +670,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_requested = std::rc::Rc::new(std::cell::Cell::new(false));
     let event_loop = builder.build()?;
     let proxy = event_loop.create_proxy();
-    let shared = Shared::new(move || {
-        let _ = proxy.send_event(());
-    });
+    let shared = if options.tree {
+        Shared::new(move || {
+            let _ = proxy.send_event(());
+        })
+    } else {
+        Shared::persistent(port, move || {
+            let _ = proxy.send_event(());
+        })
+    };
     let worker_shared = shared.clone();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let worker = std::thread::Builder::new()

@@ -42,12 +42,29 @@ then Done rearms its banner even if Working was never drawn. A new completion
 restarts its reveal; unchanged Done/reconnect does not. The acknowledgement lasts for that observed Completed episode, across unchanged
 snapshots/reconnects, until a state change/removal/source reset; a later completion
 appears again. Counts and agent state stay unchanged; selection and Focus remain
-available. Dismissals are local to this viewer launch. A fresh observed
+available. Dismissals are saved locally for this OS user and observer port,
+scoped to the verified coordinator and full agent identity. A dismissed completion
+stays hidden after closing/relaunching the viewer or screensaver; undismissed
+Completed cards still appear at startup. A fresh observed
 transition to idle or unknown shows that actual state for ten seconds. Reconnect/stale
 comparisons never invent transition events; retained cards are marked LAST KNOWN. Live removal has a truthful
 no-longer-observed notice. Multiple cards remain pageable without expiring off-page.
 The viewer cannot detect a new task if the observation stream reports Done twice
 without any intervening state/removal or a distinct completion ID.
+This also applies to work completed entirely while the viewer is closed: an
+unchanged Done snapshot cannot identify a new task. Receiving non-Done/removal
+clears the saved acknowledgement immediately, even without drawing a frame.
+
+Acknowledgements are written when you click ×, without waiting for app exit.
+State is kept in `herdr-mesh-visualizer/dismissals-<port>.bin` under
+`%LOCALAPPDATA%` (Windows), `~/Library/Application Support` (macOS), or
+`$XDG_STATE_HOME` / `~/.local/state` (Linux). The file contains only scoped
+identities and acknowledgement IDs, never agent labels, directories or mesh
+credentials. Independent writers merge changes under a bounded file lock;
+atomic replacement preserves the previous file on failed writes. Storage errors
+are reported in the interactive viewer and logs; observation continues. Delete
+this file while viewers are closed to reset acknowledgements. `--tree` does not
+read or write this state. Native Windows/macOS restart acceptance remains manual.
 
 Fresh blocked agents cause a gentle amber node beacon and a repeating circuit/ripple
 inside their surface cluster. This uses full observations even when geometry is

@@ -53,6 +53,9 @@ fn unavailable(ui: &mut egui::Ui) {
         .galley(rect.center() - galley.size() / 2., galley, color);
 }
 impl OrbUi {
+    pub fn take_dismissals(&mut self) -> Vec<(Key, u64)> {
+        self.panels.take_dismissals()
+    }
     pub fn draw(
         &mut self,
         root: &mut egui::Ui,
@@ -62,6 +65,16 @@ impl OrbUi {
         clock: f64,
     ) -> Option<Rect> {
         self.panels.handle_input(root, clock, passive);
+        if !passive && let Some(error) = &view.persistence_error {
+            // Report actual storage failure without hiding observation or crashing.
+            egui::Window::new("Completion acknowledgement storage")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(360.)
+                .show(root.ctx(), |ui| {
+                    ui.label(error);
+                });
+        }
         let generation = self.sim.source_generation;
         self.sim.update(view, wall_now(), clock);
         if self.sim.source_generation != generation {

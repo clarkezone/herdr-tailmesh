@@ -1,4 +1,5 @@
 use crate::{
+    dismissal_store::Store,
     pb::local_observer_client::LocalObserverClient,
     projection::{Branch, Key, Scene, coordinator, project},
 };
@@ -26,6 +27,10 @@ pub struct View {
     pub revision: u64,
     /// IDs of currently observed completion episodes, updated before UI coalescing.
     pub completion_episodes: Arc<BTreeMap<Key, u64>>,
+    /// Local acknowledgements restored before the first scene is published.
+    pub acknowledged_completions: Arc<BTreeMap<Key, u64>>,
+    pub acknowledgement_revision: u64,
+    pub persistence_error: Option<String>,
 }
 impl Default for View {
     fn default() -> Self {
@@ -38,6 +43,9 @@ impl Default for View {
             epoch: 0,
             revision: 0,
             completion_episodes: Default::default(),
+            acknowledged_completions: Default::default(),
+            acknowledgement_revision: 0,
+            persistence_error: None,
         }
     }
 }
@@ -45,11 +53,30 @@ pub struct Shared {
     received: Mutex<Received>,
     wake_pending: AtomicBool,
     wake: Box<dyn Fn() + Send + Sync>,
+    store: Option<Store>,
 }
 #[derive(Default)]
 struct Received {
     view: View,
     completion_serial: u64,
+    restored_source: Option<Key>,
+    restore_candidates: BTreeMap<Key, u64>,
+    unsaved_acknowledgements: BTreeMap<Key, u64>,
+}
+fn verified_source(view: &View) -> Option<Key> {
+    view.scene
+        .as_ref()?
+        .coordinator
+        .as_ref()
+        .filter(|c| c.status == "verified upstream identity")
+        .map(|c| c.key.clone())
+}
+fn storage_error(view: &mut View, error: impl std::fmt::Display) {
+    let message = format!("Completion dismissals could not be saved/restored: {error}");
+    if view.persistence_error.as_ref() != Some(&message) {
+        log::warn!("{message}");
+    }
+    view.persistence_error = Some(message);
 }
 fn completions(
     branch: &Branch,
@@ -73,10 +100,37 @@ fn completions(
 }
 impl Shared {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
+        Self::with_store(wake, None, 0)
+    }
+    /// Native launchers share per-user, per-loopback-port acknowledgement storage.
+    pub fn persistent(port: u16, wake: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
+        let mut random = [0; 8];
+        let store = Store::for_port(port).and_then(|store| {
+            getrandom::fill(&mut random).map_err(std::io::Error::other)?;
+            Ok(store)
+        });
+        match store {
+            Ok(store) => Self::with_store(wake, Some(store), u64::from_le_bytes(random)),
+            Err(error) => {
+                let shared = Self::new(wake);
+                storage_error(&mut shared.received.lock().unwrap().view, error);
+                shared
+            }
+        }
+    }
+    fn with_store(
+        wake: impl Fn() + Send + Sync + 'static,
+        store: Option<Store>,
+        serial: u64,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            received: Mutex::new(Received::default()),
+            received: Mutex::new(Received {
+                completion_serial: serial,
+                ..Default::default()
+            }),
             wake_pending: AtomicBool::new(false),
             wake: Box::new(wake),
+            store,
         })
     }
     pub fn read(&self) -> View {
@@ -89,8 +143,12 @@ impl Shared {
             let Received {
                 view,
                 completion_serial,
+                restored_source,
+                restore_candidates,
+                unsaved_acknowledgements,
             } = &mut *received;
             let revision = view.revision;
+            let previous_verified_source = verified_source(view);
             let source = view
                 .scene
                 .as_ref()
@@ -106,6 +164,87 @@ impl Shared {
                         completions(node, previous, completion_serial, &mut current);
                     }
                 }
+                let source = verified_source(view);
+                if source != previous_verified_source {
+                    // Retrying a failed load must not restore a completion that
+                    // left Done while storage was unavailable.
+                    *restore_candidates = current.clone();
+                    unsaved_acknowledgements.clear();
+                    view.acknowledged_completions = Default::default();
+                    view.acknowledgement_revision = view.acknowledgement_revision.wrapping_add(1);
+                } else {
+                    restore_candidates.retain(|key, id| current.get(key) == Some(id));
+                }
+                if source != *restored_source {
+                    if let (Some(store), Some(source)) = (&self.store, &source) {
+                        match store.restore(source, restore_candidates) {
+                            Ok(mut acknowledged) => {
+                                // Preserve explicit local input during a temporary load failure.
+                                for (key, id) in view.acknowledged_completions.iter() {
+                                    if current.get(key) == Some(id) {
+                                        acknowledged.insert(key.clone(), *id);
+                                    }
+                                }
+                                // Restore only actual Done membership, before the first UI frame.
+                                for (key, id) in &acknowledged {
+                                    current.insert(key.clone(), *id);
+                                }
+                                view.acknowledged_completions = Arc::new(acknowledged);
+                                view.acknowledgement_revision =
+                                    view.acknowledgement_revision.wrapping_add(1);
+                                view.persistence_error = None;
+                                *restored_source = Some(source.clone());
+                                restore_candidates.clear();
+                            }
+                            Err(error) => storage_error(view, error),
+                        }
+                    } else {
+                        *restored_source = source.clone();
+                        restore_candidates.clear();
+                    }
+                } else {
+                    let retired: BTreeMap<_, _> = view
+                        .acknowledged_completions
+                        .iter()
+                        .filter(|(key, id)| current.get(*key) != Some(*id))
+                        .map(|(key, id)| (key.clone(), *id))
+                        .collect();
+                    if !retired.is_empty() {
+                        let mut saved = true;
+                        if let (Some(store), Some(source)) = (&self.store, source.as_ref()) {
+                            match store.retire(source, &retired) {
+                                Ok(()) => view.persistence_error = None,
+                                Err(error) => {
+                                    saved = false;
+                                    storage_error(view, error);
+                                }
+                            }
+                        }
+                        // Mismatching IDs never suppress cards. Keep failed retirements
+                        // pending here so later accepted snapshots retry the disk update.
+                        if saved {
+                            Arc::make_mut(&mut view.acknowledged_completions)
+                                .retain(|key, _| !retired.contains_key(key));
+                            view.acknowledgement_revision =
+                                view.acknowledgement_revision.wrapping_add(1);
+                        }
+                    }
+                }
+                unsaved_acknowledgements.retain(|key, id| current.get(key) == Some(id));
+                if let (Some(store), Some(source)) = (&self.store, source.as_ref()) {
+                    unsaved_acknowledgements.retain(|key, id| {
+                        match store.acknowledge(source, key, *id) {
+                            Ok(()) => {
+                                view.persistence_error = None;
+                                false
+                            }
+                            Err(error) => {
+                                storage_error(view, error);
+                                true
+                            }
+                        }
+                    });
+                }
                 // Keep only current completions; Working/removal retires the prior episode.
                 view.completion_episodes = Arc::new(current);
             }
@@ -113,6 +252,38 @@ impl Shared {
         if !self.wake_pending.swap(true, Ordering::AcqRel) {
             (self.wake)();
         }
+    }
+    /// Revalidate the clicked frame against the latest accepted completion.
+    pub fn acknowledge(&self, key: &Key, episode: u64) -> bool {
+        let mut received = self.received.lock().unwrap();
+        let view = &mut received.view;
+        if view.completion_episodes.get(key) != Some(&episode) {
+            return false;
+        }
+        if let (Some(store), Some(source)) = (&self.store, verified_source(view)) {
+            match store.acknowledge(&source, key, episode) {
+                Ok(()) => view.persistence_error = None,
+                Err(error) => {
+                    storage_error(view, error);
+                    received
+                        .unsaved_acknowledgements
+                        .insert(key.clone(), episode);
+                }
+            }
+        } else if self.store.is_some() {
+            storage_error(
+                view,
+                "Coordinator identity unavailable; dismissal lasts only for this launch",
+            );
+        }
+        let view = &mut received.view;
+        Arc::make_mut(&mut view.acknowledged_completions).insert(key.clone(), episode);
+        view.acknowledgement_revision = view.acknowledgement_revision.wrapping_add(1);
+        drop(received);
+        if !self.wake_pending.swap(true, Ordering::AcqRel) {
+            (self.wake)();
+        }
+        true
     }
 }
 async fn connect(
@@ -324,5 +495,201 @@ mod tests {
         assert_ne!(first[key], reappeared[key]);
         accept(&shared, scene("done", "two"));
         assert_ne!(reappeared[key], shared.read().completion_episodes[key]);
+    }
+    #[test]
+    fn dismissal_survives_real_storage_reload_and_received_work_retires_it_before_rendering() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("dismissals.bin"));
+        let first = Shared::with_store(|| {}, Some(store.clone()), 100);
+        accept(&first, scene("done", "source"));
+        let initial = first.read();
+        let key = initial
+            .completion_episodes
+            .keys()
+            .find(|k| k[1] == "node")
+            .unwrap()
+            .clone();
+        let other = initial
+            .completion_episodes
+            .keys()
+            .find(|k| k[1] == "other")
+            .unwrap()
+            .clone();
+        let episode = initial.completion_episodes[&key];
+        assert!(first.acknowledge(&key, episode));
+        drop(first);
+
+        let second = Shared::with_store(|| {}, Some(store.clone()), 200);
+        accept(&second, scene("done", "source"));
+        let restored = second.read();
+        assert_eq!(restored.completion_episodes[&key], episode);
+        assert_eq!(
+            *restored.acknowledged_completions,
+            BTreeMap::from([(key.clone(), episode)])
+        );
+        assert!(!restored.acknowledged_completions.contains_key(&other));
+        second.update(|v| {
+            v.live = false;
+            v.epoch += 1;
+        });
+        accept(&second, scene("done", "source"));
+        assert_eq!(second.read().acknowledged_completions[&key], episode);
+
+        // No UI read of Working; even closing here must retire the saved dismissal.
+        accept(&second, scene("working", "source"));
+        drop(second);
+        let third = Shared::with_store(|| {}, Some(store.clone()), 300);
+        accept(&third, scene("done", "source"));
+        let later = third.read();
+        assert!(later.acknowledged_completions.is_empty());
+        assert_ne!(later.completion_episodes[&key], episode);
+        assert!(
+            !third.acknowledge(&key, episode),
+            "stale click cannot acknowledge the newer completion"
+        );
+        assert!(third.acknowledge(&key, later.completion_episodes[&key]));
+        accept(&third, scene("working", "source"));
+        accept(&third, scene("done", "source"));
+        assert!(third.read().acknowledged_completions.is_empty());
+        let fourth = Shared::with_store(|| {}, Some(store), 400);
+        accept(&fourth, scene("done", "source"));
+        assert!(fourth.read().acknowledged_completions.is_empty());
+    }
+    #[test]
+    fn saved_acknowledgements_do_not_leak_to_another_source_or_absent_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("dismissals.bin"));
+        let a = Shared::with_store(|| {}, Some(store.clone()), 100);
+        accept(&a, scene("done", "one"));
+        let initial = a.read();
+        let key = initial.completion_episodes.keys().next().unwrap().clone();
+        assert!(a.acknowledge(&key, initial.completion_episodes[&key]));
+        let b = Shared::with_store(|| {}, Some(store), 200);
+        accept(&b, scene("done", "two"));
+        assert!(b.read().acknowledged_completions.is_empty());
+        accept(&b, scene("working", "one"));
+        // The other node can be Done, but only a matching scoped agent restores.
+        if key[1] == "node" {
+            assert!(b.read().acknowledged_completions.is_empty());
+        }
+        accept(&b, scene("done", "one"));
+        assert!(!b.read().acknowledged_completions.contains_key(&key));
+    }
+    #[test]
+    fn storage_contention_retries_without_suppressing_new_completions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dismissals.bin");
+        let store = Store::at(path.clone());
+        let shared = Shared::with_store(|| {}, Some(store.clone()), 100);
+        accept(&shared, scene("done", "source"));
+        let initial = shared.read();
+        let key = initial
+            .completion_episodes
+            .keys()
+            .find(|k| k[1] == "node")
+            .unwrap()
+            .clone();
+        let episode = initial.completion_episodes[&key];
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        assert!(shared.acknowledge(&key, episode));
+        assert!(shared.read().persistence_error.is_some());
+        drop(lock);
+        accept(&shared, scene("done", "source"));
+        assert!(shared.read().persistence_error.is_none());
+        let restarted = Shared::with_store(|| {}, Some(store.clone()), 200);
+        accept(&restarted, scene("done", "source"));
+        assert_eq!(restarted.read().acknowledged_completions[&key], episode);
+        drop(restarted);
+
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        accept(&shared, scene("working", "source"));
+        accept(&shared, scene("done", "source"));
+        let latest = shared.read();
+        assert!(latest.persistence_error.is_some());
+        assert_ne!(latest.completion_episodes[&key], episode);
+        // A pending failed retirement cannot hide the new instance.
+        assert_ne!(
+            latest.acknowledged_completions[&key],
+            latest.completion_episodes[&key]
+        );
+        drop(lock);
+        accept(&shared, scene("done", "source"));
+        assert!(shared.read().persistence_error.is_none());
+        let restarted = Shared::with_store(|| {}, Some(store), 300);
+        accept(&restarted, scene("done", "source"));
+        assert!(restarted.read().acknowledged_completions.is_empty());
+    }
+    #[test]
+    fn first_snapshot_removal_retires_saved_acknowledgement_and_ports_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("port-one.bin"));
+        let first = Shared::with_store(|| {}, Some(store.clone()), 100);
+        accept(&first, scene("done", "source"));
+        let initial = first.read();
+        let key = initial.completion_episodes.keys().next().unwrap().clone();
+        first.acknowledge(&key, initial.completion_episodes[&key]);
+        let other =
+            Shared::with_store(|| {}, Some(Store::at(dir.path().join("port-two.bin"))), 200);
+        accept(&other, scene("done", "source"));
+        assert!(other.read().acknowledged_completions.is_empty());
+        let empty = Arc::new(Scene {
+            coordinator: Some(coordinator(Some(&ServerInfo {
+                instance_id: "source".into(),
+                ..Default::default()
+            }))),
+            ..Default::default()
+        });
+        let restarted = Shared::with_store(|| {}, Some(store.clone()), 300);
+        accept(&restarted, empty);
+        assert!(restarted.read().acknowledged_completions.is_empty());
+        drop(restarted);
+        let later = Shared::with_store(|| {}, Some(store), 400);
+        accept(&later, scene("done", "source"));
+        assert!(later.read().acknowledged_completions.is_empty());
+    }
+    #[test]
+    fn delayed_startup_load_cannot_restore_an_acknowledgement_after_received_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dismissals.bin");
+        let store = Store::at(path.clone());
+        let first = Shared::with_store(|| {}, Some(store.clone()), 100);
+        accept(&first, scene("done", "source"));
+        let initial = first.read();
+        let key = initial
+            .completion_episodes
+            .keys()
+            .find(|k| k[1] == "node")
+            .unwrap()
+            .clone();
+        first.acknowledge(&key, initial.completion_episodes[&key]);
+        drop(first);
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let restarted = Shared::with_store(|| {}, Some(store.clone()), 200);
+        accept(&restarted, scene("done", "source"));
+        assert!(restarted.read().persistence_error.is_some());
+        accept(&restarted, scene("working", "source"));
+        accept(&restarted, scene("done", "source"));
+        drop(lock);
+        accept(&restarted, scene("done", "source"));
+        assert!(restarted.read().persistence_error.is_none());
+        assert!(restarted.read().acknowledged_completions.is_empty());
+        let later = Shared::with_store(|| {}, Some(store), 300);
+        accept(&later, scene("done", "source"));
+        assert!(later.read().acknowledged_completions.is_empty());
     }
 }
