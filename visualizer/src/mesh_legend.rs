@@ -151,7 +151,7 @@ pub fn sample(painter: &Painter, glyph: Glyph, rect: Rect, time: f32) {
         let radius = size
             * scale
             * if matches!(glyph, Glyph::Agent(_)) {
-                3.0
+                1.3
             } else {
                 1.0
             };

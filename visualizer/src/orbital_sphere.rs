@@ -293,11 +293,11 @@ impl OrbitalSphereScene {
             .step_by(2)
             .flat_map(|p| {
                 let mut core = *p;
-                core.position_size[3] = 1.5;
-                core.color_softness = [0.035, 0.012, 0.075, 0.9];
+                core.position_size[3] = 0.9;
+                core.color_softness = [0.015, 0.006, 0.03, 0.9];
                 let mut halo = core;
-                halo.position_size[3] = 4.0;
-                halo.color_softness = [0.007, 0.0025, 0.015, 0.02];
+                halo.position_size[3] = 2.4;
+                halo.color_softness = [0.003, 0.001, 0.006, 0.02];
                 [halo, core]
             })
             .collect();

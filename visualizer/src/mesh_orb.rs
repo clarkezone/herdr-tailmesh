@@ -40,7 +40,7 @@ pub fn glyph_geometry(glyph: Glyph, time: f32) -> Geometry {
         particles: Vec::new(),
         lines: Vec::new(),
     };
-    g.glyph(glyph, Vec3::Z, 1.0, time, 0.0);
+    g.glyph(glyph, Vec3::Z, 1.0, time, 0.0, Vec3::Z);
     g
 }
 
@@ -49,6 +49,9 @@ pub fn camera_distance(viewport: Viewport) -> f32 {
     let half = (45.0_f32.to_radians() * 0.5).tan();
     3.55 / (half * aspect.clamp(0.01, 1.0)) + 0.5
 }
+fn scene_rotation(time: f32) -> Quat {
+    Quat::from_euler(glam::EulerRot::XYZ, time * 0.018, time * 0.048, 0.0)
+}
 pub fn camera(time: f32, viewport: Viewport) -> (Mat4, Mat4, f32) {
     let aspect = viewport.width / viewport.height.max(1.0);
     let half = (45.0_f32.to_radians() * 0.5).tan();
@@ -56,11 +59,8 @@ pub fn camera(time: f32, viewport: Viewport) -> (Mat4, Mat4, f32) {
     let projection =
         glam::camera::rh::proj::directx::perspective(45_f32.to_radians(), aspect, 0.1, 1000.0);
     let view = glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 0.0, z), Vec3::ZERO, Vec3::Y);
-    let model = Mat4::from_scale_rotation_translation(
-        Vec3::splat(1.1),
-        Quat::from_euler(glam::EulerRot::XYZ, time * 0.018, time * 0.048, 0.0),
-        Vec3::ZERO,
-    );
+    let model =
+        Mat4::from_scale_rotation_translation(Vec3::splat(1.1), scene_rotation(time), Vec3::ZERO);
     (
         projection * view,
         model,
@@ -68,7 +68,7 @@ pub fn camera(time: f32, viewport: Viewport) -> (Mat4, Mat4, f32) {
         // Clamp before converting to pixels or high-DPI markers hit the cap
         // early and shrink relative to the sphere and text.
         (viewport.height / viewport.pixels_per_point * 1.1 / (2.0 * z * half) / 105.0)
-            .clamp(0.25, 1.5)
+            .clamp(0.9, 1.5)
             * viewport.pixels_per_point,
     )
 }
@@ -149,7 +149,7 @@ fn arc(start: Vec3, end: Vec3, t: f32, bulge: f32) -> Vec3 {
     center + outward * (PI * t).sin() * bulge
 }
 impl Geometry {
-    fn glyph(&mut self, glyph: Glyph, p: Vec3, alpha: f32, time: f32, phase: f32) {
+    fn glyph(&mut self, glyph: Glyph, p: Vec3, alpha: f32, time: f32, phase: f32, facing: Vec3) {
         match glyph {
             Glyph::Coordinator => {
                 self.dot(p, 7.0, glyph.color(), alpha);
@@ -164,13 +164,17 @@ impl Geometry {
             }
             Glyph::Node => self.dot(p, 5.5, glyph.color(), alpha),
             Glyph::Session => {
-                self.dot(p, 4.4, glyph.color(), alpha);
+                self.dot(p, 4.8, glyph.color(), alpha);
+                // A semantic ring faces the camera rather than hugging the
+                // surface, where it collapses into a line near the silhouette.
+                let (u, v) = basis(facing);
                 for i in 0..24 {
+                    let angle = i as f32 * TAU / 24.0;
                     self.dot(
-                        circle(p, 0.16, i as f32 * TAU / 24.0),
-                        0.9,
+                        p + 0.22 * (u * angle.cos() + v * angle.sin()),
+                        1.35,
                         [0.5, 0.15, 0.9],
-                        alpha * 0.6,
+                        alpha * 0.8,
                     );
                 }
             }
@@ -189,7 +193,9 @@ impl Geometry {
                     AgentState::Completed => 0.6,
                     AgentState::Idle | AgentState::Unknown => 0.45,
                 };
-                self.agent_dot(p, state.color(), alpha * breathing);
+                // State breathing changes brightness, never the core's size.
+                // Idle/unknown remains neutral without becoming a tiny speck.
+                self.agent_dot(p, state.color().map(|channel| channel * breathing), alpha);
             }
         }
     }
@@ -197,7 +203,7 @@ impl Geometry {
         self.dot_with_halo(pos, size, color, alpha, 3.4, 0.13);
     }
     fn agent_dot(&mut self, pos: Vec3, color: [f32; 3], alpha: f32) {
-        self.dot_with_halo(pos, 2.3, color, alpha, 1.8, 0.045);
+        self.dot_with_halo(pos, 5.0, color, alpha, 1.6, 0.045);
     }
     fn dot_with_halo(
         &mut self,
@@ -250,6 +256,7 @@ impl Geometry {
 }
 pub fn geometry(sim: &Simulation) -> Geometry {
     let time = sim.time;
+    let facing = scene_rotation(time).inverse() * Vec3::Z;
     let mut g = Geometry {
         particles: Vec::new(),
         lines: Vec::new(),
@@ -271,6 +278,7 @@ pub fn geometry(sim: &Simulation) -> Geometry {
         if sim.live { 1.0 } else { 0.3 },
         time,
         0.0,
+        facing,
     );
     for (&id, life) in &sim.entities {
         let alpha = life.alpha(sim.clock) * sim.opacity(id);
@@ -280,11 +288,11 @@ pub fn geometry(sim: &Simulation) -> Geometry {
         let p = visible_position(sim, id);
         match id {
             Id::Node(_) => {
-                g.glyph(Glyph::Node, p, alpha, time, 0.0);
+                g.glyph(Glyph::Node, p, alpha, time, 0.0, facing);
                 g.curve(p, root, [0.3, 0.13, 0.7], alpha * 0.28, 0.5);
             }
             Id::Session(n, _) => {
-                g.glyph(Glyph::Session, p, alpha, time, 0.0);
+                g.glyph(Glyph::Session, p, alpha, time, 0.0, facing);
                 g.curve(
                     p,
                     visible_position(sim, Id::Node(n)),
@@ -294,7 +302,7 @@ pub fn geometry(sim: &Simulation) -> Geometry {
                 );
             }
             Id::Workspace(n, s, _) => {
-                g.glyph(Glyph::Workspace, p, alpha, time, 0.0);
+                g.glyph(Glyph::Workspace, p, alpha, time, 0.0, facing);
                 g.line(
                     p,
                     visible_position(sim, Id::Session(n, s)),
@@ -311,7 +319,14 @@ pub fn geometry(sim: &Simulation) -> Geometry {
                     [0.12, 0.3, 0.45],
                     alpha * 0.22,
                 );
-                g.glyph(Glyph::Agent(state), p, alpha, time, noise(id.seed()) * TAU);
+                g.glyph(
+                    Glyph::Agent(state),
+                    p,
+                    alpha,
+                    time,
+                    noise(id.seed()) * TAU,
+                    facing,
+                );
             }
         }
     }
@@ -556,6 +571,66 @@ pub fn overlay(ui: &egui::Ui, sim: &Simulation, rect: egui::Rect) {
 #[cfg(test)]
 mod dpi_tests {
     use super::*;
+
+    #[test]
+    fn agent_state_and_breathing_preserve_a_readable_core_size() {
+        for state in [
+            AgentState::Working,
+            AgentState::Blocked,
+            AgentState::Completed,
+            AgentState::Idle,
+            AgentState::Unknown,
+        ] {
+            for time in [0., 1., 3., 5., 10.] {
+                let glyph = glyph_geometry(Glyph::Agent(state), time);
+                assert_eq!(glyph.particles.len(), 2);
+                assert_eq!(glyph.particles[0].position_size[3], 5.0);
+                assert!(glyph.particles[1].position_size[3] > glyph.particles[0].position_size[3]);
+                assert!(
+                    glyph.particles[0].color_softness[..3]
+                        .iter()
+                        .any(|c| *c > 0.)
+                );
+            }
+        }
+        let preview = Viewport::physical(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(180., 88.)),
+            1.,
+            180,
+            88,
+        )
+        .unwrap();
+        let (_, _, scale) = camera(0., preview);
+        assert!(5.0 * scale * 2. >= 9.0);
+    }
+
+    #[test]
+    fn session_rings_stay_circular_as_clusters_and_sphere_rotate() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 800.));
+        for time in [0., 10., 30., 60., 100., 200.] {
+            let facing = scene_rotation(time).inverse() * Vec3::Z;
+            for node in 0..16 {
+                let center = position(Id::Session(node, 0), time);
+                let anchor = project(center, time, rect).unwrap();
+                let mut geometry = Geometry {
+                    particles: Vec::new(),
+                    lines: Vec::new(),
+                };
+                geometry.glyph(Glyph::Session, center, 1., time, 0., facing);
+                assert_eq!(geometry.particles.len(), 50);
+                let mut radii = Vec::new();
+                for dot in geometry.particles[2..].as_chunks::<2>().0 {
+                    let [x, y, z, _] = dot[0].position_size;
+                    let p = Vec3::new(x, y, z);
+                    let depth_offset = scene_rotation(time) * (p - center);
+                    assert!(depth_offset.z.abs() < 0.00001);
+                    radii.push(project(p, time, rect).unwrap().distance(anchor));
+                }
+                assert!(radii[0] > 12.);
+                assert!(radii.iter().all(|r| (r / radii[0] - 1.).abs() < 0.001));
+            }
+        }
+    }
 
     #[test]
     fn marker_sizes_and_projected_geometry_are_uniform_in_logical_points() {

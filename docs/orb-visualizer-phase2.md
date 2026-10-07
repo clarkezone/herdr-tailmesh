@@ -180,3 +180,28 @@ and branch coverage stays within 5% of one logical point. The portable camera
 regression checks marker size and projected anchors from tiny previews through
 large fullscreen views at all six scales. Actual Windows DPI and mixed-monitor
 interaction need a user retest; cross-platform rendering uses the shared path.
+
+## Native screenshot legibility follow-up
+
+Inspection of the real local observation stream in both a large window and a
+smaller tiled window confirmed that DPI consistency alone preserved undersized
+glyphs. Agent cores were close to the decorative field's dots, and idle/completed
+brightness also reduced their radius. Tangent-plane session rings became almost
+linear at the globe's silhouette.
+
+Agent core size is now 5 reference points, with state breathing affecting color
+intensity only; membership/freshness fading still applies. The logical marker
+scale floor is 0.9 instead of 0.25, so small windows and previews keep recognizable
+symbols while the world-space constellation continues to fit the available area.
+Compact agent halos preserve ownership gaps. Session hubs have larger/brighter
+24-dot rings in a plane parallel to the camera, using the inverse shared globe
+rotation; their projected outline remains circular at the edges and rear. The
+legend uses the same glyph geometry with adjusted magnification. Background dots
+and halos are smaller and dimmer to give semantic marks priority.
+
+Review/regressions cover equal agent core sizes across all states and breathing
+phases, a readable preview-size floor, and circular session-ring projections over
+multiple clusters and rotations. Geometry counts, slot budgets, scoped data,
+freshness rules, DPI conversion, pulse behavior and shader layout are unchanged.
+Native screenshots were inspected at large and small window sizes; snapshots of
+the live local fleet are kept out of repository/memory artifacts.
