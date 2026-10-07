@@ -49,7 +49,9 @@ class PackagingTests(unittest.TestCase):
             archive = archives[0]
             with zipfile.ZipFile(archive) as package:
                 entry = "herdr-mesh-visualizer.scr" if screensaver else name
-                self.assertEqual(package.namelist(), [entry])
+                self.assertEqual(package.namelist(), [entry, "THIRD_PARTY_NOTICES.md"])
+                self.assertIn(b"Copyright (c) 2026 Meng To", package.read("THIRD_PARTY_NOTICES.md"))
+                self.assertIn(b"Permission is hereby granted", package.read("THIRD_PARTY_NOTICES.md"))
                 self.assertEqual(package.read(entry), binary.read_bytes())
             digest = hashlib.sha256(archive.read_bytes()).hexdigest()
             self.assertEqual(
@@ -58,7 +60,7 @@ class PackagingTests(unittest.TestCase):
             )
             return archive.name
 
-    def test_existing_three_platform_viewer_archives_are_unchanged(self):
+    def test_existing_three_platform_viewer_archive_names_are_preserved(self):
         for system, label in [("Windows", "windows"), ("Linux", "linux"), ("Darwin", "macos")]:
             with self.subTest(system=system):
                 self.assertEqual(self.package(system),

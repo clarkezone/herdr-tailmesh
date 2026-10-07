@@ -19,7 +19,8 @@ selection and Linux/macOS rendering remain unchanged.
 
 The console-free Windows screensaver executable shares the viewer source and
 renderer and is distributed as `herdr-mesh-visualizer.scr`, separately from
-the existing viewer archive. Installation and activation are explicit operator
+the existing viewer archive. The archive contains one executable and the Orb
+third-party notice, which is not a runtime dependency. Installation and activation are explicit operator
 actions; builds must not change Windows screensaver settings or daemon state.
 
 ## Launch contract
@@ -35,15 +36,19 @@ actions; builds must not change Windows screensaver settings or daemon state.
   may append `--port N`. Do not claim that manually selected ports are persisted.
 - With no arguments, a `.scr` shows configuration; the ordinary `.exe` still
   opens the interactive viewer.
+- Orb is the default; `--tree` selects the existing tree for ordinary launches
+  and manual `/s` or `/p` launches. This is not a persisted Windows setting.
 - Existing `--port`, `--check`, `--help` and error handling remain available.
   Reject conflicting screensaver modes and `--check` with a screensaver mode.
   Reject Windows switches on other platforms.
 
 ## Presentation and lifecycle
 
-Reuse the live mesh tree and Fleet cards. Screensaver/preview input is not
+Orb is the default for fullscreen and preview, sharing the live observation
+adapter and GPU renderer with the interactive viewer. Append `--tree` to select
+the existing tree and Fleet cards. Screensaver/preview input is not
 forwarded to egui, preventing selection, collapse and clipboard actions.
-Automatically scroll an overflowing tree slowly back and forth, with pauses
+In `--tree` mode, automatically scroll an overflowing tree slowly back and forth, with pauses
 at its ends. Normal viewer scrolling remains directly controlled by input.
 When there is no live observation stream, show exactly `Daemon not available`
 instead of retained nodes, cards or diagnostic details. The existing bounded

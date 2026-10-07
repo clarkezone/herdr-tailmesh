@@ -54,8 +54,12 @@ def main():
     product = "herdr-mesh-screensaver" if args.screensaver else "herdr-mesh-visualizer"
     entry = "herdr-mesh-visualizer.scr" if args.screensaver else binary_name
     archive = args.output / f"{product}-{args.version}-{system}-{arch}.zip"
+    notices = Path(__file__).resolve().parents[1] / "visualizer" / "THIRD_PARTY_NOTICES.md"
+    if not notices.is_file():
+        parser.error("Orb third-party notices are required for distribution")
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as package:
         package.write(args.binary, entry)
+        package.write(notices, "THIRD_PARTY_NOTICES.md")
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     checksum = archive.with_suffix(".zip.sha256")
     checksum.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")

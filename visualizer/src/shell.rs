@@ -40,6 +40,9 @@ struct Renderer {
     state: egui_winit::State,
     egui: EguiRenderer,
     ui: ui::UiState,
+    orb_ui: crate::orb_ui::OrbUi,
+    orb: Option<crate::orbital_sphere::OrbitalSphereScene>,
+    depth: wgpu::TextureView,
     #[cfg(target_os = "windows")]
     _session_notifications: Option<windows_screensaver::SessionNotifications>,
 }
@@ -48,6 +51,7 @@ impl Renderer {
         window: Arc<Window>,
         shared_gpu: Option<Arc<Gpu>>,
         passive: bool,
+        tree: bool,
     ) -> Result<Self, String> {
         let size = window.inner_size();
         let (gpu, surface) = match shared_gpu {
@@ -146,6 +150,14 @@ impl Renderer {
             Some(device.limits().max_texture_dimension_2d as usize),
         );
         let egui = EguiRenderer::new(&device, config.format, RendererOptions::default());
+        let depth = depth_target(&device, config.width, config.height);
+        let orb = (!tree).then(|| {
+            crate::orbital_sphere::OrbitalSphereScene::new(
+                &device,
+                config.format,
+                wgpu::TextureFormat::Depth32Float,
+            )
+        });
         Ok(Self {
             gpu,
             window,
@@ -157,6 +169,9 @@ impl Renderer {
             state,
             egui,
             ui: Default::default(),
+            orb_ui: Default::default(),
+            orb,
+            depth,
             #[cfg(target_os = "windows")]
             _session_notifications: None,
         })
@@ -166,9 +181,16 @@ impl Renderer {
             self.config.width = size.width;
             self.config.height = size.height;
             self.surface.configure(&self.device, &self.config);
+            self.depth = depth_target(&self.device, size.width, size.height);
         }
     }
-    fn render(&mut self, shared: &Shared, port: u16, passive: bool) -> Result<(), String> {
+    fn render(
+        &mut self,
+        shared: &Shared,
+        port: u16,
+        passive: bool,
+        clock: f64,
+    ) -> Result<(), String> {
         if self.window.inner_size().width == 0 || self.window.inner_size().height == 0 {
             return Ok(());
         }
@@ -190,8 +212,11 @@ impl Renderer {
         };
         let input = self.state.take_egui_input(&self.window);
         let view = shared.read();
+        let mut orb_rect = None;
         let mut output = self.context.run_ui(input, |root| {
-            if passive {
+            if self.orb.is_some() {
+                orb_rect = self.orb_ui.draw(root, &view, port, passive, clock);
+            } else if passive {
                 self.ui.draw_screensaver(root, &view, port);
             } else {
                 self.ui.draw(root, &view, port);
@@ -224,6 +249,21 @@ impl Renderer {
         let mut commands =
             self.egui
                 .update_buffers(&self.device, &self.queue, &mut encoder, &jobs, &screen);
+        let orb_drawn = if let Some(viewport) = orb_rect.and_then(|rect| {
+            crate::orb_viewport::Viewport::physical(
+                rect,
+                output.pixels_per_point,
+                self.config.width,
+                self.config.height,
+            )
+        }) && let Some(orb) = &mut self.orb
+        {
+            orb.update_mesh(&self.queue, &self.orb_ui.sim, viewport)?;
+            orb.render(&mut encoder, &target, &self.depth, Some(viewport));
+            true
+        } else {
+            false
+        };
         {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("mesh text and connections"),
@@ -232,12 +272,16 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.025,
-                            g: 0.035,
-                            b: 0.05,
-                            a: 1.,
-                        }),
+                        load: if orb_drawn {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.025,
+                                g: 0.035,
+                                b: 0.05,
+                                a: 1.,
+                            })
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -261,11 +305,31 @@ impl Renderer {
         Ok(())
     }
 }
+fn depth_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("Orb depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
+}
+
 struct App {
     renderers: Vec<Renderer>,
     shared: Arc<Shared>,
     port: u16,
     mode: Mode,
+    tree: bool,
     started: Instant,
     focus_loss_pending: Option<Instant>,
     #[cfg(target_os = "windows")]
@@ -358,7 +422,12 @@ impl ApplicationHandler<()> for App {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
             WindowEvent::Resized(size) => r.resize(size),
             WindowEvent::RedrawRequested => {
-                if let Err(e) = r.render(&self.shared, self.port, self.mode.passive()) {
+                if let Err(e) = r.render(
+                    &self.shared,
+                    self.port,
+                    self.mode.passive(),
+                    self.started.elapsed().as_secs_f64(),
+                ) {
                     self.error = Some(e);
                     event_loop.exit();
                 }
@@ -401,6 +470,8 @@ impl ApplicationHandler<()> for App {
             self.next_tick = Instant::now()
                 + if self.mode.passive() {
                     Duration::from_millis(33)
+                } else if !self.tree {
+                    Duration::from_millis(16)
                 } else {
                     Duration::from_secs(1)
                 };
@@ -494,6 +565,7 @@ impl App {
                 window,
                 shared_gpu.clone(),
                 self.mode.passive(),
+                self.tree,
             ))?;
             shared_gpu = Some(renderer.gpu.clone());
             #[cfg(target_os = "windows")]
@@ -555,7 +627,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let check = options.check;
     if options.help {
         println!(
-            "herdr-mesh-visualizer [--port 8790] [--check]\nRead the local daemon; --check verifies a snapshot without opening a window."
+            "herdr-mesh-visualizer [--port 8790] [--tree] [--check]\nOrb is the default. --tree opens the legacy tree. --check verifies a snapshot without opening a window."
         );
         #[cfg(target_os = "windows")]
         println!("Windows screensaver: /s | /p HWND | /c [HWND] (also /p:HWND and /c:HWND)");
@@ -614,6 +686,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         shared,
         port,
         mode: options.mode,
+        tree: options.tree,
         started: Instant::now(),
         focus_loss_pending: None,
         #[cfg(target_os = "windows")]

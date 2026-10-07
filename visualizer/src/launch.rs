@@ -15,6 +15,7 @@ impl Mode {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
     pub port: u16,
+    pub tree: bool,
     pub check: bool,
     pub help: bool,
     pub mode: Mode,
@@ -40,6 +41,7 @@ pub fn parse(
     let mut args = args.into_iter().peekable();
     let mut options = Options {
         port: 8790,
+        tree: false,
         check: false,
         help: false,
         mode: if scr && windows {
@@ -61,6 +63,7 @@ pub fn parse(
                     .ok_or("--port must be 1..65535")?;
             }
             "--check" => options.check = true,
+            "--tree" => options.tree = true,
             "--help" | "-h" => options.help = true,
             _ => {
                 let lower = arg.to_ascii_lowercase();
@@ -233,5 +236,38 @@ mod tests {
         for i in 0..1000 {
             assert!((0. ..=180.).contains(&automatic_scroll(f64::from(i) * 0.1, 180.)));
         }
+    }
+}
+
+#[cfg(test)]
+mod orb_launch_tests {
+    use super::*;
+    #[test]
+    fn orb_is_default_and_tree_is_explicit_for_both_launchers() {
+        for (args, windows, scr) in [
+            (vec![], false, false),
+            (vec![], true, false),
+            (vec!["/s"], true, true),
+            (vec!["/p:123"], true, true),
+        ] {
+            let options = parse(args.iter().map(|s| s.to_string()), windows, scr).unwrap();
+            assert!(!options.tree);
+            let legacy = parse(
+                args.iter()
+                    .map(|s| s.to_string())
+                    .chain(Some("--tree".into())),
+                windows,
+                scr,
+            )
+            .unwrap();
+            assert!(legacy.tree);
+            assert_eq!(legacy.mode, options.mode);
+            assert_eq!(legacy.port, options.port);
+        }
+        assert!(
+            parse(["--tree".into(), "--check".into()], false, false)
+                .unwrap()
+                .check
+        );
     }
 }

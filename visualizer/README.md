@@ -1,23 +1,34 @@
 # Herdr mesh visualizer
 
-A standalone Rust viewer for the managed Herdr mesh daemon. The first cut draws
-a spatial coordinator → node → session → workspace → agent tree using GPU
-text and lines, with selection, expand/collapse and vertical scrolling (wheel or
-middle-button drag). Children stack beneath their parents with a rightward
-indent that adapts to the available width; long labels wrap into taller rows.
-The tree fits horizontally without panning. On narrow windows the collapsible
-observation pane moves above the tree; wider windows keep it beside the tree.
-All window content has a 16-point outer margin. The observation pane appears
-only while an entity is selected. Click empty tree space or the outer margin to
-deselect and let the tree reclaim the space; clicks inside observations retain
-selection for reading/copying. An entity removed from a snapshot is deselected.
-Layout changes use shared quintic ease-in/ease-out over 400 ms: resize, pane opening/closing,
-expansion/collapse, and changed snapshots. New rows fade in; removed/collapsed
-rows fade out without accepting clicks. Further changes retarget from the
-current position. Connectors and hit targets follow animated row positions.
-Text wraps for the destination width and is clipped during transitions; glyphs
-are not individually morphed. Scrolling follows input directly.
-It opens even when the daemon is offline, reconnects automatically, and retains
+A standalone Rust viewer for the managed Herdr mesh daemon. **Orb is the default**
+for both the interactive executable and Windows screensaver/preview. It presents
+real coordinator → node → session → workspace → agent observations using the
+accepted orbital geometry, depth cues, role colors, agent states, 3-second receipt
+pulses and 10-second state-change callouts. There is no simulation or debug lab.
+Idle/unknown agents use neutral gray; stale/offline observations are dimmed.
+Callouts use actual scoped names; initial snapshots and reconnect baselines do not
+replay activity. The latest three transient events are retained, and only cards
+fitting above the key/footer appear. New events can replace an older card sooner.
+
+Use `--tree` to open the existing tree, including its selection, expand/collapse,
+scrolling, 400 ms layout easing and conditional observation pane. Orb supports
+clicking a projected mark to inspect observations and clicking blank space to
+clear selection. The project summary groups exact reported project IDs using
+the existing model; it does not infer Git repository equivalence.
+
+The Orb footer counts all observed member nodes, sessions, reported workspaces
+and agents, plus working/blocked/done agents. Idle/unknown agents remain in the
+total, and unresolved workspace placeholders do not inflate workspace counts.
+Session counts include the existing default-context branch when its inventory
+is unknown; they are not a deduplicated count of native session processes.
+These are scoped observation totals, including stale inventory, with an explicit
+retained label on disconnect. The separate Fleet pulse cards preserve current
+freshness rules and use a compact summary on small windows. Fixed GPU budgets
+sample exceptionally large inventories, keeping ancestor paths and member hubs;
+an omission notice appears and totals remain complete. `--tree` exposes the full
+inventory. Placement uses scoped identities and reusable slots, not label order.
+
+The viewer opens even when the daemon is offline, reconnects automatically, and retains
 the last good observations while disconnected. Receipt timestamps become stale
 after 30 seconds; a quiet, healthy stream remains connected.
 
@@ -48,8 +59,12 @@ scrolling; the overview and narrow observation pane are bounded on short windows
 
 The native winit/wgpu/egui-wgpu shell is adapted from
 [clarkezone/wgputests](https://github.com/clarkezone/wgputests/tree/56551e298420764e43d6851efc9a2702273af0e1)
-commit `56551e298420764e43d6851efc9a2702273af0e1`. It retains the Linux Wayland
-clipboard startup fix and imports no demonstration scenes or artwork. Window
+commit `56551e298420764e43d6851efc9a2702273af0e1`. The Orb geometry/key/renderer and shaders are adapted from wgputests main
+commit `3c0eb41fdc86bc19d7469bb4c2617aa01f5194ae`. The Orbital Sphere source
+is adapted from ThreeUI under its MIT license (see [notices](THIRD_PARTY_NOTICES.md)).
+Linux keeps Wayland/X11/links support and disables the optional clipboard worker
+that crashed on teardown during the prototype; numeric controls and legacy
+viewer behavior remain available, with no lab simulation or other gallery scenes. Window
 and GPU work remain on the main thread; RPC and projection run on a worker.
 
 ## Build and run
@@ -59,6 +74,8 @@ go build -o herdr-mesh ./src/cmd/herdr-mesh
 cargo build --manifest-path visualizer/Cargo.toml --locked --release
 ./herdr-mesh start
 ./visualizer/target/release/herdr-mesh-visualizer
+# Existing tree presentation:
+./visualizer/target/release/herdr-mesh-visualizer --tree
 ```
 
 Use `.exe` filenames on Windows. Existing managed installations need a daemon
@@ -159,9 +176,30 @@ This does not substitute for graphical acceptance on the established wgputests
 machines. Test window launch/close, resize/DPI changes, scrolling/selection,
 daemon loss/restart, named sessions, empty fleet and stale snapshots there.
 
+Orb markers, halos and branch widths use logical display points, matching the
+HUD, selection targets and callouts. The active window's pixels-per-point value
+is applied each frame, including fractional scaling, egui zoom and monitor
+changes. Resize still fits the world-space constellation to the available area.
+
+An opt-in native GPU regression reads rendered pixels at 100%, 125%, 150%, 200%,
+300% and 400% scaling to check marker area and branch width:
+
+```sh
+cargo test --manifest-path visualizer/Cargo.toml --locked --bin herdr-mesh-visualizer gpu_marker_area_and_branch_width_follow_display_scale -- --ignored
+```
+
+The regular tests cover logical marker size limits, projected positions and
+clipped fractional-DPI viewports without needing a GPU. Actual monitor changes
+and Windows preview/fullscreen presentation remain manual acceptance checks.
+
 Package the host release binary with
 `python scripts/package-visualizer.py --binary <path> --version <version>`.
 Viewer archives and checksums go into `dist/visualizer/`, separately from the
 existing one-binary Go CLI archives. No Rust or Go toolchain is required on a
 target computer running the built executable; normal platform graphics/window
 libraries and a compatible GPU driver remain required.
+
+[Phase 2 plan, adversarial review and validation](../docs/orb-visualizer-phase2.md).
+
+Viewer and screensaver archives include the Orb third-party notices alongside
+the single executable. The notice file is not a runtime dependency.
