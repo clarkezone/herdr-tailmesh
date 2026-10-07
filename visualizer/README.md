@@ -10,7 +10,15 @@ neutral gray; stale/offline observations are dimmed.
 Orb uses the full, centered viewport with a blank border. A bounded floating
 panel holds the visual key, connection label and all seven counts, with a slow
 48-second vertical drift and a leader to the coordinator. Its background covers
-only that panel. Tiny previews use abbreviated counts instead of the full key.
+only that panel. The **entire panel**, including the key, counts and status,
+appears for the first minute of each three-minute cycle, then disappears for two
+minutes. Its 1.8-second holographic reveal sends a cyan beam from the coordinator,
+expands a light rail and scans the panel upwards; the final 1.6 seconds reverse
+the effect. Both transitions are included within the visible minute. Tiny previews
+follow the same cycle with abbreviated counts instead of the full key. Activity
+and selection cards stay independent; overflow page controls move into the first
+activity card while the panel is hidden or transitioning. Hidden panels do not
+intercept clicks, and their reserved space keeps callout placement stable.
 
 Each observed working agent has an independent persistent callout with its real
 node/session/workspace/agent names. It stays until that scoped agent stops;

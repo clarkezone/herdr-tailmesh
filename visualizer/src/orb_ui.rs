@@ -284,7 +284,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let rect = orb.draw(ui, &view, 8790, true, 0.).unwrap();
+                let rect = orb.draw(ui, &view, 8790, true, 2.).unwrap();
                 assert!(viewport.contains_rect(rect));
                 assert!(rect.height() > 70.);
             },

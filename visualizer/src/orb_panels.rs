@@ -3,6 +3,7 @@ use crate::{
     mesh_legend,
     mesh_model::{CALLOUT_REVEAL, Event, Simulation, callout_opacity, ease},
     mesh_orb, mesh_stats,
+    orb_hud::Reveal,
 };
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Ui, UiBuilder, pos2, vec2};
 use herdr_mesh_visualizer::{client::View, projection::Key};
@@ -217,12 +218,40 @@ fn card_anchor(card: &Card<'_>, sim: &Simulation, rect: Rect) -> Option<Pos2> {
     mesh_orb::project(mesh_orb::visible_position(sim, id), sim.time, rect)
 }
 
+fn page_controls(
+    ui: &mut Ui,
+    state: &mut Panels,
+    pages: usize,
+    count: usize,
+    capacity: usize,
+    interactive: bool,
+) {
+    ui.small(if capacity == 0 {
+        format!("{count} callouts · enlarge view")
+    } else {
+        format!("{count} callouts · page {}/{}", state.page + 1, pages)
+    });
+    if interactive && pages > 1 && capacity > 0 {
+        if ui.button("‹").clicked() {
+            state.page = (state.page + pages - 1) % pages;
+        }
+        if ui.button("›").clicked() {
+            state.page = (state.page + 1) % pages;
+        }
+    }
+}
+
 pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response {
     let rect = context.rect;
     let painter = ui.painter().with_clip_rect(rect);
     let hud = hud_layout(&painter, context);
+    let reveal = Reveal::at(context.sim.clock);
     let mut response = Response {
-        blocked: vec![hud.bounds],
+        blocked: if reveal.active() {
+            vec![reveal.aperture(hud.bounds)]
+        } else {
+            Vec::new()
+        },
         clear_selection: false,
     };
     let selected = context
@@ -269,7 +298,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         context.sim.time,
         rect,
     ) {
-        leader(&painter, anchor, hud.bounds, CYAN.gamma_multiply(0.5));
+        reveal.leader(&painter, anchor, hud.bounds);
         painter.circle_stroke(
             anchor,
             14.,
@@ -327,9 +356,10 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             leader(&painter, anchor, card, CYAN);
         }
     }
-    for (slot, card) in places
+    for (index, (slot, card)) in places
         .iter()
         .zip(candidates.iter().skip(state.page * capacity).take(capacity))
+        .enumerate()
     {
         let card_rect = slot.translate(vec2(
             0.,
@@ -357,9 +387,10 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         };
         let heading = painter.layout(title, FontId::monospace(11.), color, (width - 24.).max(1.));
         painter.galley(card_rect.min + vec2(12., 12.), heading.clone(), color);
+        let pager = index == 0 && !reveal.interactive() && !context.passive && pages > 1;
         let body = Rect::from_min_max(
             card_rect.min + vec2(12., heading.size().y + 22.),
-            card_rect.max - vec2(12., 12.),
+            card_rect.max - vec2(12., if pager { 38. } else { 12. }),
         );
         let mut child = ui.new_child(
             UiBuilder::new()
@@ -378,6 +409,20 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                         .color(color),
                 );
             });
+        if pager {
+            let footer = Rect::from_min_max(
+                pos2(card_rect.left() + 12., card_rect.bottom() - 30.),
+                card_rect.max - vec2(12., 6.),
+            );
+            let mut child = ui.new_child(
+                UiBuilder::new()
+                    .id_salt("orb-activity-page")
+                    .max_rect(footer),
+            );
+            child.set_clip_rect(footer.intersect(rect));
+            child
+                .horizontal(|ui| page_controls(ui, state, pages, candidates.len(), capacity, true));
+        }
     }
 
     if let Some(card) = detail {
@@ -444,7 +489,18 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             });
     }
 
-    frame(&painter, hud.bounds, CYAN, 1.);
+    if !reveal.active() {
+        return response;
+    }
+    let aperture = reveal.aperture(hud.bounds).intersect(rect);
+    let mut panel_painter = painter.with_clip_rect(aperture);
+    frame(
+        &panel_painter,
+        aperture,
+        CYAN,
+        ease(reveal.opacity() + 0.25),
+    );
+    panel_painter.multiply_opacity(reveal.opacity());
     let header = Rect::from_min_size(
         hud.bounds.min + vec2(12., 6.),
         vec2(
@@ -457,7 +513,13 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             .id_salt("orb-key-controls")
             .max_rect(header),
     );
-    child.set_clip_rect(header.intersect(rect));
+    child.set_clip_rect(header.intersect(aperture));
+    let opacity = child.opacity() * reveal.opacity();
+    if !reveal.interactive() {
+        child.disable();
+    }
+    // Disabling controls must not introduce a brightness jump at either boundary.
+    child.set_opacity(opacity);
     child.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
     child.label(
         egui::RichText::new(if context.view.live {
@@ -476,24 +538,14 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                 response.clear_selection = true;
             }
             if !candidates.is_empty() {
-                ui.small(if capacity == 0 {
-                    format!("{} callouts · enlarge view", candidates.len())
-                } else {
-                    format!(
-                        "{} callouts · page {}/{}",
-                        candidates.len(),
-                        state.page + 1,
-                        pages
-                    )
-                });
-                if !context.passive && pages > 1 && capacity > 0 {
-                    if ui.button("‹").clicked() {
-                        state.page = (state.page + pages - 1) % pages;
-                    }
-                    if ui.button("›").clicked() {
-                        state.page = (state.page + 1) % pages;
-                    }
-                }
+                page_controls(
+                    ui,
+                    state,
+                    pages,
+                    candidates.len(),
+                    capacity,
+                    !context.passive,
+                );
             }
         });
         if context.sim.omitted > 0 {
@@ -504,15 +556,113 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         }
     }
     if let Some(key) = &hud.legend {
-        mesh_legend::draw(&painter, key, context.sim.time);
+        mesh_legend::draw(&panel_painter, key, context.sim.time);
     }
-    mesh_stats::draw(&painter, &hud.stats);
+    mesh_stats::draw(&panel_painter, &hud.stats);
+    reveal.scan(&painter, hud.bounds);
     response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hidden_panel_has_no_text_or_hit_mask_and_keeps_callouts_and_paging() {
+        use crate::mesh_model::tests::{node, view};
+        use herdr_mesh_visualizer::heartbeat::Stamp;
+        let ctx = egui::Context::default();
+        let view = view(vec![node("one", "working", 10)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&view, Stamp::seconds(201), 0.);
+        let selected = view.scene.as_ref().unwrap().nodes[0].key.clone();
+        let mut state = Panels::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
+        let mut run = |clock: f64, events: Vec<egui::Event>, state: &mut Panels| {
+            sim.update(&view, Stamp::seconds(201), clock);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let context = Context {
+                        sim: &sim,
+                        view: &view,
+                        rect,
+                        selected: Some(&selected),
+                        passive: false,
+                    };
+                    let hud = hud_layout(ui.painter(), &context);
+                    let response = draw(ui, &context, state);
+                    if !Reveal::at(clock).active() {
+                        assert!(
+                            !response
+                                .blocked
+                                .iter()
+                                .any(|r| r.contains(hud.bounds.center()))
+                        );
+                    }
+                },
+            );
+            let texts: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|s| {
+                    if let egui::Shape::Text(t) = &s.shape {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(texts.iter().any(|t| t.galley.text() == "Observation"));
+            assert!(
+                texts
+                    .iter()
+                    .filter(|t| t.galley.text().contains("AGENT WORKING"))
+                    .count()
+                    >= 2
+            );
+            let shown = Reveal::at(clock).active();
+            assert_eq!(
+                texts.iter().any(|t| t.galley.text().contains("20 AGENTS")),
+                shown
+            );
+            assert_eq!(
+                texts
+                    .iter()
+                    .any(|t| t.galley.text().contains("LIVE · all known")),
+                shown
+            );
+            let next = texts
+                .iter()
+                .find(|t| t.galley.text() == "›")
+                .map(|t| t.pos + t.galley.size() * 0.5);
+            output.textures_delta.clear();
+            next
+        };
+        run(2., vec![], &mut state);
+        let button =
+            run(90., vec![], &mut state).expect("Hidden HUD must not hide activity page controls");
+        let click = |pressed| {
+            vec![
+                egui::Event::PointerMoved(button),
+                egui::Event::PointerButton {
+                    pos: button,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        run(90., click(true), &mut state);
+        run(90., click(false), &mut state);
+        assert_eq!(state.page, 1);
+        for clock in [120., 179., 182.] {
+            run(clock, vec![], &mut state);
+        }
+    }
     #[test]
     fn drifting_hud_and_counts_stay_bounded_in_preview_and_regular_views() {
         use crate::mesh_model::tests::{node, view};

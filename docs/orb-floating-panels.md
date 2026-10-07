@@ -10,6 +10,10 @@
   keep its header, Fleet pulse, layout, scrolling and observations unchanged.
 - Put the visual key and seven totals into one bounded rectangle. Restrict the
   semitransparent background to that rectangle and gently move it vertically.
+  The entire panel (key, counts, status and controls) appears for sixty seconds
+  per 180-second cycle, with the reveal/retract transitions inside that minute.
+  Use a staged sci-fi effect: coordinator beam, expanding rail, unfolding aperture,
+  luminous scan edge, circuit ticks and holographic scan lines; reverse to hide.
   Include a coordinator leader, connection/retained label, project summary access
   and any detail-sampling disclosure within the same panel.
 - Selection uses a floating observation card and joining line, with no timeout.
@@ -33,6 +37,17 @@
 panels around it. `orb_panels` owns the bounded HUD, project/selection cards,
 leaders, hit masks and activity placement. The key and stats expose translations
 so their existing measured layout moves as one panel without a full-width strap.
+`orb_hud` computes the 180-second duty cycle from the shared monotonic application
+clock (including every screensaver surface). It reveals for 1.8 seconds, remains
+fully shown until 58.4 seconds, then retracts over 1.6 seconds. The next 120 seconds
+produce no panel widgets, paint or hit mask. Reconnection/snapshot arrival does
+not reset this clock. Text and glyphs retain their logical sizes behind a growing
+clip aperture; the decorative scan uses fixed loop bounds. Controls are disabled
+during transitions. Callout placement still reserves the panel bounds to avoid
+jumping at a visibility edge. If activity overflows, interactive page controls are
+also rendered in the first callout while panel controls are unavailable. Selection,
+working/stop lifetimes and passive page rotation remain independent.
+
 Motion uses a 48-second sine cycle: up to twelve logical points for the HUD and
 eight for cards, reduced to available room. Mark sizing, surface-tangent ring
 transforms, shaders, pulse geometry and display-scale handling are unchanged.
@@ -80,6 +95,22 @@ for activity or observation cards.
 - Legacy presentation could inherit Orb chrome: keep its UI/GPU routing separate.
   No changes to tree UI, Fleet pulse renderer or launch behavior are required.
 
+## Panel-cycle adversarial review
+
+- Counting animation outside the minute would exceed the requested duty cycle:
+  include reveal and retract inside seconds 0–60, with no panel during 60–180.
+- Using f32 accumulated time could drift in long-lived savers: compute the phase
+  from the f64 application clock, and convert only normalized transition progress.
+- Fading widgets alone could leave ghost controls: do not create hidden HUD UI;
+  disable transition controls, clip paint and mask only the revealed aperture.
+  Preserve paint opacity when disabling controls to avoid a brightness step at
+  the start/end of retraction.
+- Hiding the key could strand activity pagination: keep a callout-local pager.
+- Changing layout reservations could jump active callouts during reveal: retain
+  stable slots and the centered viewport, independently of panel visibility.
+- Applying opacity to the whole Orb could hide observations/activity: isolate
+  panel paint and header UI from all other callouts and the GPU scene.
+
 ## Validation
 
 - Formatting and strict all-target clippy with the screensaver feature passed.
@@ -99,3 +130,14 @@ for activity or observation cards.
   handshake/snapshot check passed, and a separately launched `--tree` native
   window confirmed the preserved text/tree presentation and Fleet pulse cards.
   Platform PR CI runs separately; graphical Windows/macOS acceptance remains open.
+
+Panel-cycle follow-up: format and strict screensaver-feature all-target clippy
+passed, and all 71 distinct portable tests passed (124 executions across both
+launchers). Regressions exercise exact repeat/boundary timing, long-running clocks,
+continuous bounded reveal/retraction, hidden text/hit masks, persistent callouts
+and real pointer-driven pagination while the key/status panel is hidden. Optimized
+Linux builds for both launchers passed. Native live-stream captures at reveal,
+scan, fully shown, retraction and hidden phases were inspected; the entire panel
+and its leader disappear while the working-agent callout remains. Real fleet
+captures stay local. Updated platform CI runs on the pushed head; native
+Windows/macOS graphics and mixed-DPI/screensaver acceptance remain open.
