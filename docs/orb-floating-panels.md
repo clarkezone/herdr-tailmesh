@@ -1,5 +1,8 @@
 # Orb floating panels and persistent activity
 
+Completion lifetime is superseded by [Persistent Completed](orb-persistent-completed.md):
+Completed is now a persistent current state, including startup/reconnect.
+
 ## Requirements
 
 - Orb remains centered in a symmetric viewport with a blank outer margin.

@@ -26,6 +26,18 @@ pub enum AgentState {
     Unknown,
 }
 impl AgentState {
+    fn persistent(self) -> bool {
+        matches!(self, Self::Working | Self::Blocked | Self::Completed)
+    }
+    // Higher values win admission when persistent callouts reach the history limit.
+    fn priority(self) -> u8 {
+        match self {
+            Self::Blocked => 3,
+            Self::Working => 2,
+            Self::Completed => 1,
+            Self::Idle | Self::Unknown => 0,
+        }
+    }
     pub fn color(self) -> [f32; 3] {
         match self {
             Self::Working => [0.05, 0.8, 1.0],
@@ -310,7 +322,7 @@ impl Simulation {
         freshness: Freshness,
         offline: bool,
     ) {
-        let persistent = matches!(state, AgentState::Working | AgentState::Blocked);
+        let persistent = state.persistent();
         if let Some(activity) = self.activities.get_mut(key)
             && activity.persistent
             && activity.state == state
@@ -499,29 +511,9 @@ impl Simulation {
                     && branch.freshness.is_live(self.wall)
                     && old.is_some_and(|r| r.state != state && r.freshness.is_live(self.wall));
                 let joined = emit && branch.kind == "node" && existing.is_none();
-                let persistent_card = self
-                    .activities
-                    .get(&branch.key)
-                    .is_some_and(|a| a.persistent);
-                if branch.kind == "agent"
-                    && matches!(state, AgentState::Working | AgentState::Blocked)
-                    || attention && self.activities.contains_key(&branch.key)
-                {
-                    let text = format!(
-                        "{}\nNode: {}\nSession: {}\nWorkspace: {}\nAgent: {}",
-                        branch.status, names[0], names[1], names[2], names[3]
-                    );
-                    self.activity(
-                        &branch.key,
-                        id,
-                        state,
-                        text,
-                        branch.freshness,
-                        self.records
-                            .get(&Id::Node(id.indices().0))
-                            .is_some_and(|r| r.offline),
-                    );
-                } else if attention {
+                // Persistent cards reconcile from the complete observation below,
+                // independently of which agents have GPU geometry.
+                if attention && !state.persistent() && !self.activities.contains_key(&branch.key) {
                     let title = match state {
                         AgentState::Blocked => "ATTENTION REQUIRED",
                         AgentState::Working => "AGENT WORKING",
@@ -533,12 +525,6 @@ impl Simulation {
                         branch.status, names[0], names[1], names[2], names[3]
                     );
                     self.event(id, title, text, state.color());
-                } else if branch.kind == "agent"
-                    && !matches!(state, AgentState::Working | AgentState::Blocked)
-                    && persistent_card
-                {
-                    // Stale/reconnected comparisons cannot fabricate completion.
-                    self.activities.remove(&branch.key);
                 } else if joined {
                     self.event(
                         id,
@@ -649,95 +635,41 @@ impl Simulation {
             }
             true
         });
-        // Retain activity independently of geometry admission, with node anchors
-        // for sampled leaves. Scan references, prioritizing blocked over working.
-        let mut sampled = Vec::new();
-        fn sampled_agents<'a>(
+        // Reconcile existing cards before admission, so stale priorities and
+        // evicted GPU-visible cards cannot restart on each observation revision.
+        let mut agents = Vec::new();
+        fn collect_agents<'a>(
             branch: &'a Branch,
             names: &mut Vec<&'a str>,
             node: &'a Branch,
-            selected: &HashSet<Id>,
-            ids: &BTreeMap<Key, Id>,
             output: &mut Vec<(&'a Branch, Vec<&'a str>, &'a Branch)>,
         ) {
             names.push(&branch.label);
-            if branch.kind == "agent"
-                && !ids.get(&branch.key).is_some_and(|id| selected.contains(id))
-            {
+            if branch.kind == "agent" {
                 output.push((branch, names.clone(), node));
             }
             for child in &branch.children {
-                sampled_agents(child, names, node, selected, ids, output);
+                collect_agents(child, names, node, output);
             }
             names.pop();
         }
         for node in &scene.nodes {
-            sampled_agents(
-                node,
-                &mut Vec::new(),
-                node,
-                &selected,
-                &self.ids,
-                &mut sampled,
-            );
+            collect_agents(node, &mut Vec::new(), node, &mut agents);
         }
-        sampled.sort_by_key(|(b, _, _)| if b.status == "blocked" { 0 } else { 1 });
-        let incoming = sampled
-            .iter()
-            .filter(|(b, _, _)| {
-                matches!(b.status.as_str(), "working" | "blocked")
-                    && !self.activities.contains_key(&b.key)
-            })
-            .count();
-        let incoming_blocked = sampled
-            .iter()
-            .filter(|(b, _, _)| b.status == "blocked" && !self.activities.contains_key(&b.key))
-            .count();
-        let mut evict: Vec<_> = self
-            .activities
-            .iter()
-            .map(|(key, a)| {
-                (
-                    if !a.persistent {
-                        0
-                    } else if a.state == AgentState::Working {
-                        1
-                    } else {
-                        2
-                    },
-                    a.event.serial,
-                    key.clone(),
-                )
-            })
-            .collect();
-        evict.sort_unstable();
-        for (priority, _, key) in evict {
-            let need = if priority == 0 {
-                incoming
-            } else if priority == 1 {
-                incoming_blocked
-            } else {
-                0
+        agents
+            .sort_by_key(|(b, _, _)| std::cmp::Reverse(AgentState::observed(&b.status).priority()));
+        for (branch, names, node) in &agents {
+            let Some(previous) = self.activities.get(&branch.key) else {
+                continue;
             };
-            if self.activities.len() + need > MAX_ENTITIES {
-                self.activities.remove(&key);
-            }
-        }
-        for (branch, names, node) in sampled {
             let state = AgentState::observed(&branch.status);
-            let persistent = matches!(state, AgentState::Working | AgentState::Blocked);
-            let previous = self.activities.get(&branch.key);
             let transition = emit
                 && branch.freshness.is_live(self.wall)
-                && previous.is_some_and(|a| {
-                    a.persistent && a.state != state && a.freshness.is_live(self.wall)
-                });
-            if persistent || transition {
-                // The existing hard history bound is independent of GPU detail.
-                if previous.is_none() && self.activities.len() >= MAX_ENTITIES {
-                    continue;
-                }
-                let Some(id) = self.id(&node.key) else {
+                && previous.persistent
+                && previous.state != state
+                && previous.freshness.is_live(self.wall);
+            if state.persistent() || transition {
+                let Some(id) = self.id(&branch.key).or_else(|| self.id(&node.key)) else {
                     continue;
                 };
                 let text = format!(
@@ -752,12 +684,60 @@ impl Simulation {
                     branch.freshness,
                     node.status != "connected",
                 );
-            } else if previous.is_some_and(|a| a.persistent) {
+            } else if previous.persistent {
                 self.activities.remove(&branch.key); // Baselines cannot invent a resolution.
             }
         }
+        let mut incoming = [0usize; 4];
+        for (branch, _, _) in &agents {
+            let state = AgentState::observed(&branch.status);
+            if state.persistent() && !self.activities.contains_key(&branch.key) {
+                incoming[state.priority() as usize] += 1;
+            }
+        }
+        let mut evict: Vec<_> = self
+            .activities
+            .iter()
+            .map(|(key, a)| {
+                (
+                    if a.persistent { a.state.priority() } else { 0 },
+                    a.event.serial,
+                    key.clone(),
+                )
+            })
+            .collect();
+        evict.sort_unstable();
+        for (priority, _, key) in evict {
+            let need: usize = incoming[usize::from(priority) + 1..].iter().sum();
+            if self.activities.len() + need > MAX_ENTITIES {
+                self.activities.remove(&key);
+            }
+        }
+        for (branch, names, node) in agents {
+            let state = AgentState::observed(&branch.status);
+            if state.persistent() && !self.activities.contains_key(&branch.key) {
+                if self.activities.len() >= MAX_ENTITIES {
+                    continue;
+                }
+                let Some(id) = self.id(&branch.key).or_else(|| self.id(&node.key)) else {
+                    continue;
+                };
+                let text = format!(
+                    "{}\nNode: {}\nSession: {}\nWorkspace: {}\nAgent: {}",
+                    branch.status, names[0], names[1], names[2], names[3]
+                );
+                self.activity(
+                    &branch.key,
+                    id,
+                    state,
+                    text,
+                    branch.freshness,
+                    node.status != "connected",
+                );
+            }
+        }
         // Disclose the fixed presentation/history bound independently of GPU sampling.
-        self.omitted_activities = (known.working + known.blocked)
+        self.omitted_activities = (known.working + known.blocked + known.done)
             .saturating_sub(self.activities.values().filter(|a| a.persistent).count());
     }
 }
@@ -966,7 +946,11 @@ pub mod tests {
             sim.update(&changed, Stamp::seconds(202), 112.);
             assert_eq!(
                 sim.activities.len(),
-                if status == "working" { 6 } else { 2 }
+                if matches!(status, "working" | "done") {
+                    6
+                } else {
+                    2
+                }
             );
         }
     }
@@ -990,7 +974,14 @@ pub mod tests {
         let mut resolved = view(vec![node("one", "done", 1)], 3);
         resolved.epoch = 3;
         sim.update(&resolved, Stamp::seconds(201), 102.);
-        assert!(sim.activities.is_empty()); // Reconnect cannot manufacture a completion.
+        assert_eq!(sim.activities.len(), 2); // Current completed state, not replayed events.
+        assert!(
+            sim.activities
+                .values()
+                .all(|a| a.persistent && a.state == AgentState::Completed)
+        );
+        assert!(sim.events.is_empty());
+        assert!(sim.pulses.is_empty());
         let blocked = view(vec![node("one", "blocked", 1)], 4);
         sim.update(&blocked, Stamp::seconds(201), 103.);
         let serial = sim.serial;
@@ -1012,7 +1003,194 @@ pub mod tests {
         assert!(sim.blocked_nodes().is_empty());
     }
     #[test]
-    fn concurrent_work_persists_then_each_actual_stop_expires_independently() {
+    fn completed_startup_refresh_reconnect_and_staleness_preserve_current_state() {
+        let mut sim = Simulation::default();
+        let mut v = view(vec![node("one", "done", 2)], 1);
+        sim.update(&v, Stamp::seconds(201), 0.);
+        let serials: Vec<_> = sim.activities.values().map(|a| a.event.serial).collect();
+        assert_eq!(serials.len(), 4);
+        assert!(sim.events.is_empty());
+        assert!(sim.pulses.is_empty());
+        sim.update(&v, Stamp::seconds(202), 60.);
+        assert_eq!(sim.activities.len(), 4);
+        let mut renamed = node("one", "done", 2);
+        renamed.hostname = "Renamed completed host".into();
+        v = view(vec![renamed], 2);
+        v.epoch = 2;
+        sim.update(&v, Stamp::seconds(202), 61.);
+        assert_eq!(
+            serials,
+            sim.activities
+                .values()
+                .map(|a| a.event.serial)
+                .collect::<Vec<_>>()
+        );
+        assert!(sim.activities.values().all(|a| a.persistent
+            && a.state == AgentState::Completed
+            && a.event.title == "AGENT COMPLETED"
+            && a.event.text.contains("Renamed completed host")));
+        assert!(sim.events.is_empty());
+        assert!(sim.pulses.is_empty());
+        v.live = false;
+        sim.update(&v, Stamp::seconds(260), 120.);
+        assert_eq!(sim.activities.len(), 4);
+        assert!(sim.activities.keys().all(|key| sim.activity_retained(key)));
+        assert!(sim.blocked_nodes().is_empty());
+        let mut idle_baseline = view(vec![node("one", "idle", 2)], 3);
+        idle_baseline.epoch = 3;
+        sim.update(&idle_baseline, Stamp::seconds(202), 121.);
+        assert!(sim.activities.is_empty());
+        assert!(sim.events.is_empty());
+        assert!(sim.pulses.is_empty());
+    }
+    #[test]
+    fn completed_transitions_replace_state_and_only_idle_unknown_are_timed() {
+        for (status, title) in [
+            ("working", "AGENT WORKING"),
+            ("blocked", "ATTENTION REQUIRED"),
+            ("idle", "AGENT IDLE"),
+            ("unrecognized", "AGENT STATE UNKNOWN"),
+        ] {
+            let mut sim = Simulation::default();
+            sim.update(
+                &view(vec![node("one", "done", 1)], 1),
+                Stamp::seconds(201),
+                0.,
+            );
+            let serial = sim.serial;
+            let changed = view(vec![node("one", status, 1)], 2);
+            sim.update(&changed, Stamp::seconds(202), 60.);
+            assert_eq!(sim.activities.len(), 2);
+            assert!(sim.activities.values().all(|a| a.event.title == title
+                && a.event.serial > serial
+                && a.persistent == matches!(status, "working" | "blocked")));
+            sim.update(&changed, Stamp::seconds(202), 71.);
+            assert_eq!(
+                sim.activities.len(),
+                if matches!(status, "working" | "blocked") {
+                    2
+                } else {
+                    0
+                }
+            );
+        }
+        let mut sim = Simulation::default();
+        sim.update(
+            &view(vec![node("one", "done", 1)], 1),
+            Stamp::seconds(201),
+            0.,
+        );
+        sim.update(&view(vec![], 2), Stamp::seconds(202), 60.);
+        assert!(
+            sim.activities
+                .values()
+                .all(|a| !a.persistent && a.event.title == "AGENT NO LONGER OBSERVED")
+        );
+        sim.update(&view(vec![], 2), Stamp::seconds(202), 71.);
+        assert!(sim.activities.is_empty());
+        sim.update(
+            &view(vec![node("one", "done", 1)], 3),
+            Stamp::seconds(202),
+            72.,
+        );
+        sim.update(&View::default(), Stamp::seconds(202), 73.);
+        assert!(sim.activities.is_empty());
+    }
+    #[test]
+    fn sampled_completed_startup_retention_and_capacity_prioritize_live_attention() {
+        let mut sim = Simulation::default();
+        let initial = view(
+            vec![node("one", "done", 4095), node("two", "done", 4095)],
+            1,
+        );
+        sim.update(&initial, Stamp::seconds(201), 0.);
+        assert_eq!(sim.activities.len(), MAX_ENTITIES);
+        assert_eq!(sim.omitted_activities, 16380 - MAX_ENTITIES);
+        let sampled = sim
+            .activities
+            .keys()
+            .find(|key| sim.id(key).is_none())
+            .unwrap()
+            .clone();
+        assert!(matches!(sim.anchor(&sampled), Some(Id::Node(_))));
+        assert!(sim.activities[&sampled].persistent);
+        let mixed = view(
+            vec![
+                node("one", "done", 4095),
+                node("two", "done", 4095),
+                node("blocked", "blocked", 100),
+                node("busy", "working", 100),
+            ],
+            2,
+        );
+        sim.update(&mixed, Stamp::seconds(202), 60.);
+        assert_eq!(sim.activities.len(), MAX_ENTITIES);
+        assert_eq!(
+            sim.activities
+                .values()
+                .filter(|a| a.state == AgentState::Blocked)
+                .count(),
+            200
+        );
+        assert_eq!(
+            sim.activities
+                .values()
+                .filter(|a| a.state == AgentState::Working)
+                .count(),
+            200
+        );
+        assert_eq!(
+            sim.activities
+                .values()
+                .filter(|a| a.state == AgentState::Completed)
+                .count(),
+            MAX_ENTITIES - 400
+        );
+        assert_eq!(sim.omitted_activities, 16780 - MAX_ENTITIES);
+        let serials: BTreeMap<_, _> = sim
+            .activities
+            .iter()
+            .map(|(k, a)| (k.clone(), a.event.serial))
+            .collect();
+        let mut repeat = mixed;
+        repeat.revision = 3;
+        sim.update(&repeat, Stamp::seconds(202), 61.);
+        assert_eq!(serials.len(), sim.activities.len());
+        assert!(
+            sim.activities
+                .iter()
+                .all(|(k, a)| serials.get(k) == Some(&a.event.serial)),
+            "unchanged capacity must retain card identities without replaying entrances"
+        );
+        assert!(sim.activities.values().all(|a| a.persistent));
+    }
+    #[test]
+    fn completed_downgrades_release_capacity_before_sampled_blocked_admission() {
+        let mut sim = Simulation::default();
+        sim.update(
+            &view(
+                vec![node("one", "blocked", 4095), node("two", "blocked", 4095)],
+                1,
+            ),
+            Stamp::seconds(201),
+            0.,
+        );
+        assert_eq!(sim.activities.len(), MAX_ENTITIES);
+        let changed = view(
+            vec![node("one", "done", 4095), node("two", "blocked", 4095)],
+            2,
+        );
+        sim.update(&changed, Stamp::seconds(202), 1.);
+        assert_eq!(sim.activities.len(), MAX_ENTITIES);
+        assert!(
+            sim.activities
+                .iter()
+                .all(|(key, a)| key[1] == "two" && a.persistent && a.state == AgentState::Blocked)
+        );
+        assert_eq!(sim.omitted_activities, 16380 - MAX_ENTITIES);
+    }
+    #[test]
+    fn concurrent_work_and_completion_persist_then_idle_notices_expire_independently() {
         let mut sim = Simulation::default();
         let first = view(
             vec![node("one", "working", 4), node("two", "working", 2)],
@@ -1032,7 +1210,7 @@ pub mod tests {
         );
         let second = view(vec![node("one", "done", 4), node("two", "working", 2)], 2);
         sim.update(&second, Stamp::seconds(202), 61.);
-        assert_eq!(sim.activities.values().filter(|a| a.persistent).count(), 4);
+        assert_eq!(sim.activities.values().filter(|a| a.persistent).count(), 12);
         assert_eq!(
             sim.activities
                 .values()
@@ -1043,16 +1221,23 @@ pub mod tests {
         sim.update(&second, Stamp::seconds(202), 70.9);
         assert_eq!(sim.activities.len(), 12);
         sim.update(&second, Stamp::seconds(202), 71.01);
-        assert_eq!(sim.activities.len(), 4);
+        assert_eq!(sim.activities.len(), 12);
         let third = view(vec![node("one", "done", 4), node("two", "idle", 2)], 3);
         sim.update(&third, Stamp::seconds(202), 72.);
         assert!(
             sim.activities
                 .values()
+                .filter(|a| a.state == AgentState::Idle)
                 .all(|a| !a.persistent && a.event.title == "AGENT IDLE")
         );
+        assert_eq!(sim.activities.values().filter(|a| !a.persistent).count(), 4);
         sim.update(&third, Stamp::seconds(202), 82.01);
-        assert!(sim.activities.is_empty());
+        assert_eq!(sim.activities.len(), 8);
+        assert!(
+            sim.activities
+                .values()
+                .all(|a| a.persistent && a.state == AgentState::Completed)
+        );
     }
     #[test]
     fn working_disconnect_and_reconnect_do_not_invent_completion_or_reuse_anchors() {
@@ -1253,9 +1438,10 @@ pub mod tests {
         );
         sim.update(&resolved, Stamp::seconds(202), 2.);
         assert_eq!(sim.activities[&sampled].event.title, "AGENT COMPLETED");
-        assert!(!sim.activities[&sampled].persistent);
+        assert!(sim.activities[&sampled].persistent);
         sim.update(&resolved, Stamp::seconds(202), 12.01);
-        assert!(!sim.activities.contains_key(&sampled));
+        assert_eq!(sim.activities[&sampled].state, AgentState::Completed);
+        assert!(sim.activities[&sampled].persistent);
         let huge = view(
             vec![node("one", "blocked", 4095), node("two", "blocked", 4095)],
             3,

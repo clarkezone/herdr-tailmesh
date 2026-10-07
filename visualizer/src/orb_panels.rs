@@ -280,6 +280,7 @@ fn cards(sim: &Simulation) -> Vec<Card<'_>> {
             if a.persistent {
                 b.attention
                     .cmp(&a.attention)
+                    .then_with(|| b.working.cmp(&a.working))
                     .then_with(|| a.key.cmp(&b.key))
             } else {
                 b.event.serial.cmp(&a.event.serial)
@@ -1118,6 +1119,52 @@ mod tests {
             |ui| state.handle_input(ui, 100., false),
         );
         assert!(state.focus.is_none());
+        output.textures_delta.clear();
+    }
+    #[test]
+    fn completed_startup_cards_render_after_one_minute_with_work_hidden_and_focus_available() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "done", 1)], 1);
+        let mut sim = Simulation::default();
+        let mut state = Panels::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
+        sim.update(&v, Stamp::seconds(201), 0.);
+        state.controls.toggle_workers(2.);
+        sim.update(&v, Stamp::seconds(202), 60.);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw(
+                    ui,
+                    &Context {
+                        sim: &sim,
+                        view: &v,
+                        rect,
+                        selected: None,
+                        passive: false,
+                    },
+                    &mut state,
+                );
+            },
+        );
+        for expected in [
+            "AGENT COMPLETED",
+            "Focus",
+            "Actual node one",
+            "Actual workspace",
+            "Actual agent 0",
+        ] {
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text().contains(expected))), "missing {expected}");
+        }
+        assert!(
+            sim.activities
+                .values()
+                .all(|a| a.persistent && a.state == AgentState::Completed)
+        );
+        assert!(!state.controls.workers.shown);
         output.textures_delta.clear();
     }
     #[test]
