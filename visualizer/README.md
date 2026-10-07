@@ -32,8 +32,9 @@ its real node/session/workspace/agent names, including initial/reconnect snapsho
 counts, selection and timed notices remain independent of W. Working → blocked
 replaces the work card with persistent ATTENTION REQUIRED, and blocked → working
 replaces attention with work. Completed cards remain until the agent changes state
-or disappears, including agents already done at startup/reconnect. **Dismiss**
-acknowledges a completion locally and retracts its card; narrow cards use **×**.
+or disappears, including agents already done at startup/reconnect. A bracketed **×**
+beside the Focus reticle acknowledges that card's completion locally and retracts
+it. The control glows on hover/keyboard focus; hover help identifies Dismiss.
 The acknowledgement lasts for that observed Completed episode, across unchanged
 snapshots/reconnects, until a state change/removal/source reset; a later completion
 appears again. Counts and agent state stay unchanged; selection and Focus remain
