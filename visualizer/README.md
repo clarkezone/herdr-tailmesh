@@ -3,30 +3,53 @@
 A standalone Rust viewer for the managed Herdr mesh daemon. **Orb is the default**
 for both the interactive executable and Windows screensaver/preview. It presents
 real coordinator → node → session → workspace → agent observations using the
-accepted orbital geometry, depth cues, role colors, agent states, 3-second receipt
-pulses and 10-second state-change callouts. There is no simulation or debug lab.
-Idle/unknown agents use neutral gray; stale/offline observations are dimmed.
-Callouts use actual scoped names; initial snapshots and reconnect baselines do not
-replay activity. The latest three transient events are retained, and only cards
-fitting above the key/footer appear. New events can replace an older card sooner.
+accepted orbital geometry, depth cues, role colors, agent states and 3-second
+receipt pulses. There is no simulation or debug lab. Idle/unknown agents use
+neutral gray; stale/offline observations are dimmed.
 
-Use `--tree` to open the existing tree, including its selection, expand/collapse,
-scrolling, 400 ms layout easing and conditional observation pane. Orb supports
-clicking a projected mark to inspect observations and clicking blank space to
-clear selection. The project summary groups exact reported project IDs using
-the existing model; it does not infer Git repository equivalence.
+Orb uses the full, centered viewport with a blank border. A bounded floating
+panel holds the visual key, connection label and all seven counts, with a slow
+48-second vertical drift and a leader to the coordinator. Its background covers
+only that panel. Tiny previews use abbreviated counts instead of the full key.
 
-The Orb footer counts all observed member nodes, sessions, reported workspaces
+Each observed working agent has an independent persistent callout with its real
+node/session/workspace/agent names. It stays until that scoped agent stops;
+completion, blocked, idle or unknown then shows the actual reported state for
+ten seconds, including entrance/fade. Starting new work replaces that agent's
+stop notice. Current working observations also appear on an initial snapshot;
+this does not replay a start event. Disconnected/stale working cards are marked
+LAST KNOWN, with no invented completion. Reconnect baselines do not replay stops.
+Removed agents get a truthful no-longer-observed notice on a live delta.
+
+Multiple cards stack in available edge columns. Overflow is pageable; interactive
+views have page controls, while passive views advance every twelve seconds.
+New transient events return to the first page, with stop notices ahead of work.
+Persistent cards do not expire while off-page. Timed notices still expire after
+ten seconds, so an exceptionally crowded screen is not a lossless event log.
+Other transient events keep their latest-three bound; activity history is bounded
+separately and current working cards take priority over expired/old history.
+Long callout names and selection details scroll within their bounded cards.
+
+Use `--tree` to open the independent existing tree renderer, including Fleet pulse
+cards, selection, expand/collapse, scrolling, 400 ms layout easing and conditional
+observation pane. It does not initialize the Orb GPU pipelines. Orb supports
+clicking a projected mark to inspect observations in a floating card and leader
+that stay until dismissed. Click the same mark again, blank space, or Close to
+clear selection. Cards do not resize or move the Orb viewport. Project summaries
+remain available through Projects in the key panel, grouping exact reported IDs
+without inferring Git equivalence or changing project ownership.
+
+The Orb panel counts all observed member nodes, sessions, reported workspaces
 and agents, plus working/blocked/done agents. Idle/unknown agents remain in the
 total, and unresolved workspace placeholders do not inflate workspace counts.
 Session counts include the existing default-context branch when its inventory
 is unknown; they are not a deduplicated count of native session processes.
 These are scoped observation totals, including stale inventory, with an explicit
-retained label on disconnect. The separate Fleet pulse cards preserve current
-freshness rules and use a compact summary on small windows. Fixed GPU budgets
-sample exceptionally large inventories, keeping ancestor paths and member hubs;
-an omission notice appears and totals remain complete. `--tree` exposes the full
-inventory. Placement uses scoped identities and reusable slots, not label order.
+LAST KNOWN label on disconnect. The separate Fleet pulse cards in `--tree` retain
+their dashboard freshness rules. Fixed GPU budgets sample exceptionally large
+inventories, keeping ancestor paths and member hubs; an omission notice appears
+and totals remain complete. `--tree` exposes the full inventory. Placement uses
+scoped identities and reusable slots, not label order.
 
 The viewer opens even when the daemon is offline, reconnects automatically, and retains
 the last good observations while disconnected. Receipt timestamps become stale
@@ -128,7 +151,7 @@ Start-Process -FilePath .\visualizer\target\release\herdr-mesh-visualizer.scr -A
 wheel/touch, or mouse movement of 8 physical pixels after a one-second startup
 grace period. Focus loss outside its own windows, suspend, session lock and
 display-topology changes also close it.
-The live tree automatically scrolls. If no live stream is available, it shows
+With `--tree`, the live tree automatically scrolls. If no live stream is available, it shows
 only **Daemon not available**, never retained fleet data. Reconnection is automatic.
 
 `/p HWND` (or `/p:HWND`) embeds a non-activating preview in a Windows-provided
@@ -203,3 +226,5 @@ libraries and a compatible GPU driver remain required.
 
 Viewer and screensaver archives include the Orb third-party notices alongside
 the single executable. The notice file is not a runtime dependency.
+
+[Floating Orb panels and persistent activity: requirements, review and validation](../docs/orb-floating-panels.md).

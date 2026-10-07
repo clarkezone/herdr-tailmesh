@@ -61,6 +61,14 @@ pub struct Layout {
     cells: Vec<Rect>,
     icon_width: f32,
 }
+impl Layout {
+    pub fn translate(&mut self, delta: egui::Vec2) {
+        self.bounds = self.bounds.translate(delta);
+        for cell in &mut self.cells {
+            *cell = cell.translate(delta);
+        }
+    }
+}
 
 // Keep hierarchy and agent states on separate rows; wrap each group on narrow windows.
 pub fn layout(painter: &Painter, viewport: Rect, bottom: f32) -> Layout {
@@ -215,13 +223,6 @@ pub fn draw(painter: &Painter, layout: &Layout, time: f32) {
         );
         return;
     }
-    painter.rect_filled(bounds, 4.0, Color32::from_rgba_unmultiplied(4, 12, 24, 230));
-    painter.rect_stroke(
-        bounds,
-        4.0,
-        Stroke::new(0.5, Color32::from_white_alpha(35)),
-        egui::StrokeKind::Inside,
-    );
     for pair in layout.cells[..HIERARCHY_COUNT].windows(2) {
         if pair[0].top() == pair[1].top() {
             let center = pos2(pair[0].right() + 5.0, pair[0].center().y);
