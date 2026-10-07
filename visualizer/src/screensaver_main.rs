@@ -8,6 +8,7 @@ mod mesh_model;
 mod mesh_orb;
 mod mesh_stats;
 mod mesh_territory;
+mod orb_focus;
 mod orb_hud;
 mod orb_panels;
 mod orb_ui;

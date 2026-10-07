@@ -2,7 +2,7 @@
 use crate::{
     animation::Motion,
     mesh_legend,
-    mesh_model::{Event, Simulation, ease},
+    mesh_model::{AgentState, Event, Simulation, ease},
     mesh_orb, mesh_stats,
     orb_hud::{Controls, Panel, Reveal},
 };
@@ -15,6 +15,7 @@ const CYAN: Color32 = Color32::from_rgb(90, 216, 235);
 pub struct Panels {
     pub page: usize,
     pub projects: bool,
+    pub focus: Option<Key>,
     controls: Controls,
     key_motion: Option<Motion>,
     count_motion: Option<Motion>,
@@ -30,6 +31,7 @@ impl Panels {
         self.previous.clear();
         self.membership.clear();
         self.projects = false;
+        self.focus = None;
     }
     pub fn handle_input(&mut self, ui: &Ui, clock: f64, passive: bool) {
         self.controls.update(clock);
@@ -53,6 +55,7 @@ impl Panels {
                         egui::Key::K => self.controls.toggle(Panel::Key, clock),
                         egui::Key::N => self.controls.toggle(Panel::Counts, clock),
                         egui::Key::W => self.controls.toggle_workers(clock),
+                        egui::Key::Escape => self.focus = None,
                         _ => {}
                     }
                 }
@@ -249,6 +252,8 @@ struct Card<'a> {
     event: &'a Event,
     key: Option<&'a Key>,
     persistent: bool,
+    working: bool,
+    attention: bool,
 }
 fn cards(sim: &Simulation) -> Vec<Card<'_>> {
     let mut cards: Vec<_> = sim
@@ -258,18 +263,24 @@ fn cards(sim: &Simulation) -> Vec<Card<'_>> {
             event: &a.event,
             key: Some(key),
             persistent: a.persistent,
+            working: a.persistent && a.state == AgentState::Working,
+            attention: a.persistent && a.state == AgentState::Blocked,
         })
         .collect();
     cards.extend(sim.events.iter().rev().map(|event| Card {
         event,
         key: None,
         persistent: false,
+        working: false,
+        attention: false,
     }));
     // Short-lived transitions get first-page priority; persistent work remains pageable.
     cards.sort_by(|a, b| {
         a.persistent.cmp(&b.persistent).then_with(|| {
             if a.persistent {
-                a.key.cmp(&b.key)
+                b.attention
+                    .cmp(&a.attention)
+                    .then_with(|| a.key.cmp(&b.key))
             } else {
                 b.event.serial.cmp(&a.event.serial)
             }
@@ -279,19 +290,16 @@ fn cards(sim: &Simulation) -> Vec<Card<'_>> {
 }
 fn card_anchor(card: &Card<'_>, sim: &Simulation, rect: Rect) -> Option<Pos2> {
     let id = match card.key {
-        Some(key) => sim.id(key)?,
+        Some(key) => sim.anchor(key)?,
         None => card.event.origin,
     };
-    mesh_orb::project(mesh_orb::visible_position(sim, id), sim.time, rect)
+    mesh_orb::project_sim(mesh_orb::visible_position(sim, id), sim, rect)
 }
 
 fn retained(card: &Card<'_>, sim: &Simulation) -> bool {
-    card.persistent
-        && card
-            .key
-            .and_then(|key| sim.id(key))
-            .is_some_and(|id| sim.opacity(id) < 1.)
+    card.persistent && card.key.is_some_and(|key| sim.activity_retained(key))
 }
+
 fn title(card: &Card<'_>, sim: &Simulation) -> String {
     if retained(card, sim) {
         format!("{} · LAST KNOWN", card.event.title)
@@ -301,7 +309,7 @@ fn title(card: &Card<'_>, sim: &Simulation) -> String {
 }
 fn card_reveal(card: &Card<'_>, context: &Context<'_>, state: &Panels) -> Reveal {
     let own = Reveal::event(context.sim.clock - card.event.started, card.persistent);
-    if card.persistent {
+    if card.working {
         Reveal::new(
             own.amount()
                 .min(state.controls.workers.reveal(context.sim.clock).amount()),
@@ -343,7 +351,7 @@ fn card_size(
     );
     vec2(
         width,
-        (heading.size().y + body.size().y + 34. + if pager { 28. } else { 0. }).min(limit.y),
+        (heading.size().y + body.size().y + 34. + 24. + if pager { 28. } else { 0. }).min(limit.y),
     )
 }
 fn places(
@@ -463,6 +471,19 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         .selected
         .and_then(|key| crate::orb_ui::selected_branch(context.view, key));
     let mut reserved: Vec<_> = docks.iter().map(|d| d.bounds).collect();
+    if !context.passive
+        && let Some(bounds) = crate::orb_focus::panel(
+            ui,
+            context.sim,
+            context.view,
+            rect,
+            &mut state.focus,
+            &reserved,
+        )
+    {
+        reserved.push(bounds);
+        response.blocked.push(bounds);
+    }
     let detail = (selected.is_some() || state.projects)
         .then(|| detail_rect(context, &reserved))
         .filter(|r| r.width() >= 64. && r.height() >= 64.);
@@ -472,7 +493,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
     }
     let candidates: Vec<_> = cards(context.sim)
         .into_iter()
-        .filter(|c| !c.persistent || state.controls.workers.occupies(context.sim.clock))
+        .filter(|c| !c.working || state.controls.workers.occupies(context.sim.clock))
         .collect();
     if !state
         .membership
@@ -536,9 +557,9 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
     // Capture this frame's cursor: clicking a pager changes only the next frame.
     let page_start = state.page_start;
     let pager = page_start > 0 || page_start + capacity < candidates.len();
-    if let Some(anchor) = mesh_orb::project(
-        mesh_orb::coordinator(context.sim.time),
-        context.sim.time,
+    if let Some(anchor) = mesh_orb::project_sim(
+        mesh_orb::coordinator(context.sim.motion_time()),
+        context.sim,
         rect,
     ) {
         for dock in &docks {
@@ -571,7 +592,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             .selected
             .and_then(|key| {
                 if selected.is_some_and(|b| b.kind == "coordinator") {
-                    Some(mesh_orb::coordinator(context.sim.time))
+                    Some(mesh_orb::coordinator(context.sim.motion_time()))
                 } else {
                     context
                         .sim
@@ -582,9 +603,9 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             .or_else(|| {
                 state
                     .projects
-                    .then(|| mesh_orb::coordinator(context.sim.time))
+                    .then(|| mesh_orb::coordinator(context.sim.motion_time()))
             })
-            .and_then(|p| mesh_orb::project(p, context.sim.time, rect));
+            .and_then(|p| mesh_orb::project_sim(p, context.sim, rect));
         if let Some(anchor) = anchor {
             leader(&painter, anchor, card, CYAN);
         }
@@ -625,7 +646,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         let has_pager = index == 0 && pager && !context.passive;
         let body = Rect::from_min_max(
             bounds.min + vec2(12., heading.size().y + 22.),
-            bounds.max - vec2(12., if has_pager { 40. } else { 12. }),
+            bounds.max - vec2(12., if has_pager { 64. } else { 36. }),
         );
         let mut child = ui.new_child(
             UiBuilder::new()
@@ -649,6 +670,34 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                         .color(color),
                 );
             });
+        if !context.passive {
+            let footer = Rect::from_min_max(
+                pos2(
+                    bounds.left() + 12.,
+                    bounds.bottom() - if has_pager { 56. } else { 30. },
+                ),
+                pos2(
+                    bounds.right() - 12.,
+                    bounds.bottom() - if has_pager { 34. } else { 8. },
+                ),
+            );
+            let mut child = ui.new_child(
+                UiBuilder::new()
+                    .id_salt(("orb-activity-focus", card.event.serial))
+                    .max_rect(footer),
+            );
+            child.set_clip_rect(footer.intersect(aperture));
+            if !reveal.interactive() {
+                child.disable();
+            }
+            child.set_opacity(opacity);
+            if let Some(key) = card.key.or_else(|| context.sim.key(card.event.origin)) {
+                // Removed activity keys do not inherit a recycled geometry slot.
+                if context.sim.anchor(key).is_some() {
+                    crate::orb_focus::checkbox(&mut child, context.view, key, &mut state.focus);
+                }
+            }
+        }
         if has_pager {
             let footer = Rect::from_min_max(
                 pos2(bounds.left() + 12., bounds.bottom() - 32.),
@@ -699,6 +748,11 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                 state.projects = false;
             }
         });
+        if !context.passive
+            && let Some(branch) = selected
+        {
+            crate::orb_focus::checkbox(&mut child, context.view, &branch.key, &mut state.focus);
+        }
         egui::ScrollArea::vertical()
             .max_height(child.available_height())
             .auto_shrink([false, false])
@@ -833,6 +887,18 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                 context.sim.omitted
             ),
             egui::FontId::monospace(9.),
+            CYAN,
+        );
+    }
+    if context.sim.omitted_activities > 0 {
+        painter.text(
+            rect.left_top() + vec2(0., 14.),
+            egui::Align2::LEFT_TOP,
+            format!(
+                "Callout capacity: {} omitted; node attention and totals complete",
+                context.sim.omitted_activities
+            ),
+            FontId::monospace(9.),
             CYAN,
         );
     }
@@ -997,6 +1063,62 @@ mod tests {
                 assert!(!docks[0].bounds.intersects(docks[1].bounds));
             }
         }
+    }
+    #[test]
+    fn w_hides_only_working_cards_while_blocked_attention_and_focus_remain_available() {
+        let ctx = egui::Context::default();
+        let v = view(
+            vec![node("attention", "blocked", 2), node("busy", "working", 1)],
+            1,
+        );
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        let mut state = Panels::default();
+        state.controls.toggle_workers(2.);
+        state.focus = Some(v.scene.as_ref().unwrap().nodes[1].key.clone());
+        sim.update(&v, Stamp::seconds(201), 100.);
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw(
+                    ui,
+                    &Context {
+                        sim: &sim,
+                        view: &v,
+                        rect,
+                        selected: None,
+                        passive: false,
+                    },
+                    &mut state,
+                );
+            },
+        );
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.text().contains("ATTENTION REQUIRED"))));
+        assert!(!output.shapes.iter().any(
+            |s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.text().contains("AGENT WORKING"))
+        ));
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.text().contains("Return to fleet"))));
+        assert_eq!(
+            sim.activities
+                .values()
+                .filter(|a| a.state == AgentState::Blocked)
+                .count(),
+            4
+        );
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![key(egui::Key::Escape, true, false)],
+                ..Default::default()
+            },
+            |ui| state.handle_input(ui, 100., false),
+        );
+        assert!(state.focus.is_none());
+        output.textures_delta.clear();
     }
     #[test]
     fn working_toggle_hides_all_work_without_changing_counts_and_stops_still_show() {

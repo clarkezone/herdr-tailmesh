@@ -118,7 +118,7 @@ fn rear_weight(world: vec3<f32>) -> f32 {
     // Camera is on +Z. Feather across the middle of the sphere; no hemisphere
     // pop when rotation carries a cluster through the silhouette/midplane.
     let width = scene.camera_depth.y * 0.32;
-    return 1.0 - smoothstep(-width, width, world.z);
+    return 1.0 - smoothstep(-width, width, world.z - scene.group_model[3].z);
 }
 
 @fragment
@@ -173,10 +173,11 @@ fn veil_fs(input: VeilOutput) -> @location(0) vec4<f32> {
     let eye = vec3<f32>(0.0, 0.0, scene.camera_depth.x);
     let ray = normalize(vec3<f32>(input.screen.x*aspect*0.41421356, input.screen.y*0.41421356, -1.0));
     let radius = scene.camera_depth.y;
-    let b = dot(eye, ray);
-    let discriminant = b*b - dot(eye,eye) + radius*radius;
+    let relative_eye = eye - scene.group_model[3].xyz;
+    let b = dot(relative_eye, ray);
+    let discriminant = b*b - dot(relative_eye,relative_eye) + radius*radius;
     if discriminant <= 0.0 { discard; }
-    let hit = eye + ray*(-b-sqrt(discriminant));
+    let hit = relative_eye + ray*(-b-sqrt(discriminant));
     let normal = hit / radius;
     let facing = clamp(dot(normal,-ray),0.0,1.0);
     let rim = pow(1.0-facing,3.0);

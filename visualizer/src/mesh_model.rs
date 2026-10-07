@@ -5,7 +5,7 @@ use herdr_mesh_visualizer::{
     projection::{Branch, Freshness, Key, Scene},
     summary::summary,
 };
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 pub const MAX_NODES: usize = 128;
 pub const MAX_ENTITIES: usize = 8_000;
@@ -150,6 +150,9 @@ pub struct Event {
     pub color: [f32; 3],
 }
 pub struct Activity {
+    pub state: AgentState,
+    pub freshness: Freshness,
+    pub offline: bool,
     pub event: Event,
     pub persistent: bool,
 }
@@ -160,14 +163,17 @@ pub struct Simulation {
     ids: BTreeMap<Key, Id>,
     pub pulses: Vec<Pulse>,
     pub events: VecDeque<Event>,
-    /// Current working agents and their timed stop notices, scoped by identity.
+    /// Current working/blocked agents and their timed resolution notices, scoped by identity.
     pub activities: BTreeMap<Key, Activity>,
+    pub camera: Option<crate::orb_focus::Pose>,
     pub time: f32,
     pub clock: f64,
     pub live: bool,
     pub callouts: bool,
     pub omitted: usize,
+    pub omitted_activities: usize,
     totals: Summary,
+    blocked_receipts: BTreeMap<Key, Vec<Stamp>>,
     pub source_generation: u64,
     source: Option<Key>,
     epoch: Option<u64>,
@@ -205,8 +211,45 @@ impl Simulation {
             }
         })
     }
+    pub fn activity_retained(&self, key: &Key) -> bool {
+        self.activities
+            .get(key)
+            .is_some_and(|a| !self.live || a.offline || !a.freshness.is_live(self.wall))
+    }
+    pub fn anchor(&self, key: &Key) -> Option<Id> {
+        self.id(key)
+            .or_else(|| key.get(..2).and_then(|node| self.id(&node.to_vec())))
+    }
+    pub fn name(&self, id: Id) -> &str {
+        self.records
+            .get(&id)
+            .and_then(|r| r.names.last())
+            .map_or("", String::as_str)
+    }
+    pub fn motion_time(&self) -> f32 {
+        self.camera.map_or(self.time, |pose| pose.orbit_time)
+    }
+    pub fn blocked_nodes(&self) -> BTreeMap<usize, f32> {
+        // Node attention follows complete observation, even when agent geometry
+        // is sampled. Cache unique context receipts, then age them every frame.
+        self.entities
+            .iter()
+            .filter_map(|(&id, life)| {
+                if !matches!(id, Id::Node(_)) || !life.entering() || self.opacity(id) < 1. {
+                    return None;
+                }
+                let key = self.key(id)?;
+                self.blocked_receipts
+                    .get(key)?
+                    .iter()
+                    .any(|stamp| Freshness::Receipt(*stamp).is_live(self.wall))
+                    .then(|| (id.indices().0, life.alpha(self.clock)))
+            })
+            .collect()
+    }
     fn prune(&mut self) -> bool {
         let previous = self.entities.len();
+        let previous_activities = self.activities.len();
         self.entities
             .retain(|_, life| life.entering() || self.clock - life.since < TRANSITION);
         if previous != self.entities.len() {
@@ -219,7 +262,7 @@ impl Simulation {
         self.activities.retain(|_, activity| {
             activity.persistent || self.clock - activity.event.started < CALLOUT_DURATION
         });
-        previous != self.entities.len()
+        previous != self.entities.len() || previous_activities != self.activities.len()
     }
 
     fn slot(
@@ -258,19 +301,33 @@ impl Simulation {
             self.events.pop_front();
         }
     }
-    fn activity(&mut self, key: &Key, id: Id, state: AgentState, text: String) {
-        let persistent = state == AgentState::Working;
+    fn activity(
+        &mut self,
+        key: &Key,
+        id: Id,
+        state: AgentState,
+        text: String,
+        freshness: Freshness,
+        offline: bool,
+    ) {
+        let persistent = matches!(state, AgentState::Working | AgentState::Blocked);
         if let Some(activity) = self.activities.get_mut(key)
             && activity.persistent
+            && activity.state == state
             && persistent
         {
             activity.event.text = text;
+            activity.freshness = freshness;
+            activity.offline = offline;
             return;
         }
         self.serial = self.serial.wrapping_add(1);
         self.activities.insert(
             key.clone(),
             Activity {
+                state,
+                freshness,
+                offline,
                 persistent,
                 event: Event {
                     serial: self.serial,
@@ -300,6 +357,7 @@ impl Simulation {
             self.pulses.clear();
             self.events.clear();
             self.activities.clear();
+            self.blocked_receipts.clear();
             self.receipts = Default::default();
             self.revision = None;
             return;
@@ -328,7 +386,9 @@ impl Simulation {
         self.source = source;
         self.epoch = Some(view.epoch);
         self.live = view.live;
-        if self.revision != Some(view.revision) || freed && self.omitted > 0 {
+        if self.revision != Some(view.revision)
+            || freed && (self.omitted > 0 || self.omitted_activities > 0)
+        {
             self.reconcile(scene, !baseline && self.revision != Some(view.revision));
             self.revision = Some(view.revision);
         }
@@ -372,6 +432,26 @@ impl Simulation {
             agents: known.agents,
             states: [known.working, known.blocked, known.done],
         };
+        self.blocked_receipts.clear();
+        fn attention_receipts(branch: &Branch, receipts: &mut BTreeSet<Stamp>) {
+            if branch.kind == "agent"
+                && branch.status == "blocked"
+                && let Freshness::Receipt(stamp) = branch.freshness
+            {
+                receipts.insert(stamp);
+            }
+            for child in &branch.children {
+                attention_receipts(child, receipts);
+            }
+        }
+        for node in &scene.nodes {
+            let mut receipts = BTreeSet::new();
+            attention_receipts(node, &mut receipts);
+            if !receipts.is_empty() {
+                self.blocked_receipts
+                    .insert(node.key.clone(), receipts.into_iter().collect());
+            }
+        }
         let mut budget = [0; 2];
         let mut retained = [0; 2];
         for id in self.entities.keys() {
@@ -419,18 +499,28 @@ impl Simulation {
                     && branch.freshness.is_live(self.wall)
                     && old.is_some_and(|r| r.state != state && r.freshness.is_live(self.wall));
                 let joined = emit && branch.kind == "node" && existing.is_none();
-                let working_card = self
+                let persistent_card = self
                     .activities
                     .get(&branch.key)
                     .is_some_and(|a| a.persistent);
-                if branch.kind == "agent" && state == AgentState::Working
+                if branch.kind == "agent"
+                    && matches!(state, AgentState::Working | AgentState::Blocked)
                     || attention && self.activities.contains_key(&branch.key)
                 {
                     let text = format!(
                         "{}\nNode: {}\nSession: {}\nWorkspace: {}\nAgent: {}",
                         branch.status, names[0], names[1], names[2], names[3]
                     );
-                    self.activity(&branch.key, id, state, text);
+                    self.activity(
+                        &branch.key,
+                        id,
+                        state,
+                        text,
+                        branch.freshness,
+                        self.records
+                            .get(&Id::Node(id.indices().0))
+                            .is_some_and(|r| r.offline),
+                    );
                 } else if attention {
                     let title = match state {
                         AgentState::Blocked => "ATTENTION REQUIRED",
@@ -443,7 +533,10 @@ impl Simulation {
                         branch.status, names[0], names[1], names[2], names[3]
                     );
                     self.event(id, title, text, state.color());
-                } else if branch.kind == "agent" && state != AgentState::Working && working_card {
+                } else if branch.kind == "agent"
+                    && !matches!(state, AgentState::Working | AgentState::Blocked)
+                    && persistent_card
+                {
                     // Stale/reconnected comparisons cannot fabricate completion.
                     self.activities.remove(&branch.key);
                 } else if joined {
@@ -539,9 +632,12 @@ impl Simulation {
         }
         self.activities.retain(|key, activity| {
             if activity.persistent && !self.ids.get(key).is_some_and(|id| selected.contains(id)) {
-                if !emit || present.contains(key) {
-                    return false; // Baselines and render sampling cannot assert departure.
-                }
+                if present.contains(key) {
+                    return true;
+                } // Sampled leaves remain observed.
+                if !emit {
+                    return false;
+                } // Baselines cannot assert departure.
                 // This is a new timed notice, not the old working-card entrance.
                 self.serial = self.serial.wrapping_add(1);
                 activity.event.serial = self.serial;
@@ -553,20 +649,116 @@ impl Simulation {
             }
             true
         });
-        // Trim completed history once per snapshot, avoiding repeated full-map scans.
-        let excess = self.activities.len().saturating_sub(MAX_ENTITIES);
-        if excess > 0 {
-            let mut timed: Vec<_> = self
-                .activities
-                .iter()
-                .filter(|(_, a)| !a.persistent)
-                .map(|(key, a)| (a.event.serial, key.clone()))
-                .collect();
-            timed.sort_unstable_by_key(|(serial, _)| *serial);
-            for (_, key) in timed.into_iter().take(excess) {
+        // Retain activity independently of geometry admission, with node anchors
+        // for sampled leaves. Scan references, prioritizing blocked over working.
+        let mut sampled = Vec::new();
+        fn sampled_agents<'a>(
+            branch: &'a Branch,
+            names: &mut Vec<&'a str>,
+            node: &'a Branch,
+            selected: &HashSet<Id>,
+            ids: &BTreeMap<Key, Id>,
+            output: &mut Vec<(&'a Branch, Vec<&'a str>, &'a Branch)>,
+        ) {
+            names.push(&branch.label);
+            if branch.kind == "agent"
+                && !ids.get(&branch.key).is_some_and(|id| selected.contains(id))
+            {
+                output.push((branch, names.clone(), node));
+            }
+            for child in &branch.children {
+                sampled_agents(child, names, node, selected, ids, output);
+            }
+            names.pop();
+        }
+        for node in &scene.nodes {
+            sampled_agents(
+                node,
+                &mut Vec::new(),
+                node,
+                &selected,
+                &self.ids,
+                &mut sampled,
+            );
+        }
+        sampled.sort_by_key(|(b, _, _)| if b.status == "blocked" { 0 } else { 1 });
+        let incoming = sampled
+            .iter()
+            .filter(|(b, _, _)| {
+                matches!(b.status.as_str(), "working" | "blocked")
+                    && !self.activities.contains_key(&b.key)
+            })
+            .count();
+        let incoming_blocked = sampled
+            .iter()
+            .filter(|(b, _, _)| b.status == "blocked" && !self.activities.contains_key(&b.key))
+            .count();
+        let mut evict: Vec<_> = self
+            .activities
+            .iter()
+            .map(|(key, a)| {
+                (
+                    if !a.persistent {
+                        0
+                    } else if a.state == AgentState::Working {
+                        1
+                    } else {
+                        2
+                    },
+                    a.event.serial,
+                    key.clone(),
+                )
+            })
+            .collect();
+        evict.sort_unstable();
+        for (priority, _, key) in evict {
+            let need = if priority == 0 {
+                incoming
+            } else if priority == 1 {
+                incoming_blocked
+            } else {
+                0
+            };
+            if self.activities.len() + need > MAX_ENTITIES {
                 self.activities.remove(&key);
             }
         }
+        for (branch, names, node) in sampled {
+            let state = AgentState::observed(&branch.status);
+            let persistent = matches!(state, AgentState::Working | AgentState::Blocked);
+            let previous = self.activities.get(&branch.key);
+            let transition = emit
+                && branch.freshness.is_live(self.wall)
+                && previous.is_some_and(|a| {
+                    a.persistent && a.state != state && a.freshness.is_live(self.wall)
+                });
+            if persistent || transition {
+                // The existing hard history bound is independent of GPU detail.
+                if previous.is_none() && self.activities.len() >= MAX_ENTITIES {
+                    continue;
+                }
+                let Some(id) = self.id(&node.key) else {
+                    continue;
+                };
+                let text = format!(
+                    "{}\nNode: {}\nSession: {}\nWorkspace: {}\nAgent: {}",
+                    branch.status, names[0], names[1], names[2], names[3]
+                );
+                self.activity(
+                    &branch.key,
+                    id,
+                    state,
+                    text,
+                    branch.freshness,
+                    node.status != "connected",
+                );
+            } else if previous.is_some_and(|a| a.persistent) {
+                self.activities.remove(&branch.key); // Baselines cannot invent a resolution.
+            }
+        }
+        // Disclose the fixed presentation/history bound independently of GPU sampling.
+        self.omitted_activities = (known.working + known.blocked)
+            .saturating_sub(self.activities.values().filter(|a| a.persistent).count());
     }
 }
 
@@ -706,7 +898,12 @@ pub mod tests {
         assert!(sim.pulses.is_empty());
         assert_eq!(sim.activities.len(), 2);
         sim.update(&v, Stamp::seconds(202), 11.01);
-        assert!(sim.activities.is_empty());
+        assert_eq!(sim.activities.len(), 2);
+        assert!(
+            sim.activities
+                .values()
+                .all(|a| a.persistent && a.state == AgentState::Blocked)
+        );
         assert!(sim.events.is_empty());
         v.epoch = 2;
         v.revision = 3;
@@ -728,6 +925,91 @@ pub mod tests {
         assert!(sim.pulses.is_empty());
         assert!(callout_opacity(6.) > 0.99);
         assert_eq!(callout_opacity(CALLOUT_DURATION as f32), 0.);
+    }
+    #[test]
+    fn blocked_snapshots_persist_and_each_resolution_reports_the_actual_state() {
+        for (status, expected) in [
+            ("working", "AGENT WORKING"),
+            ("done", "AGENT COMPLETED"),
+            ("idle", "AGENT IDLE"),
+            ("unrecognized", "AGENT STATE UNKNOWN"),
+        ] {
+            let mut sim = Simulation::default();
+            let blocked = view(
+                vec![node("attention", "blocked", 2), node("busy", "working", 1)],
+                1,
+            );
+            sim.update(&blocked, Stamp::seconds(201), 0.);
+            let originals: Vec<_> = sim.activities.values().map(|a| a.event.serial).collect();
+            sim.update(&blocked, Stamp::seconds(202), 100.);
+            assert_eq!(sim.activities.len(), 6);
+            assert_eq!(
+                sim.activities
+                    .values()
+                    .map(|a| a.event.serial)
+                    .collect::<Vec<_>>(),
+                originals
+            );
+            assert!(sim.activities.values().all(|a| a.persistent));
+            let changed = view(
+                vec![node("attention", status, 2), node("busy", "working", 1)],
+                2,
+            );
+            sim.update(&changed, Stamp::seconds(202), 101.);
+            assert_eq!(
+                sim.activities
+                    .values()
+                    .filter(|a| a.event.title == expected)
+                    .count(),
+                if status == "working" { 6 } else { 4 }
+            );
+            sim.update(&changed, Stamp::seconds(202), 112.);
+            assert_eq!(
+                sim.activities.len(),
+                if status == "working" { 6 } else { 2 }
+            );
+        }
+    }
+    #[test]
+    fn blocked_baselines_staleness_and_removal_do_not_invent_live_attention() {
+        let mut sim = Simulation::default();
+        let mut v = view(vec![node("one", "blocked", 1)], 1);
+        sim.update(&v, Stamp::seconds(201), 0.);
+        assert_eq!(sim.blocked_nodes().len(), 1);
+        sim.update(&v, Stamp::seconds(260), 60.);
+        assert!(sim.blocked_nodes().is_empty());
+        assert_eq!(sim.activities.len(), 2);
+        v.live = false;
+        sim.update(&v, Stamp::seconds(260), 100.);
+        assert!(sim.blocked_nodes().is_empty());
+        let mut baseline = view(vec![node("one", "blocked", 1)], 2);
+        baseline.epoch = 2;
+        sim.update(&baseline, Stamp::seconds(201), 101.);
+        assert_eq!(sim.activities.len(), 2);
+        assert!(sim.events.is_empty());
+        let mut resolved = view(vec![node("one", "done", 1)], 3);
+        resolved.epoch = 3;
+        sim.update(&resolved, Stamp::seconds(201), 102.);
+        assert!(sim.activities.is_empty()); // Reconnect cannot manufacture a completion.
+        let blocked = view(vec![node("one", "blocked", 1)], 4);
+        sim.update(&blocked, Stamp::seconds(201), 103.);
+        let serial = sim.serial;
+        sim.update(&view(vec![], 5), Stamp::seconds(201), 104.);
+        assert!(sim.blocked_nodes().is_empty());
+        assert!(sim.activities.values().all(|a| !a.persistent
+            && a.event.serial > serial
+            && a.event.title == "AGENT NO LONGER OBSERVED"));
+        sim.update(&view(vec![], 5), Stamp::seconds(201), 115.);
+        assert!(sim.activities.is_empty());
+    }
+    #[test]
+    fn offline_node_suppresses_attention_even_with_fresh_agent_inventory() {
+        let mut n = node("one", "blocked", 1);
+        n.connected = false;
+        let mut sim = Simulation::default();
+        sim.update(&view(vec![n], 1), Stamp::seconds(201), 2.);
+        assert_eq!(sim.activities.len(), 2);
+        assert!(sim.blocked_nodes().is_empty());
     }
     #[test]
     fn concurrent_work_persists_then_each_actual_stop_expires_independently() {
@@ -939,6 +1221,86 @@ pub mod tests {
                 .iter()
                 .all(|p| p.position_size.iter().all(|x| x.is_finite()))
         );
+    }
+    #[test]
+    fn sampled_blocked_cards_resolve_without_departure_and_capacity_is_disclosed() {
+        let mut sim = Simulation::default();
+        let blocked = view(
+            vec![
+                node("one", "blocked", 1000),
+                node("two", "blocked", 1000),
+                node("three", "blocked", 1000),
+            ],
+            1,
+        );
+        sim.update(&blocked, Stamp::seconds(201), 0.);
+        assert_eq!(sim.activities.len(), 6000);
+        assert_eq!(sim.omitted_activities, 0);
+        let sampled = sim
+            .activities
+            .keys()
+            .find(|k| k[1] == "three" && sim.id(k).is_none())
+            .unwrap()
+            .clone();
+        assert!(matches!(sim.anchor(&sampled), Some(Id::Node(_))));
+        let resolved = view(
+            vec![
+                node("one", "blocked", 1000),
+                node("two", "blocked", 1000),
+                node("three", "done", 1000),
+            ],
+            2,
+        );
+        sim.update(&resolved, Stamp::seconds(202), 2.);
+        assert_eq!(sim.activities[&sampled].event.title, "AGENT COMPLETED");
+        assert!(!sim.activities[&sampled].persistent);
+        sim.update(&resolved, Stamp::seconds(202), 12.01);
+        assert!(!sim.activities.contains_key(&sampled));
+        let huge = view(
+            vec![node("one", "blocked", 4095), node("two", "blocked", 4095)],
+            3,
+        );
+        sim.update(&huge, Stamp::seconds(202), 13.);
+        assert_eq!(sim.activities.len(), MAX_ENTITIES);
+        assert_eq!(sim.omitted_activities, 16380 - MAX_ENTITIES);
+        assert!(
+            sim.activities
+                .values()
+                .all(|a| a.persistent && a.state == AgentState::Blocked)
+        );
+        assert_eq!(sim.blocked_nodes().len(), 2);
+    }
+    #[test]
+    fn every_blocked_node_and_heartbeat_fit_existing_gpu_budgets_together() {
+        let mut nodes: Vec<_> = (0..MAX_NODES)
+            .map(|n| node(&n.to_string(), "blocked", 10))
+            .collect();
+        let mut sim = Simulation::default();
+        sim.update(&view(nodes.clone(), 1), Stamp::seconds(201), 0.);
+        for n in &mut nodes {
+            n.last_seen = Some(Timestamp {
+                seconds: 201,
+                nanos: 0,
+            });
+        }
+        sim.update(&view(nodes, 2), Stamp::seconds(202), 2.);
+        assert_eq!(sim.blocked_nodes().len(), MAX_NODES);
+        assert_eq!(sim.activities.len(), MAX_NODES * 20);
+        assert_eq!(sim.omitted_activities, 0);
+        let sampled = sim
+            .activities
+            .keys()
+            .find(|key| sim.id(key).is_none())
+            .unwrap();
+        assert!(matches!(sim.anchor(sampled), Some(Id::Node(_))));
+        assert!(!sim.activity_retained(sampled));
+        assert_eq!(sim.pulses.len(), MAX_NODES);
+        let g = crate::mesh_orb::geometry(&sim);
+        assert!(g.particles.len() <= crate::mesh_orb::MAX_PARTICLES);
+        assert!(g.lines.len() <= crate::mesh_orb::MAX_LINES);
+        let before = g.particles.len();
+        sim.live = false;
+        assert!(crate::mesh_orb::geometry(&sim).particles.len() < before);
     }
     #[test]
     fn every_node_hub_survives_dense_detail_and_simultaneous_receipt_effects() {

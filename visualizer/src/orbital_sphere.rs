@@ -343,7 +343,7 @@ impl OrbitalSphereScene {
         sim: &crate::mesh_model::Simulation,
         viewport: Viewport,
     ) -> Result<(), String> {
-        let (view_projection, group_model, scale) = crate::mesh_orb::camera(sim.time, viewport);
+        let (view_projection, group_model, scale) = crate::mesh_orb::camera_for(sim, viewport);
         queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -352,7 +352,7 @@ impl OrbitalSphereScene {
                 group_model: group_model.to_cols_array_2d(),
                 viewport_brightness: [viewport.width, viewport.height, 1.45, scale],
                 camera_depth: [
-                    crate::mesh_orb::camera_distance(viewport),
+                    crate::mesh_orb::camera_distance(viewport) / sim.camera.map_or(1., |p| p.zoom),
                     SPHERE_RADIUS * 1.1,
                     1.0,
                     viewport.pixels_per_point,
