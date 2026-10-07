@@ -115,3 +115,31 @@ working card; real W key presses showed its scan/retraction, fully hidden state
 and restoration while counts stayed unchanged. The capture helper stopped if
 focus left its owned window; remaining K/N docking checks use portable egui tests.
 Real fleet screenshots remain local and are not committed.
+
+
+## Pre-merge adversarial review (2026-10-07)
+
+- Fixed fresh removal notices retaining an old working event serial. That gave
+  a newly observed removal old priority and could keep it off-page when the
+  candidate order stayed unchanged. Allocate a new presentation notice serial
+  on a live removal, preserving scoped identity, captured names, truthful
+  no-longer-observed status and the ten-second lifetime. Baselines and sampled
+  admission still cannot emit departure.
+- Fixed inaccessible activity pagination at the minimum supported card width.
+  A wrapping caption consumed the footer and left neither navigation arrow
+  visible. Place navigation first with compact spacing, shorten or omit the
+  inline caption when necessary, and preserve full counts/page details in the
+  button tooltip. Pointer regression verifies both arrows inside a forty-point
+  footer and actual next/previous navigation.
+- Reviewed source resets, reconnect/stale activity, scoped slot reuse, sampling,
+  bounded history/text work, W-independent stop notices/counts, panel reversals,
+  resize clipping, selected observations and independent tree/saver lifecycle.
+  The daemon protocol, data architecture and GPU geometry remain unchanged.
+
+Removal identity and minimum-width navigation regressions reproduced failures
+before the fixes. The full screensaver-feature suite now passes 78 distinct
+portable tests (138 executions across both launchers), with strict all-target
+clippy and formatting checks. The first-page regression additionally covers
+removal without a candidate-order change. Optimized builds and final platform
+CI are checked before merge. Native Windows/macOS graphics and mixed-DPI/saver
+acceptance remain manual checks.

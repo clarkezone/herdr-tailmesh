@@ -542,6 +542,9 @@ impl Simulation {
                 if !emit || present.contains(key) {
                     return false; // Baselines and render sampling cannot assert departure.
                 }
+                // This is a new timed notice, not the old working-card entrance.
+                self.serial = self.serial.wrapping_add(1);
+                activity.event.serial = self.serial;
                 activity.persistent = false;
                 activity.event.started = self.clock;
                 activity.event.title = "AGENT NO LONGER OBSERVED";
@@ -799,6 +802,46 @@ pub mod tests {
         assert!(sim.activities.keys().all(|key| sim.id(key).is_none()));
         sim.update(&current, Stamp::seconds(202), 34.01);
         assert!(sim.activities.is_empty());
+    }
+    #[test]
+    fn live_removal_gets_a_new_notice_identity_and_priority() {
+        let mut sim = Simulation::default();
+        sim.update(
+            &view(
+                vec![node("gone", "working", 1), node("active", "working", 1)],
+                1,
+            ),
+            Stamp::seconds(201),
+            0.,
+        );
+        sim.update(
+            &view(
+                vec![node("gone", "working", 1), node("active", "blocked", 1)],
+                2,
+            ),
+            Stamp::seconds(202),
+            1.,
+        );
+        let before = sim.serial;
+        sim.update(
+            &view(vec![node("active", "blocked", 1)], 3),
+            Stamp::seconds(203),
+            2.,
+        );
+        let removed: Vec<_> = sim
+            .activities
+            .values()
+            .filter(|a| a.event.title == "AGENT NO LONGER OBSERVED")
+            .collect();
+        assert_eq!(removed.len(), 2);
+        for notice in removed {
+            assert!(!notice.persistent);
+            assert_eq!(notice.event.started, 2.);
+            assert!(
+                notice.event.serial > before,
+                "Removal reused old working-card identity and priority"
+            );
+        }
     }
     #[test]
     fn idle_unknown_stale_and_source_changes_are_honest() {

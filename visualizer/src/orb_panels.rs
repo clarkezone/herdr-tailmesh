@@ -417,10 +417,16 @@ fn page_controls(
     interactive: bool,
     clock: f64,
 ) {
-    ui.small(format!("{} · page {}", count, state.page + 1));
+    let width = ui.available_width();
+    let caption = format!("{} callouts · page {}", count, state.page + 1);
     if interactive && capacity > 0 {
+        if width < 160. {
+            ui.spacing_mut().item_spacing.x = 4.;
+        }
+        // Reserve navigation first: a wrapping caption must not strand either button.
         if ui
             .add_enabled(!state.previous.is_empty(), egui::Button::new("‹"))
+            .on_hover_text(format!("Previous · {caption}"))
             .clicked()
         {
             state.page_start = state.previous.pop().unwrap_or(0);
@@ -429,6 +435,7 @@ fn page_controls(
         }
         if ui
             .add_enabled(state.page_start + capacity < count, egui::Button::new("›"))
+            .on_hover_text(format!("Next · {caption}"))
             .clicked()
         {
             state.previous.push(state.page_start);
@@ -436,6 +443,14 @@ fn page_controls(
             state.page = state.previous.len();
             state.page_since = clock;
         }
+        if width >= 180. {
+            ui.small(&caption);
+        } else if width >= 80. {
+            ui.small(format!("{}", state.page + 1))
+                .on_hover_text(&caption);
+        }
+    } else {
+        ui.small(caption);
     }
 }
 
@@ -1068,6 +1083,132 @@ mod tests {
         ));
         assert!(!state.controls.workers.shown);
         output.textures_delta.clear();
+    }
+    #[test]
+    fn fresh_removal_returns_to_first_page_even_when_card_order_is_unchanged() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "working", 20)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        sim.update(&v, Stamp::seconds(201), 90.);
+        let mut state = Panels::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
+        let run = |sim: &Simulation, v: &View, state: &mut Panels| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    draw(
+                        ui,
+                        &Context {
+                            sim,
+                            view: v,
+                            rect,
+                            selected: None,
+                            passive: false,
+                        },
+                        state,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+        };
+        run(&sim, &v, &mut state);
+        let original: Vec<_> = cards(&sim).iter().map(|c| c.key.unwrap().clone()).collect();
+        state.page = 1;
+        state.page_start = 5;
+        state.previous.push(0);
+        let mut changed = node("one", "working", 20);
+        changed.herdr.as_mut().unwrap().agents.remove(0);
+        let changed = view(vec![changed], 2);
+        assert!(crate::orb_ui::selected_branch(&changed, &original[0]).is_none());
+        sim.update(&changed, Stamp::seconds(202), 92.);
+        assert_eq!(
+            cards(&sim)
+                .iter()
+                .map(|c| c.key.unwrap().clone())
+                .collect::<Vec<_>>(),
+            original
+        );
+        run(&sim, &changed, &mut state);
+        assert_eq!(
+            state.page_start, 0,
+            "A new removal notice must return to page one"
+        );
+        assert_eq!(state.page, 0);
+        assert!(state.previous.is_empty());
+    }
+    #[test]
+    fn narrow_pager_keeps_both_buttons_visible_and_pointer_reachable() {
+        let ctx = egui::Context::default();
+        let footer = Rect::from_min_size(pos2(30., 40.), vec2(40., 26.));
+        let mut state = Panels {
+            page: 1,
+            page_start: 5,
+            previous: vec![0],
+            ..Default::default()
+        };
+        let run = |state: &mut Panels, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(320., 600.))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let mut child = ui.new_child(
+                        UiBuilder::new()
+                            .id_salt("narrow-pager-review")
+                            .max_rect(footer),
+                    );
+                    child.set_clip_rect(footer);
+                    child.horizontal(|ui| page_controls(ui, state, 8000, 5, true, 90.));
+                },
+            );
+            let mut arrows = Vec::new();
+            for shape in &output.shapes {
+                if let egui::Shape::Text(t) = &shape.shape
+                    && ["‹", "›"].contains(&t.galley.text())
+                {
+                    let glyph = Rect::from_min_size(t.pos, t.galley.size());
+                    assert!(
+                        footer.contains_rect(glyph),
+                        "pager arrow clipped: {glyph:?} {:?}",
+                        shape.clip_rect
+                    );
+                    arrows.push((t.galley.text().to_string(), glyph.center()));
+                }
+            }
+            output.textures_delta.clear();
+            arrows
+        };
+        let arrows = run(&mut state, vec![]);
+        assert_eq!(arrows.len(), 2);
+        let next = arrows.iter().find(|(label, _)| label == "›").unwrap().1;
+        let click = |point, pressed| {
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        run(&mut state, click(next, true));
+        run(&mut state, click(next, false));
+        assert_eq!(state.page_start, 10);
+        let previous = run(&mut state, vec![])
+            .iter()
+            .find(|(label, _)| label == "‹")
+            .unwrap()
+            .1;
+        run(&mut state, click(previous, true));
+        run(&mut state, click(previous, false));
+        assert_eq!(state.page_start, 5);
     }
     #[test]
     fn content_sizing_and_packing_are_bounded_and_pagination_still_works_without_key() {
