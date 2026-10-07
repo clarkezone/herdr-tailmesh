@@ -47,29 +47,34 @@ pub fn camera_distance(viewport: Viewport) -> f32 {
     let half = (45.0_f32.to_radians() * 0.5).tan();
     3.55 / (half * aspect.clamp(0.01, 1.0)) + 0.5
 }
-fn scene_rotation(time: f32) -> Quat {
+pub(crate) fn scene_rotation(time: f32) -> Quat {
     Quat::from_euler(glam::EulerRot::XYZ, time * 0.018, time * 0.048, 0.0)
 }
 pub fn camera(time: f32, viewport: Viewport) -> (Mat4, Mat4, f32) {
+    camera_pose(crate::orb_focus::Pose::ambient(time), viewport)
+}
+pub fn camera_for(sim: &Simulation, viewport: Viewport) -> (Mat4, Mat4, f32) {
+    match sim.camera {
+        Some(pose) => camera_pose(pose, viewport),
+        None => camera(sim.time, viewport),
+    }
+}
+fn camera_pose(pose: crate::orb_focus::Pose, viewport: Viewport) -> (Mat4, Mat4, f32) {
     let aspect = viewport.width / viewport.height.max(1.0);
     let half = (45.0_f32.to_radians() * 0.5).tan();
-    let z = camera_distance(viewport);
+    let z = camera_distance(viewport) / pose.zoom;
     let projection =
         glam::camera::rh::proj::directx::perspective(45_f32.to_radians(), aspect, 0.1, 1000.0);
     let view = glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 0.0, z), Vec3::ZERO, Vec3::Y);
     let model =
-        Mat4::from_scale_rotation_translation(Vec3::splat(1.1), scene_rotation(time), Vec3::ZERO);
-    (
-        projection * view,
-        model,
-        // Size limits are logical points, just like the HUD and hit targets.
-        // Clamp before converting to pixels or high-DPI markers hit the cap
-        // early and shrink relative to the sphere and text.
-        (viewport.height / viewport.pixels_per_point * 1.1 / (2.0 * z * half) / 105.0)
-            .clamp(0.9, 1.5)
-            * viewport.pixels_per_point,
-    )
+        Mat4::from_scale_rotation_translation(Vec3::splat(1.1), pose.rotation, -pose.center);
+    // Keep markers in logical points; zoom expands cluster spacing, not tiny dots.
+    let scale = (viewport.height / viewport.pixels_per_point * 1.1 / (2.0 * z * half) / 105.0)
+        .clamp(0.9, 1.5 + 0.7 * (pose.zoom - 1.).clamp(0., 1.))
+        * viewport.pixels_per_point;
+    (projection * view, model, scale)
 }
+
 fn orbit_rotation(index: usize, time: f32) -> Quat {
     Quat::from_euler(
         glam::EulerRot::XYZ,
@@ -134,7 +139,7 @@ pub fn position(id: Id, time: f32) -> Vec3 {
     circle(workspace, 0.15, child_angle(a) + 0.35)
 }
 pub fn visible_position(sim: &Simulation, id: Id) -> Vec3 {
-    let pos = position(id, sim.time);
+    let pos = position(id, sim.motion_time());
     let alpha = sim
         .entities
         .get(&id)
@@ -255,14 +260,15 @@ pub fn geometry(sim: &Simulation) -> Geometry {
     for ring in 0..6 {
         for i in 0..120 {
             g.line(
-                orbit(ring, i as f32 * TAU / 120.0, time),
-                orbit(ring, (i + 1) as f32 * TAU / 120.0, time),
+                orbit(ring, i as f32 * TAU / 120.0, sim.motion_time()),
+                orbit(ring, (i + 1) as f32 * TAU / 120.0, sim.motion_time()),
                 [0.21, 0.09, 0.5],
                 0.6,
             );
         }
     }
-    let root = coordinator(time);
+    let root = coordinator(sim.motion_time());
+    let blocked = sim.blocked_nodes();
     g.glyph(
         Glyph::Coordinator,
         root,
@@ -279,6 +285,15 @@ pub fn geometry(sim: &Simulation) -> Geometry {
         match id {
             Id::Node(_) => {
                 g.glyph(Glyph::Node, p, alpha, time, 0.0);
+                if let Some(strength) = blocked.get(&id.indices().0) {
+                    let breathing = 0.35 + 0.25 * (time * TAU / 4.8).sin();
+                    g.dot(
+                        p,
+                        8.0,
+                        AgentState::Blocked.color(),
+                        alpha * strength * breathing,
+                    );
+                }
                 g.curve(p, root, [0.3, 0.13, 0.7], alpha * 0.28, 0.5);
             }
             Id::Session(n, _) => {
@@ -311,6 +326,25 @@ pub fn geometry(sim: &Simulation) -> Geometry {
                 );
                 g.glyph(Glyph::Agent(state), p, alpha, time, noise(id.seed()) * TAU);
             }
+        }
+    }
+    // One bounded circuit per fresh blocked node, independent of agent count.
+    // The slow amber ripple conveys attention, never a receipt heartbeat.
+    for (n, strength) in blocked {
+        let center = crate::mesh_territory::anchor(n) * 1.94;
+        let phase = (time / 4.8 + noise(n as u32)) % 1.;
+        let color = AgentState::Blocked.color();
+        for i in 0_usize..32 {
+            let angle = i as f32 * TAU / 32.;
+            let a = circle(center, 0.28 + phase * 0.5, angle);
+            let b = circle(center, 0.28 + phase * 0.5, angle + TAU / 16.);
+            // Sixteen circuit segments leave headroom for the full retained-exit
+            // line budget; keep all thirty-two lamps for the visual scanner.
+            if i.is_multiple_of(2) {
+                g.line(a, b, color, strength * (1. - phase) * 0.28);
+            }
+            let light = 0.12 + 0.28 * (angle - time * 1.3).sin().max(0.);
+            g.dot(circle(center, 0.65, angle), 1.3, color, strength * light);
         }
     }
     for pulse in &sim.pulses {
@@ -367,16 +401,29 @@ pub fn geometry(sim: &Simulation) -> Geometry {
     debug_assert!(g.lines.len() <= MAX_LINES);
     g
 }
+#[cfg(test)]
 pub fn project(pos: Vec3, time: f32, rect: egui::Rect) -> Option<egui::Pos2> {
-    let (vp, model, _) = camera(
-        time,
-        Viewport {
-            x: rect.left(),
-            y: rect.top(),
-            width: rect.width(),
-            height: rect.height(),
-            pixels_per_point: 1.0,
-        },
+    project_pose(pos, None, time, rect)
+}
+pub fn project_sim(pos: Vec3, sim: &Simulation, rect: egui::Rect) -> Option<egui::Pos2> {
+    project_pose(pos, sim.camera, sim.time, rect)
+}
+fn project_pose(
+    pos: Vec3,
+    pose: Option<crate::orb_focus::Pose>,
+    time: f32,
+    rect: egui::Rect,
+) -> Option<egui::Pos2> {
+    let viewport = Viewport {
+        x: rect.left(),
+        y: rect.top(),
+        width: rect.width(),
+        height: rect.height(),
+        pixels_per_point: 1.,
+    };
+    let (vp, model, _) = camera_pose(
+        pose.unwrap_or_else(|| crate::orb_focus::Pose::ambient(time)),
+        viewport,
     );
     let clip = vp * model * pos.extend(1.0);
     if clip.w <= 0.0 {

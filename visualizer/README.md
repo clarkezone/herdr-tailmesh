@@ -26,26 +26,43 @@ Tiny previews use abbreviated vertical counts and a bounded key hint when the
 full visual key cannot fit. Activity pagination remains in the first callout,
 independently of whether the key is showing.
 
-Each observed working agent has an independent persistent callout with its real
-node/session/workspace/agent names. **W** toggles all working-agent callouts
-together, including work that starts while hidden. This only changes visibility:
-agent states and totals remain intact, selection and timed stop notices stay
-independent. Each card stays until that scoped agent stops;
-completion, blocked, idle or unknown then shows the actual reported state for
-ten seconds, including entrance/fade. Starting new work replaces that agent's
-stop notice. Current working observations also appear on an initial snapshot;
-this does not replay a start event. Disconnected/stale working cards are marked
-LAST KNOWN, with no invented completion. Reconnect baselines do not replay stops.
-Removed agents get a truthful no-longer-observed notice on a live delta.
+Each observed working or blocked agent has an independent persistent callout with
+its real node/session/workspace/agent names, including initial/reconnect snapshots.
+**W** toggles working callouts only; blocked attention remains visible. State and
+counts, selection and timed notices remain independent of W. Working → blocked
+replaces the work card with persistent ATTENTION REQUIRED, and blocked → working
+replaces attention with work. A fresh observed transition to done, idle or unknown
+shows that actual state for ten seconds. Reconnect/stale comparisons never invent
+completion; retained cards are marked LAST KNOWN. Live removal has a truthful
+no-longer-observed notice. Multiple cards remain pageable without expiring off-page.
+
+Fresh blocked agents cause a gentle amber node beacon and a repeating circuit/ripple
+inside their surface cluster. This uses full observations even when geometry is
+sampled, ages with inventory freshness, and remains separate from receipt heartbeat
+pulses. Sampled agent callouts anchor to their owning node. Callout history is capped
+at 8,000, with attention ahead of working cards and old timed history; capacity
+omissions are disclosed independently of K/N/W, while totals remain complete.
+
+Every activity callout and selected node/descendant observation offers a compact
+illuminated reticle **Focus** toggle.
+Checking it pauses orbital motion and eases that node's surface cluster forward
+with zoom over 1.5 seconds; focus framing has a further 20% magnification boost. Another node transfers focus; uncheck, **Escape**, or
+**Return to fleet** restores the rotating overview without a camera jump. Focus
+survives callout expiry and W hiding, but releases on node removal/source replacement.
+Live data, attention and heartbeat effects keep running while motion is paused.
+Names appear beside projected glyphs where they fit; the focused-node panel lists
+the full node/session/workspace/agent hierarchy with scrolling, including sampled
+geometry. Interactive focus controls are omitted in passive/screensaver mode.
 
 Multiple cards stack in available edge columns. Overflow is pageable; interactive
 views have page controls, while passive views advance every twelve seconds.
-New transient events return to the first page, with stop notices ahead of work.
+New transient events return to the first page, with stop notices ahead of blocked
+attention, then working cards.
 Persistent cards do not expire while off-page. Timed notices still expire after
 ten seconds, so an exceptionally crowded screen is not a lossless event log.
 Other transient events keep their latest-three bound; activity history is bounded
-separately and current working cards take priority over expired/old history.
-Working boxes fit their actual heading and names, with modest padding. Only
+separately and persistent attention/work take priority over expired/old history.
+Activity boxes fit their actual heading, names and Focus control, with modest padding. Only
 unusually long content scrolls within a capped card; selection details scroll
 within their bounded observation card.
 
@@ -247,3 +264,5 @@ Viewer and screensaver archives include the Orb third-party notices alongside
 the single executable. The notice file is not a runtime dependency.
 
 [Floating Orb panels and persistent activity: requirements, review and validation](../docs/orb-floating-panels.md).
+
+[Persistent Block specs, review and validation](../docs/orb-persistent-block.md).

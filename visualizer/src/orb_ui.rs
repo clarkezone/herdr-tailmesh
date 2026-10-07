@@ -10,6 +10,7 @@ pub struct OrbUi {
     pub sim: Simulation,
     selected: Option<Key>,
     panels: orb_panels::Panels,
+    focus: crate::orb_focus::Controller,
 }
 fn find<'a>(branches: &'a [Branch], key: &Key) -> Option<&'a Branch> {
     for b in branches {
@@ -66,6 +67,8 @@ impl OrbUi {
         if self.sim.source_generation != generation {
             self.selected = None;
             self.panels.reset_source();
+            self.focus.reset();
+            self.sim.camera = None;
         }
         if self
             .selected
@@ -77,10 +80,16 @@ impl OrbUi {
         if passive && (!view.live || view.scene.is_none()) {
             self.selected = None;
             self.panels.projects = false;
+            self.panels.focus = None;
+            self.focus.reset();
+            self.sim.camera = None;
             unavailable(root);
             return None;
         }
         if view.scene.is_none() {
+            self.panels.focus = None;
+            self.focus.reset();
+            self.sim.camera = None;
             root.painter().text(
                 root.max_rect().center(),
                 egui::Align2::CENTER_CENTER,
@@ -98,6 +107,8 @@ impl OrbUi {
         if rect.width() < 1. || rect.height() < 1. {
             return None;
         }
+        self.focus
+            .update(&mut self.sim, &mut self.panels.focus, rect);
         // The full symmetric viewport stays fixed when panels appear/disappear.
         let response = root.allocate_rect(
             rect,
@@ -140,13 +151,13 @@ impl OrbUi {
         }
         if !passive && let Some(key) = &self.selected {
             let position = if selected_branch(view, key).is_some_and(|b| b.kind == "coordinator") {
-                Some(mesh_orb::coordinator(self.sim.time))
+                Some(mesh_orb::coordinator(self.sim.motion_time()))
             } else {
                 self.sim
                     .id(key)
                     .map(|id| mesh_orb::visible_position(&self.sim, id))
             };
-            if let Some(point) = position.and_then(|p| mesh_orb::project(p, self.sim.time, rect)) {
+            if let Some(point) = position.and_then(|p| mesh_orb::project_sim(p, &self.sim, rect)) {
                 root.painter().with_clip_rect(rect).circle_stroke(
                     point,
                     14.,
@@ -165,12 +176,10 @@ impl OrbUi {
             if !life.entering() || life.alpha(self.sim.clock) < 0.1 {
                 continue;
             }
-            let Some(point) = mesh_orb::project(
-                mesh_orb::visible_position(&self.sim, id),
-                self.sim.time,
-                rect,
-            )
-            .filter(|p| rect.contains(*p)) else {
+            let Some(point) =
+                mesh_orb::project_sim(mesh_orb::visible_position(&self.sim, id), &self.sim, rect)
+                    .filter(|p| rect.contains(*p))
+            else {
                 continue;
             };
             let d = point.distance(pointer);
@@ -183,8 +192,11 @@ impl OrbUi {
             .scene
             .as_ref()
             .and_then(|scene| scene.coordinator.as_ref())
-            && let Some(point) =
-                mesh_orb::project(mesh_orb::coordinator(self.sim.time), self.sim.time, rect)
+            && let Some(point) = mesh_orb::project_sim(
+                mesh_orb::coordinator(self.sim.motion_time()),
+                &self.sim,
+                rect,
+            )
             && point.distance(pointer) < distance
         {
             best = Some(root.key.clone());
@@ -376,7 +388,7 @@ mod tests {
             .keys()
             .find(|id| matches!(id, crate::mesh_model::Id::Node(_)))
             .unwrap();
-        let point = mesh_orb::project(mesh_orb::visible_position(&orb.sim, id), orb.sim.time, rect)
+        let point = mesh_orb::project_sim(mesh_orb::visible_position(&orb.sim, id), &orb.sim, rect)
             .unwrap();
         let click = |pos, pressed| {
             vec![
@@ -433,7 +445,7 @@ mod tests {
                     .find(|(id, _)| matches!(id, crate::mesh_model::Id::Node(_)))
                     .unwrap();
                 let point =
-                    mesh_orb::project(mesh_orb::visible_position(&orb.sim, id), orb.sim.time, rect)
+                    mesh_orb::project_sim(mesh_orb::visible_position(&orb.sim, id), &orb.sim, rect)
                         .unwrap();
                 assert_eq!(orb.pick(&view, point, rect), orb.sim.key(id).cloned());
                 orb.selected = orb.sim.key(id).cloned();
