@@ -49,6 +49,11 @@ Completed cards still appear at startup. A fresh observed
 transition to idle or unknown shows that actual state for ten seconds. Reconnect/stale
 comparisons never invent transition events; retained cards are marked LAST KNOWN. Live removal has a truthful
 no-longer-observed notice. Multiple cards remain pageable without expiring off-page.
+New completion instances receive first-page priority ahead of older activity,
+so finishing a visible worker cannot silently send its completion behind all
+the still-working cards. That priority has no timeout while the agent stays Done;
+later new completions can move older cards to another page. Initial observations,
+unchanged reconnects and geometry resampling do not replay old completions.
 The viewer cannot detect a new task if the observation stream reports Done twice
 without any intervening state/removal or a distinct completion ID.
 This also applies to work completed entirely while the viewer is closed: an

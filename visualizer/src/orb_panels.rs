@@ -24,6 +24,9 @@ pub struct Panels {
     dismissed: BTreeMap<Key, Dismissal>,
     dismissal_revision: Option<(u64, u64, u64)>,
     pending_dismissals: Vec<(Key, u64)>,
+    previous_episodes: Option<std::sync::Arc<BTreeMap<Key, u64>>>,
+    completion_order: BTreeMap<Key, (u64, u64)>,
+    completion_sequence: u64,
     controls: Controls,
     key_motion: Option<Motion>,
     count_motion: Option<Motion>,
@@ -43,6 +46,9 @@ impl Panels {
         self.dismissed.clear();
         self.dismissal_revision = None;
         self.pending_dismissals.clear();
+        self.previous_episodes = None;
+        self.completion_order.clear();
+        self.completion_sequence = 0;
     }
     fn refresh_dismissals(&mut self, view: &View) {
         let revision = (view.epoch, view.revision, view.acknowledgement_revision);
@@ -50,6 +56,18 @@ impl Panels {
             return;
         }
         self.dismissal_revision = Some(revision);
+        self.completion_order
+            .retain(|key, (episode, _)| view.completion_episodes.get(key) == Some(episode));
+        if let Some(previous) = &self.previous_episodes {
+            for (key, episode) in view.completion_episodes.iter() {
+                if previous.get(key) != Some(episode) {
+                    self.completion_sequence = self.completion_sequence.wrapping_add(1);
+                    self.completion_order
+                        .insert(key.clone(), (*episode, self.completion_sequence));
+                }
+            }
+        }
+        self.previous_episodes = Some(std::sync::Arc::clone(&view.completion_episodes));
         for (key, episode) in view.acknowledged_completions.iter() {
             if view.completion_episodes.get(key) == Some(episode)
                 && !self
@@ -325,6 +343,7 @@ struct Card<'a> {
     persistent: bool,
     working: bool,
     attention: bool,
+    completed: bool,
 }
 fn cards(sim: &Simulation) -> Vec<Card<'_>> {
     let mut cards: Vec<_> = sim
@@ -336,6 +355,7 @@ fn cards(sim: &Simulation) -> Vec<Card<'_>> {
             persistent: a.persistent,
             working: a.persistent && a.state == AgentState::Working,
             attention: a.persistent && a.state == AgentState::Blocked,
+            completed: a.persistent && a.state == AgentState::Completed,
         })
         .collect();
     cards.extend(sim.events.iter().rev().map(|event| Card {
@@ -344,6 +364,7 @@ fn cards(sim: &Simulation) -> Vec<Card<'_>> {
         persistent: false,
         working: false,
         attention: false,
+        completed: false,
     }));
     // Short-lived transitions get first-page priority; persistent work remains pageable.
     cards.sort_by(|a, b| {
@@ -630,7 +651,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         reserved.push(card);
         response.blocked.push(card);
     }
-    let candidates: Vec<_> = cards(context.sim)
+    let mut candidates: Vec<_> = cards(context.sim)
         .into_iter()
         .filter(|c| !c.working || state.controls.workers.occupies(context.sim.clock))
         .filter(|c| {
@@ -638,6 +659,17 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                 || c.key.is_none_or(|key| !state.dismissed.contains_key(key))
         })
         .collect();
+    // A visible worker must not vanish behind still-working cards on completion.
+    // Keep new completion instances ahead until acknowledged/state change;
+    // never derive their order from sampled history/GPU admission event serials.
+    candidates.sort_by_key(|card| {
+        std::cmp::Reverse(
+            card.key
+                .filter(|_| card.completed)
+                .and_then(|key| state.completion_order.get(key))
+                .map(|(_, order)| *order),
+        )
+    });
     if !state
         .membership
         .iter()
@@ -1445,6 +1477,126 @@ mod tests {
             state.focus.is_some(),
             "acknowledgement must leave Focus active"
         );
+    }
+    #[test]
+    fn a_visible_worker_completion_is_shown_on_the_first_page_without_dismiss_input() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 600.));
+        let mut work = node("one", "working", 4);
+        work.herdr.as_mut().unwrap().agents[0].display_name = "Freshly completed agent".into();
+        let mut initial = view(vec![work.clone(), node("older", "done", 1)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&initial, Stamp::seconds(201), 0.);
+        initial.completion_episodes = std::sync::Arc::new(
+            sim.activities
+                .iter()
+                .filter(|(_, a)| a.state == AgentState::Completed)
+                .enumerate()
+                .map(|(i, (key, _))| (key.clone(), i as u64 + 1))
+                .collect(),
+        );
+        sim = Simulation::default();
+        sim.update(&initial, Stamp::seconds(201), 0.);
+        sim.update(&initial, Stamp::seconds(201), 2.);
+        let mut state = Panels::default();
+        let frame = |sim: &Simulation, view: &View, state: &mut Panels| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    draw(
+                        ui,
+                        &Context {
+                            sim,
+                            view,
+                            rect,
+                            selected: None,
+                            passive: false,
+                        },
+                        state,
+                    );
+                },
+            );
+            let texts: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            output.textures_delta.clear();
+            texts
+        };
+        assert!(
+            frame(&sim, &initial, &mut state)
+                .iter()
+                .any(|t| t.contains("Freshly completed agent"))
+        );
+        assert!(state.dismissed.is_empty());
+        work.herdr.as_mut().unwrap().agents[0].agent_status = "done".into();
+        let mut completed = view(vec![work, node("older", "done", 1)], 2);
+        completed.completion_episodes = initial.completion_episodes.clone();
+        let key = sim
+            .activities
+            .iter()
+            .find(|(_, a)| a.event.text.contains("Freshly completed agent"))
+            .unwrap()
+            .0
+            .clone();
+        std::sync::Arc::make_mut(&mut completed.completion_episodes).insert(key.clone(), 99);
+        sim.update(&completed, Stamp::seconds(202), 3.);
+        sim.update(&completed, Stamp::seconds(202), 5.);
+        let texts = frame(&sim, &completed, &mut state);
+        assert!(
+            texts.iter().any(|t| t == "AGENT COMPLETED"),
+            "the new completion must have a visible banner"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Freshly completed agent")),
+            "the previously visible worker must not silently move to a later page"
+        );
+        assert!(state.dismissed.is_empty(), "no dismissal was requested");
+        assert!(state.take_dismissals().is_empty());
+        assert_eq!(sim.summary().states[2], 3);
+        assert!(
+            state
+                .membership
+                .contains(&sim.activities[&key].event.serial)
+        );
+        // Priority has no ten-second expiry and unchanged reconnects cannot replay it.
+        let order = state.completion_order[&key];
+        completed.epoch += 1;
+        completed.revision += 1;
+        sim.update(&completed, Stamp::seconds(202), 70.);
+        let texts = frame(&sim, &completed, &mut state);
+        assert!(texts.iter().any(|t| t.contains("Freshly completed agent")));
+        assert_eq!(state.completion_order[&key], order);
+        // Geometry/history readmission serials cannot take priority from this instance.
+        let old_key = initial.completion_episodes.keys().next().unwrap();
+        sim.activities.get_mut(old_key).unwrap().event.serial = 999_999;
+        sim.update(&completed, Stamp::seconds(202), 71.);
+        let texts = frame(&sim, &completed, &mut state);
+        assert!(texts.iter().any(|t| t.contains("Freshly completed agent")));
+        assert_eq!(state.completion_order[&key], order);
+        assert!(!state.completion_order.contains_key(old_key));
+        // Retraction still needs an explicit independent acknowledgement.
+        state.dismissed.insert(
+            key.clone(),
+            Dismissal {
+                episode: Some(99),
+                at: 71.,
+            },
+        );
+        sim.update(&completed, Stamp::seconds(202), 73.);
+        assert!(
+            !frame(&sim, &completed, &mut state)
+                .iter()
+                .any(|t| t.contains("Freshly completed agent"))
+        );
+        assert_eq!(sim.summary().states[2], 3);
     }
     #[test]
     fn restored_acknowledgement_is_hidden_from_first_frame_in_both_launchers() {

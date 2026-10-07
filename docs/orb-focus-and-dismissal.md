@@ -33,6 +33,26 @@ and the Focus control should show only its reticle/brackets.
 
 ## Implementation and adversarial review
 
+### Completion visibility under callout overflow
+
+- A worker finishing must receive first-page completion priority even when other
+  Working/Blocked cards fill the viewport. The previous state-priority sort could
+  move its new Completed card to an unseen page while the count rose; no dismissal
+  was involved. A no-input render regression fails before this fix and passes after.
+- Track newly observed completion instances by scoped key plus receive-time token,
+  independently of geometry/history event serials. Put newer completions first;
+  keep that order while Done until acknowledgement/state change. There is no
+  ten-second priority timeout. More cards than fit remain explicitly pageable;
+  later new completions may move earlier completions to another page.
+- Initial observations retain normal ordering; unchanged reconnect, aging and
+  resampling do not promote/replay old completions. Source reset discards local
+  order. Preserve acknowledgement retraction, complete counts, independent Focus,
+  passive page rotation, and --tree. Rendering Working is not required when the
+  receiver reports a changed completion token.
+- Review/test the crowded 1100×600 first page, no input/acknowledgement, the same
+  episode after one minute/reconnect, old history readmission with a newer event
+  serial, and independent explicit dismissal without reducing counts.
+
 ### Durable acknowledgement follow-up
 
 - Save each explicit × acknowledgement immediately, before app exit. Restore
@@ -102,8 +122,8 @@ and the Focus control should show only its reticle/brackets.
 
 ## Validation
 
-Formatting, strict screensaver-feature all-target clippy and 114 distinct portable
-Rust tests passed (200 executions across viewer/screensaver launchers; optional
+Formatting, strict screensaver-feature all-target clippy and 115 distinct portable
+Rust tests passed (202 executions across viewer/screensaver launchers; optional
 GPU readback excluded). Optimized Linux builds passed for both launchers.
 
 Native Linux synthetic-observer inspection at 1100×600 confirmed projected names
@@ -120,6 +140,13 @@ Dismissing one of four completions saved its acknowledgement immediately. After
 relaunch, that card stayed hidden, the three independent cards remained visible,
 and the fleet still counted four Completed agents. Back-to-back Working/Done
 then restored its new completion and pagination. Both windows closed cleanly.
+
+The overflow follow-up was checked in an optimized native 1100×600 window with
+twelve Working callouts and no keyboard/mouse input. Completing two agents put
+both Completed banners on the first page, alongside a remaining Working card;
+the fleet showed ten Working and two Completed, with all twelve callouts retained.
+Both completion banners remained visible twelve seconds later, and no dismissal
+file was created. The temporary synthetic fixture and screenshots are not shipped.
 
 Cross-platform compilation/tests, wire contract and packaging are checked in PR
 CI. Native Windows/macOS graphical and mixed-DPI acceptance remain manual.
