@@ -102,8 +102,8 @@ and the Focus control should show only its reticle/brackets.
 
 ## Validation
 
-Formatting, strict screensaver-feature all-target clippy and 105 distinct portable
-Rust tests passed (190 executions across viewer/screensaver launchers; optional
+Formatting, strict screensaver-feature all-target clippy and 114 distinct portable
+Rust tests passed (200 executions across viewer/screensaver launchers; optional
 GPU readback excluded). Optimized Linux builds passed for both launchers.
 
 Native Linux synthetic-observer inspection at 1100×600 confirmed projected names
@@ -113,6 +113,13 @@ retracted and left pagination while the fleet retained four Completed agents and
 Focus stayed active. K hiding relocated the hierarchy without losing labels;
 Escape returned to the fleet and the viewer closed cleanly. The temporary native
 fixture and screenshots are not shipped.
+
+The durable follow-up's final optimized build was also checked through an actual
+close/relaunch using isolated user storage and the same synthetic observer port.
+Dismissing one of four completions saved its acknowledgement immediately. After
+relaunch, that card stayed hidden, the three independent cards remained visible,
+and the fleet still counted four Completed agents. Back-to-back Working/Done
+then restored its new completion and pagination. Both windows closed cleanly.
 
 Cross-platform compilation/tests, wire contract and packaging are checked in PR
 CI. Native Windows/macOS graphical and mixed-DPI acceptance remain manual.
