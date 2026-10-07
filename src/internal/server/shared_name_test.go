@@ -9,6 +9,7 @@ import (
 	pb "github.com/clarkezone/herdr-distributed-mesh/src/gen/agentflow/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestLogicalNodeNamePersistsBeforePublicationAndSurvivesRestore(t *testing.T) {
@@ -73,5 +74,49 @@ func TestLogicalNodeNameRejectsInvalidSupersededAndFailedWrites(t *testing.T) {
 	}
 	if replacement.view.Hostname != "" {
 		t.Fatal("uncommitted logical name was published")
+	}
+}
+
+func TestImplementationVersionIsLiveOnlyAndSanitized(t *testing.T) {
+	persistence := &fakePersistence{}
+	fleet := &fleetStore{storage: persistence}
+	now := time.Now()
+	entry, err := fleet.begin("node", "stable", false, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fleet.setImplementationVersion(entry, "1.2.3-preview.1"); err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := fleet.list(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodes.Nodes[0].ImplementationVersion != "1.2.3-preview.1" ||
+		entry.view.ImplementationVersion != "" || persistence.saved["node"].ImplementationVersion != "" {
+		t.Fatalf("implementation version must be live-only: entry=%+v stored=%+v listed=%+v",
+			entry.view, persistence.saved["node"], nodes.Nodes[0])
+	}
+	accidentalProjection := proto.Clone(entry.view).(*pb.NodeView)
+	accidentalProjection.ImplementationVersion = "1.2.3-preview.1"
+	if err := fleet.save(accidentalProjection); err != nil {
+		t.Fatal(err)
+	}
+	if persistence.saved["node"].ImplementationVersion != "" {
+		t.Fatal("implementation version leaked into downgrade-sensitive durable state")
+	}
+	if err := fleet.setImplementationVersion(entry, ""); err != nil {
+		t.Fatalf("missing legacy implementation version rejected: %v", err)
+	}
+	if entry.implementationVersion != "" {
+		t.Fatalf("missing legacy implementation version was not preserved: %+v", entry)
+	}
+	for _, version := range []string{"bad version", "C:\\private", strings.Repeat("x", 129)} {
+		if err := fleet.setImplementationVersion(entry, version); err != nil {
+			t.Fatalf("invalid advisory implementation version failed handshake: %q %v", version, err)
+		}
+		if entry.implementationVersion != "" {
+			t.Fatalf("invalid advisory implementation version was exposed: %q", version)
+		}
 	}
 }

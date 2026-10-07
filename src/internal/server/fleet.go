@@ -29,29 +29,30 @@ const (
 )
 
 type fleetEntry struct {
-	view            *agentflowv1.NodeView
-	done            chan struct{}
-	outbound        chan queuedCommand
-	probes          bool
-	workspaces      bool
-	worktrees       bool
-	agents          bool
-	lifecycle       bool
-	projects        bool
-	sessions        bool
-	sessionSequence uint64
-	projectWake     chan struct{}
-	projectSent     map[string]*agentflowv1.ProjectConfig
-	projectApplied  map[string]*agentflowv1.ProjectAck
-	queries         map[string]*pendingAgentQuery
-	queryCanceled   map[string]time.Time
-	queryOutbound   chan *agentflowv1.NodeEnvelope
-	peerContext     context.Context
-	streamDone      <-chan struct{}
-	supersedeOnce   sync.Once
-	sendMu          sync.Mutex
-	sends           sync.WaitGroup
-	drained         chan struct{}
+	view                  *agentflowv1.NodeView
+	implementationVersion string
+	done                  chan struct{}
+	outbound              chan queuedCommand
+	probes                bool
+	workspaces            bool
+	worktrees             bool
+	agents                bool
+	lifecycle             bool
+	projects              bool
+	sessions              bool
+	sessionSequence       uint64
+	projectWake           chan struct{}
+	projectSent           map[string]*agentflowv1.ProjectConfig
+	projectApplied        map[string]*agentflowv1.ProjectAck
+	queries               map[string]*pendingAgentQuery
+	queryCanceled         map[string]time.Time
+	queryOutbound         chan *agentflowv1.NodeEnvelope
+	peerContext           context.Context
+	streamDone            <-chan struct{}
+	supersedeOnce         sync.Once
+	sendMu                sync.Mutex
+	sends                 sync.WaitGroup
+	drained               chan struct{}
 }
 
 func (e *fleetEntry) supersede() {
@@ -165,14 +166,19 @@ func (f *fleetStore) save(view *agentflowv1.NodeView) error {
 	if f.storageErr != nil {
 		return storageUnavailable()
 	}
-	if proto.Size(view) > state.MaxNodeBytes {
+	persisted := view
+	if view.ImplementationVersion != "" {
+		persisted = proto.Clone(view).(*agentflowv1.NodeView)
+		persisted.ImplementationVersion = ""
+	}
+	if proto.Size(persisted) > state.MaxNodeBytes {
 		return status.Error(codes.ResourceExhausted, "combined node state size limit exceeded")
 	}
 	if f.storage == nil {
 		return nil
 	}
 	if err := persistCoordinator("save_node", func(ctx context.Context) error {
-		return f.storage.SaveNode(ctx, view)
+		return f.storage.SaveNode(ctx, persisted)
 	}); err != nil {
 		return f.failLocked(err)
 	}
@@ -251,6 +257,7 @@ func validateStoredNode(view *agentflowv1.NodeView) error {
 	bad := errors.New("invalid persisted node record")
 	if view == nil || view.InstanceId == "" || len(view.InstanceId) > 128 ||
 		view.TailscaleStableId == "" || len(view.TailscaleStableId) > 128 ||
+		(view.ImplementationVersion != "" && !safeVersion.MatchString(view.ImplementationVersion)) ||
 		view.LastSeen == nil || view.LastSeen.CheckValid() != nil || view.Herdr == nil ||
 		len(view.ProtoReflect().GetUnknown()) != 0 || len(view.LastSeen.ProtoReflect().GetUnknown()) != 0 {
 		return bad
@@ -510,6 +517,7 @@ func (f *fleetStore) list(now time.Time) (*agentflowv1.NodeList, error) {
 	list := &agentflowv1.NodeList{Nodes: make([]*agentflowv1.NodeView, 0, len(f.nodes))}
 	for _, entry := range f.nodes {
 		view := proto.Clone(entry.view).(*agentflowv1.NodeView)
+		view.ImplementationVersion = entry.implementationVersion
 		view.Stale = !view.Connected || view.Herdr.Status != "ready" ||
 			view.HerdrReceivedAt == nil || now.Sub(view.HerdrReceivedAt.AsTime()) > herdrStaleAfter
 		view.WorkspaceReady = view.WorkspaceReady && freshHerdr(view, now) && f.current(entry)

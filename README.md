@@ -303,6 +303,10 @@ port overrides and cross-platform validation are described in its README.
 The read-only dashboard uses the existing fleet inventory. It is embedded in
 the Go binary; no frontend server, npm install, or system Tailscale client is
 needed. Use the same mesh build on the controller and execution nodes.
+Each connected node reports its `herdr-mesh` implementation version in the
+live fleet protobuf/JSON inventory alongside the observed native Herdr version.
+The advisory mesh version is not persisted, preserving coordinator downgrade
+compatibility; it is unknown until a node reconnects after coordinator restart.
 
 The managed coordinator also serves the dashboard on its Tailscale identity at
 `http://<actual-coordinator-full-magic-dns-name>:8787/`. `herdr-mesh help` on

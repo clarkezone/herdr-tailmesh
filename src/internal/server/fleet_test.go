@@ -15,6 +15,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/dynamicpb"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -198,6 +201,7 @@ func TestFleetRPCIngestionAndAuthorization(t *testing.T) {
 			return transport.PeerIdentity{StableID: "stable-1", Tags: []string{"tag:node", "tag:client"}}, nil
 		},
 	}
+
 	connection := newTestConnection(t, api)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -213,7 +217,8 @@ func TestFleetRPCIngestionAndAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Nodes) != 1 || list.Nodes[0].Herdr.Panes[0].AgentStatus != "working" || list.Nodes[0].Connected || !list.Nodes[0].Stale {
+	if len(list.Nodes) != 1 || list.Nodes[0].ImplementationVersion != "test-version" ||
+		list.Nodes[0].Herdr.Panes[0].AgentStatus != "working" || list.Nodes[0].Connected || !list.Nodes[0].Stale {
 		t.Fatalf("wrong fleet result: %v", list)
 	}
 	denied := newTestConnection(t, &service{
@@ -224,6 +229,76 @@ func TestFleetRPCIngestionAndAuthorization(t *testing.T) {
 	})
 	if _, err := agentflowv1.NewFleetClient(denied).ListNodes(ctx, &emptypb.Empty{}); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("node role could query fleet: %v", err)
+	}
+}
+
+func TestNewCoordinatorAcceptsLegacyNodeWithoutImplementationVersion(t *testing.T) {
+	api := &service{
+		requiredClientTag: "tag:client", requiredNodeTag: "tag:node",
+		identifyPeer: func(context.Context) (transport.PeerIdentity, error) {
+			return transport.PeerIdentity{StableID: "stable-legacy", Tags: []string{"tag:node", "tag:client"}}, nil
+		},
+	}
+	connection := newTestConnection(t, api)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := agentflowv1.NewNodeControlClient(connection).Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := nodeHello("legacy-node")
+	hello.GetHello().ImplementationVersion = ""
+	if err := stream.Send(hello); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatalf("legacy node handshake rejected: %v", err)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Fatalf("legacy node stream failed: %v", err)
+	}
+	list, err := agentflowv1.NewFleetClient(connection).ListNodes(ctx, &emptypb.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Nodes) != 1 || list.Nodes[0].ImplementationVersion != "" {
+		t.Fatalf("legacy node version must remain unknown: %v", list)
+	}
+}
+
+func TestLegacyClientIgnoresNodeImplementationVersion(t *testing.T) {
+	file := protodesc.ToFileDescriptorProto(agentflowv1.File_agentflow_v1_control_proto)
+	for _, message := range file.MessageType {
+		if message.GetName() != "NodeView" {
+			continue
+		}
+		fields := message.Field[:0]
+		for _, field := range message.Field {
+			if field.GetNumber() != 17 {
+				fields = append(fields, field)
+			}
+		}
+		message.Field = fields
+	}
+	legacyFile, err := protodesc.NewFile(file, protoregistry.GlobalFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyNode := dynamicpb.NewMessage(legacyFile.Messages().ByName("NodeView"))
+	wire, err := proto.Marshal(&agentflowv1.NodeView{
+		InstanceId: "node-1", Hostname: "desktop", ImplementationVersion: "1.2.3",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.Unmarshal(wire, legacyNode); err != nil {
+		t.Fatalf("legacy client rejected additive node field: %v", err)
+	}
+	if got := legacyNode.Get(legacyNode.Descriptor().Fields().ByName("hostname")).String(); got != "desktop" {
+		t.Fatalf("legacy client lost known fields: %q", got)
 	}
 }
 

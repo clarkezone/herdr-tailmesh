@@ -15,6 +15,19 @@ func validateLogicalNodeName(name string) error {
 	return nil
 }
 
+func (f *fleetStore) setImplementationVersion(entry *fleetEntry, version string) error {
+	if version != "" && !safeVersion.MatchString(version) {
+		version = ""
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.current(entry) {
+		return status.Error(codes.Aborted, "node stream superseded")
+	}
+	entry.implementationVersion = version
+	return nil
+}
+
 func (f *fleetStore) setLogicalName(entry *fleetEntry, name string) error {
 	if err := validateLogicalNodeName(name); err != nil {
 		return err
