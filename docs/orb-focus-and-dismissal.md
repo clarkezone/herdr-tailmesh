@@ -18,7 +18,10 @@ and the Focus control should show only its reticle/brackets.
   then remove their widgets, hit masks and pagination entries. Counts, agent
   state, working/blocked cards, selection and Focus remain independent.
 - A dismissal acknowledges the current observed Completed episode, scoped to
-  node/session/incarnation/workspace/agent. Retain it across unchanged snapshots,
+  node/session/incarnation/workspace/tab/agent plus an explicit completion ID.
+  Track each accepted snapshot before UI coalescing: leaving Done/removal retires
+  the ID, and returning to Done allocates another. The UI need not render Working
+  to rearm the next completion. Retain it across unchanged snapshots,
   reconnect, renames, freshness aging and geometry/history sampling. Clear it
   on an observed state change, removal or source replacement; a later completion
   appears again. Dismissals are local to the viewer launch, never mesh mutations.
@@ -34,9 +37,13 @@ and the Focus control should show only its reticle/brackets.
   vertical segment at candidate edge/HUD-adjacent positions. Include activity
   drift bounds in label reservations before painting.
 - Keep scoped dismissal timestamps in Panels, prune against complete observed
-  Done membership when revision/epoch changes, and clear on source reset. Scope
-  acknowledgement to current observed state rather than event serials, which can
-  change under admission pressure. Reuse the existing retraction duration/reveal.
+  Done membership and matching completion IDs when revision/epoch changes, and
+  clear on source reset. Receive-time IDs live beside the accepted scene under
+  the client's existing mutex; retain only current Done entries and a serial.
+  Share the immutable ID map with frames. Source replacement gets new IDs;
+  reconnect/unchanged Done preserves IDs. Activity compares completion IDs so a
+  coalesced Working/Done cycle restarts its reveal and page identity. GPU/history
+  admission event serials do not define acknowledgement lifetime.
 - Dismiss is a local acknowledgement, not setting the mesh agent to Idle/Done or
   removing its observation. Passive launchers offer no interactive dismissal.
 - The icon refinement removes stock button chrome and text. Draw a green × and
@@ -57,8 +64,8 @@ and the Focus control should show only its reticle/brackets.
 
 ## Validation
 
-Formatting, strict screensaver-feature all-target clippy and 102 distinct portable
-Rust tests passed (186 executions across viewer/screensaver launchers; optional
+Formatting, strict screensaver-feature all-target clippy and 105 distinct portable
+Rust tests passed (190 executions across viewer/screensaver launchers; optional
 GPU readback excluded). Optimized Linux builds passed for both launchers.
 
 Native Linux synthetic-observer inspection at 1100×600 confirmed projected names
@@ -71,3 +78,21 @@ fixture and screenshots are not shipped.
 
 Cross-platform compilation/tests, wire contract and packaging are checked in PR
 CI. Native Windows/macOS graphical and mixed-DPI acceptance remain manual.
+
+## Completion-instance follow-up
+
+The agent-key-only acknowledgement previously relied on the UI seeing a non-Done
+snapshot. A regression reproduced a dismissed completion remaining suppressed
+when Working was processed without drawing panels. The receive-time IDs also
+cover Working and Done both arriving before the renderer reads the latest scene.
+Tests cover both paths, same agent IDs on separate nodes, repeated Done, reconnect,
+source/removal, real dismissal input, independent counts and sampled readmission.
+Native Linux synthetic-observer inspection confirmed a dismissed card returning
+after back-to-back Working/Done messages, restoring four retained completions
+with independent counts/Focus, K relocation, Escape return and clean close.
+
+This is viewer presentation state; it changes neither the observation protocol
+nor agent identity. If the stream omits the intermediate state entirely, there is
+no task/completion ID in the current observation to distinguish two Done snapshots.
+That delivery question is being reviewed separately; the viewer does not invent
+new completions from unchanged Done receipts.

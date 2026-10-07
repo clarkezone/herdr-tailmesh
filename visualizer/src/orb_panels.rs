@@ -12,12 +12,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const CYAN: Color32 = Color32::from_rgb(90, 216, 235);
 
+struct Dismissal {
+    episode: Option<u64>,
+    at: f64,
+}
 #[derive(Default)]
 pub struct Panels {
     pub page: usize,
     pub projects: bool,
     pub focus: Option<Key>,
-    dismissed: BTreeMap<Key, f64>,
+    dismissed: BTreeMap<Key, Dismissal>,
     dismissal_revision: Option<(u64, u64)>,
     controls: Controls,
     key_motion: Option<Motion>,
@@ -50,22 +54,30 @@ impl Panels {
         let mut retained = BTreeSet::new();
         fn scan(
             branch: &herdr_mesh_visualizer::projection::Branch,
-            dismissed: &BTreeMap<Key, f64>,
+            dismissed: &BTreeMap<Key, Dismissal>,
+            episodes: &BTreeMap<Key, u64>,
             retained: &mut BTreeSet<Key>,
         ) {
             if branch.kind == "agent"
                 && branch.status == "done"
-                && dismissed.contains_key(&branch.key)
+                && dismissed
+                    .get(&branch.key)
+                    .is_some_and(|d| d.episode == episodes.get(&branch.key).copied())
             {
                 retained.insert(branch.key.clone());
             }
             for child in &branch.children {
-                scan(child, dismissed, retained);
+                scan(child, dismissed, episodes, retained);
             }
         }
         if let Some(scene) = &view.scene {
             for node in &scene.nodes {
-                scan(node, &self.dismissed, &mut retained);
+                scan(
+                    node,
+                    &self.dismissed,
+                    &view.completion_episodes,
+                    &mut retained,
+                );
             }
         }
         self.dismissed.retain(|key, _| retained.contains(key));
@@ -347,10 +359,10 @@ fn title(card: &Card<'_>, sim: &Simulation) -> String {
 }
 fn card_reveal(card: &Card<'_>, context: &Context<'_>, state: &Panels) -> Reveal {
     let own = Reveal::event(context.sim.clock - card.event.started, card.persistent);
-    if let Some(since) = card.key.and_then(|key| state.dismissed.get(key)) {
+    if let Some(dismissal) = card.key.and_then(|key| state.dismissed.get(key)) {
         return Reveal::new(
             own.amount()
-                .min((1. - (context.sim.clock - since) / crate::orb_hud::RETRACT) as f32),
+                .min((1. - (context.sim.clock - dismissal.at) / crate::orb_hud::RETRACT) as f32),
         );
     }
     if card.working {
@@ -506,7 +518,7 @@ fn page_controls(
     }
 }
 
-fn dismiss_completed(ui: &mut Ui, key: &Key, state: &mut Panels, clock: f64) {
+fn dismiss_completed(ui: &mut Ui, key: &Key, state: &mut Panels, clock: f64, episode: Option<u64>) {
     let (rect, response) = ui.allocate_exact_size(
         vec2(28_f32.min(ui.available_width().max(1.)), 20.),
         egui::Sense::click(),
@@ -519,7 +531,9 @@ fn dismiss_completed(ui: &mut Ui, key: &Key, state: &mut Panels, clock: f64) {
         )
     });
     if response.clicked() {
-        state.dismissed.insert(key.clone(), clock);
+        state
+            .dismissed
+            .insert(key.clone(), Dismissal { episode, at: clock });
     }
     let glow = ui.ctx().animate_bool_with_time(
         response.id.with("glow"),
@@ -827,14 +841,26 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                             .is_some_and(|a| a.state == AgentState::Completed);
                     let compact = ui.available_width() < 100.;
                     if completed && compact {
-                        dismiss_completed(ui, key, state, context.sim.clock);
+                        dismiss_completed(
+                            ui,
+                            key,
+                            state,
+                            context.sim.clock,
+                            context.view.completion_episodes.get(key).copied(),
+                        );
                     }
                     // Removed activity keys do not inherit a recycled geometry slot.
                     if context.sim.anchor(key).is_some() {
                         crate::orb_focus::checkbox(ui, context.view, key, &mut state.focus);
                     }
                     if completed && !compact {
-                        dismiss_completed(ui, key, state, context.sim.clock);
+                        dismiss_completed(
+                            ui,
+                            key,
+                            state,
+                            context.sim.clock,
+                            context.view.completion_episodes.get(key).copied(),
+                        );
                     }
                 }
             });
@@ -1406,6 +1432,15 @@ mod tests {
         };
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
         sim.update(&v, Stamp::seconds(201), 0.);
+        v.completion_episodes = std::sync::Arc::new(
+            sim.activities
+                .keys()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), i as u64 + 1))
+                .collect(),
+        );
+        sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
         sim.update(&v, Stamp::seconds(201), 2.);
         let draw_frame = |sim: &Simulation, v: &View, state: &mut Panels, events| {
             let mut output = ctx.run_ui(
@@ -1461,6 +1496,10 @@ mod tests {
         }
         assert_eq!(state.dismissed.len(), 1);
         let key = state.dismissed.keys().next().unwrap().clone();
+        assert_eq!(
+            state.dismissed[&key].episode,
+            v.completion_episodes.get(&key).copied()
+        );
         sim.update(&v, Stamp::seconds(201), 2.8);
         assert!(
             card_reveal(
@@ -1504,13 +1543,101 @@ mod tests {
         inventory.agents[0].agent_status = "working".into();
         let mut working = view(vec![changed], 3);
         working.epoch = 2;
+        working.completion_episodes = std::sync::Arc::new(
+            v.completion_episodes
+                .iter()
+                .filter(|(k, _)| *k != &key)
+                .map(|(k, n)| (k.clone(), *n))
+                .collect(),
+        );
         sim.update(&working, Stamp::seconds(202), 6.);
         draw_frame(&sim, &working, &mut state, vec![]);
         assert!(state.dismissed.is_empty());
         v.revision = 4;
+        std::sync::Arc::make_mut(&mut v.completion_episodes)
+            .entry(key)
+            .and_modify(|n| *n += 10);
         sim.update(&v, Stamp::seconds(202), 7.);
         sim.update(&v, Stamp::seconds(202), 9.);
         assert_eq!(draw_frame(&sim, &v, &mut state, vec![]).1, 2);
+    }
+    #[test]
+    fn a_new_completion_cannot_inherit_dismissal_when_working_was_not_drawn() {
+        for simulation_saw_working in [true, false] {
+            let ctx = egui::Context::default();
+            let mut initial = view(vec![node("one", "done", 1)], 1);
+            let mut sim = Simulation::default();
+            sim.update(&initial, Stamp::seconds(201), 0.);
+            initial.completion_episodes = std::sync::Arc::new(
+                sim.activities
+                    .keys()
+                    .enumerate()
+                    .map(|(i, k)| (k.clone(), i as u64 + 1))
+                    .collect(),
+            );
+            sim = Simulation::default();
+            sim.update(&initial, Stamp::seconds(201), 0.);
+            sim.update(&initial, Stamp::seconds(201), 2.);
+            let key = sim.activities.keys().next().unwrap().clone();
+            let previous_serial = sim.activities[&key].event.serial;
+            let mut state = Panels::default();
+            for (key, episode) in initial.completion_episodes.iter() {
+                state.dismissed.insert(
+                    key.clone(),
+                    Dismissal {
+                        at: 2.,
+                        episode: Some(*episode),
+                    },
+                );
+            }
+            state.refresh_dismissals(&initial);
+            if simulation_saw_working {
+                let working = view(vec![node("one", "working", 1)], 2);
+                sim.update(&working, Stamp::seconds(202), 4.);
+                assert_eq!(sim.activities[&key].state, AgentState::Working);
+            }
+            // The receive-time tracker supplies new tokens even if Working was never drawn/read.
+            let mut completed = view(vec![node("one", "done", 1)], 3);
+            completed.completion_episodes = std::sync::Arc::new(
+                initial
+                    .completion_episodes
+                    .iter()
+                    .map(|(k, n)| (k.clone(), n + 10))
+                    .collect(),
+            );
+            sim.update(&completed, Stamp::seconds(203), 6.);
+            assert!(sim.activities[&key].event.serial > previous_serial);
+            assert_eq!(sim.activities[&key].event.started, 6.);
+            sim.update(&completed, Stamp::seconds(203), 8.);
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    draw(
+                        ui,
+                        &Context {
+                            sim: &sim,
+                            view: &completed,
+                            rect,
+                            selected: None,
+                            passive: false,
+                        },
+                        &mut state,
+                    );
+                },
+            );
+            let count = output.shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "AGENT COMPLETED")).count();
+            output.textures_delta.clear();
+            assert_eq!(
+                count, 2,
+                "both scoped instances need new cards (simulation saw Working: {simulation_saw_working})"
+            );
+            assert!(state.dismissed.is_empty());
+            assert_eq!(sim.summary().states[2], 2);
+        }
     }
     #[test]
     fn acknowledgements_survive_sampled_history_readmission_but_not_removal_or_source_reset() {
@@ -1524,7 +1651,14 @@ mod tests {
             .unwrap()
             .clone();
         let mut state = Panels::default();
-        state.dismissed.insert(key.clone(), 0.);
+        v.completion_episodes = std::sync::Arc::new(BTreeMap::from([(key.clone(), 7)]));
+        state.dismissed.insert(
+            key.clone(),
+            Dismissal {
+                at: 0.,
+                episode: Some(7),
+            },
+        );
         state.refresh_dismissals(&v);
         let serial = sim.activities.remove(&key).unwrap().event.serial;
         v.revision = 2;
@@ -1535,7 +1669,13 @@ mod tests {
         assert_eq!(sim.summary().agents, 7998);
         state.refresh_dismissals(&view(vec![], 3));
         assert!(state.dismissed.is_empty());
-        state.dismissed.insert(key, 0.);
+        state.dismissed.insert(
+            key,
+            Dismissal {
+                at: 0.,
+                episode: None,
+            },
+        );
         state.reset_source();
         assert!(state.dismissed.is_empty());
     }

@@ -6,6 +6,7 @@ use herdr_mesh_visualizer::{
     summary::summary,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::sync::Arc;
 
 pub const MAX_NODES: usize = 128;
 pub const MAX_ENTITIES: usize = 8_000;
@@ -163,6 +164,7 @@ pub struct Event {
 }
 pub struct Activity {
     pub state: AgentState,
+    pub completion_episode: Option<u64>,
     pub freshness: Freshness,
     pub offline: bool,
     pub event: Event,
@@ -175,7 +177,7 @@ pub struct Simulation {
     ids: BTreeMap<Key, Id>,
     pub pulses: Vec<Pulse>,
     pub events: VecDeque<Event>,
-    /// Current working/blocked agents and their timed resolution notices, scoped by identity.
+    /// Current working/blocked/completed agents and timed notices, scoped by identity.
     pub activities: BTreeMap<Key, Activity>,
     pub camera: Option<crate::orb_focus::Pose>,
     pub time: f32,
@@ -192,6 +194,7 @@ pub struct Simulation {
     revision: Option<u64>,
     receipts: Pulses,
     serial: u64,
+    completion_episodes: Arc<BTreeMap<Key, u64>>,
     wall: Stamp,
 }
 impl Simulation {
@@ -323,9 +326,15 @@ impl Simulation {
         offline: bool,
     ) {
         let persistent = state.persistent();
+        let completion_episode = self
+            .completion_episodes
+            .get(key)
+            .copied()
+            .filter(|_| state == AgentState::Completed);
         if let Some(activity) = self.activities.get_mut(key)
             && activity.persistent
             && activity.state == state
+            && activity.completion_episode == completion_episode
             && persistent
         {
             activity.event.text = text;
@@ -338,6 +347,7 @@ impl Simulation {
             key.clone(),
             Activity {
                 state,
+                completion_episode,
                 freshness,
                 offline,
                 persistent,
@@ -362,6 +372,7 @@ impl Simulation {
         self.clock = clock;
         self.time = clock as f32;
         self.wall = wall;
+        self.completion_episodes = Arc::clone(&view.completion_episodes);
         self.callouts = true;
         let freed = self.prune();
         let Some(scene) = &view.scene else {
