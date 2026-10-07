@@ -40,7 +40,7 @@ pub fn glyph_geometry(glyph: Glyph, time: f32) -> Geometry {
         particles: Vec::new(),
         lines: Vec::new(),
     };
-    g.glyph(glyph, Vec3::Z, 1.0, time, 0.0, Vec3::Z);
+    g.glyph(glyph, Vec3::Z, 1.0, time, 0.0);
     g
 }
 
@@ -149,7 +149,7 @@ fn arc(start: Vec3, end: Vec3, t: f32, bulge: f32) -> Vec3 {
     center + outward * (PI * t).sin() * bulge
 }
 impl Geometry {
-    fn glyph(&mut self, glyph: Glyph, p: Vec3, alpha: f32, time: f32, phase: f32, facing: Vec3) {
+    fn glyph(&mut self, glyph: Glyph, p: Vec3, alpha: f32, time: f32, phase: f32) {
         match glyph {
             Glyph::Coordinator => {
                 self.dot(p, 7.0, glyph.color(), alpha);
@@ -165,17 +165,11 @@ impl Geometry {
             Glyph::Node => self.dot(p, 5.5, glyph.color(), alpha),
             Glyph::Session => {
                 self.dot(p, 4.8, glyph.color(), alpha);
-                // A semantic ring faces the camera rather than hugging the
-                // surface, where it collapses into a line near the silhouette.
-                let (u, v) = basis(facing);
+                // Keep the enlarged ring tangent to the sphere's surface.
+                // Its radial normal rotates with the session, preserving depth.
                 for i in 0..24 {
                     let angle = i as f32 * TAU / 24.0;
-                    self.dot(
-                        p + 0.22 * (u * angle.cos() + v * angle.sin()),
-                        1.35,
-                        [0.5, 0.15, 0.9],
-                        alpha * 0.8,
-                    );
+                    self.dot(circle(p, 0.22, angle), 1.35, [0.5, 0.15, 0.9], alpha * 0.8);
                 }
             }
             Glyph::Workspace => {
@@ -256,7 +250,6 @@ impl Geometry {
 }
 pub fn geometry(sim: &Simulation) -> Geometry {
     let time = sim.time;
-    let facing = scene_rotation(time).inverse() * Vec3::Z;
     let mut g = Geometry {
         particles: Vec::new(),
         lines: Vec::new(),
@@ -278,7 +271,6 @@ pub fn geometry(sim: &Simulation) -> Geometry {
         if sim.live { 1.0 } else { 0.3 },
         time,
         0.0,
-        facing,
     );
     for (&id, life) in &sim.entities {
         let alpha = life.alpha(sim.clock) * sim.opacity(id);
@@ -288,11 +280,11 @@ pub fn geometry(sim: &Simulation) -> Geometry {
         let p = visible_position(sim, id);
         match id {
             Id::Node(_) => {
-                g.glyph(Glyph::Node, p, alpha, time, 0.0, facing);
+                g.glyph(Glyph::Node, p, alpha, time, 0.0);
                 g.curve(p, root, [0.3, 0.13, 0.7], alpha * 0.28, 0.5);
             }
             Id::Session(n, _) => {
-                g.glyph(Glyph::Session, p, alpha, time, 0.0, facing);
+                g.glyph(Glyph::Session, p, alpha, time, 0.0);
                 g.curve(
                     p,
                     visible_position(sim, Id::Node(n)),
@@ -302,7 +294,7 @@ pub fn geometry(sim: &Simulation) -> Geometry {
                 );
             }
             Id::Workspace(n, s, _) => {
-                g.glyph(Glyph::Workspace, p, alpha, time, 0.0, facing);
+                g.glyph(Glyph::Workspace, p, alpha, time, 0.0);
                 g.line(
                     p,
                     visible_position(sim, Id::Session(n, s)),
@@ -319,14 +311,7 @@ pub fn geometry(sim: &Simulation) -> Geometry {
                     [0.12, 0.3, 0.45],
                     alpha * 0.22,
                 );
-                g.glyph(
-                    Glyph::Agent(state),
-                    p,
-                    alpha,
-                    time,
-                    noise(id.seed()) * TAU,
-                    facing,
-                );
+                g.glyph(Glyph::Agent(state), p, alpha, time, noise(id.seed()) * TAU);
             }
         }
     }
@@ -605,29 +590,25 @@ mod dpi_tests {
     }
 
     #[test]
-    fn session_rings_stay_circular_as_clusters_and_sphere_rotate() {
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 800.));
+    fn session_rings_follow_the_surface_with_enlarged_radius() {
         for time in [0., 10., 30., 60., 100., 200.] {
-            let facing = scene_rotation(time).inverse() * Vec3::Z;
             for node in 0..16 {
                 let center = position(Id::Session(node, 0), time);
-                let anchor = project(center, time, rect).unwrap();
+                let rotation = scene_rotation(time);
+                let normal = rotation * center.normalize();
                 let mut geometry = Geometry {
                     particles: Vec::new(),
                     lines: Vec::new(),
                 };
-                geometry.glyph(Glyph::Session, center, 1., time, 0., facing);
+                geometry.glyph(Glyph::Session, center, 1., time, 0.);
                 assert_eq!(geometry.particles.len(), 50);
-                let mut radii = Vec::new();
                 for dot in geometry.particles[2..].as_chunks::<2>().0 {
                     let [x, y, z, _] = dot[0].position_size;
                     let p = Vec3::new(x, y, z);
-                    let depth_offset = scene_rotation(time) * (p - center);
-                    assert!(depth_offset.z.abs() < 0.00001);
-                    radii.push(project(p, time, rect).unwrap().distance(anchor));
+                    let offset = rotation * (p - center);
+                    assert!(offset.dot(normal).abs() < 0.00001);
+                    assert!((offset.length() - 0.22).abs() < 0.00001);
                 }
-                assert!(radii[0] > 12.);
-                assert!(radii.iter().all(|r| (r / radii[0] - 1.).abs() < 0.001));
             }
         }
     }
