@@ -334,11 +334,15 @@ pub fn geometry(sim: &Simulation) -> Geometry {
         let center = crate::mesh_territory::anchor(n) * 1.94;
         let phase = (time / 4.8 + noise(n as u32)) % 1.;
         let color = AgentState::Blocked.color();
-        for i in 0..32 {
+        for i in 0_usize..32 {
             let angle = i as f32 * TAU / 32.;
             let a = circle(center, 0.28 + phase * 0.5, angle);
-            let b = circle(center, 0.28 + phase * 0.5, angle + TAU / 32.);
-            g.line(a, b, color, strength * (1. - phase) * 0.28);
+            let b = circle(center, 0.28 + phase * 0.5, angle + TAU / 16.);
+            // Sixteen circuit segments leave headroom for the full retained-exit
+            // line budget; keep all thirty-two lamps for the visual scanner.
+            if i.is_multiple_of(2) {
+                g.line(a, b, color, strength * (1. - phase) * 0.28);
+            }
             let light = 0.12 + 0.28 * (angle - time * 1.3).sin().max(0.);
             g.dot(circle(center, 0.65, angle), 1.3, color, strength * light);
         }

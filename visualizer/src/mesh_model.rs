@@ -1303,6 +1303,47 @@ pub mod tests {
         assert!(crate::mesh_orb::geometry(&sim).particles.len() < before);
     }
     #[test]
+    fn blocked_circuits_leave_headroom_for_dense_repeated_session_exits() {
+        let nodes: Vec<_> = (0..MAX_NODES)
+            .map(|n| {
+                let mut n = node(&n.to_string(), "blocked", 1);
+                let session = n.sessions[0].clone();
+                n.sessions = (0..8)
+                    .map(|s| SessionView {
+                        name: format!("s{s}"),
+                        ..session.clone()
+                    })
+                    .collect();
+                n
+            })
+            .collect();
+        let mut sim = Simulation::default();
+        sim.update(&view(nodes.clone(), 1), Stamp::seconds(202), 0.);
+        sim.update(&view(nodes.clone(), 1), Stamp::seconds(202), 1.3);
+        for rev in 2..=5 {
+            let mut changed = nodes.clone();
+            for n in &mut changed {
+                n.last_seen = Some(Timestamp {
+                    seconds: 201,
+                    nanos: 0,
+                });
+                for s in &mut n.sessions {
+                    s.incarnation = format!("epoch-{rev}");
+                }
+            }
+            sim.update(
+                &view(changed, rev),
+                Stamp::seconds(202),
+                1.2 + rev as f64 * 0.1,
+            );
+            assert_eq!(sim.blocked_nodes().len(), MAX_NODES);
+            assert!(sim.entities.values().any(|l| !l.entering()));
+            let g = crate::mesh_orb::geometry(&sim);
+            assert!(g.lines.len() <= crate::mesh_orb::MAX_LINES);
+            assert!(g.particles.len() <= crate::mesh_orb::MAX_PARTICLES);
+        }
+    }
+    #[test]
     fn every_node_hub_survives_dense_detail_and_simultaneous_receipt_effects() {
         let nodes: Vec<_> = (0..MAX_NODES)
             .map(|n| {
