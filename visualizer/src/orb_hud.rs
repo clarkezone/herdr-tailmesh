@@ -5,7 +5,7 @@ use crate::mesh_model::ease;
 
 pub const INTRO_END: f64 = 60.;
 const REVEAL: f64 = 1.8;
-const RETRACT: f64 = 1.6;
+pub(crate) const RETRACT: f64 = 1.6;
 const CYAN: Color32 = Color32::from_rgb(90, 216, 235);
 
 #[derive(Clone, Copy)]

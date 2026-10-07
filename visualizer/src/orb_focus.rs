@@ -168,7 +168,7 @@ pub fn checkbox(ui: &mut Ui, view: &View, key: &Key, focus: &mut Option<Key>) {
     };
     let mut checked = focus.as_ref() == Some(&node.key);
     let (rect, mut response) = ui.allocate_exact_size(
-        vec2(76_f32.min(ui.available_width().max(1.)), 20.),
+        vec2(28_f32.min(ui.available_width().max(1.)), 20.),
         egui::Sense::click(),
     );
     if response.clicked() {
@@ -241,19 +241,13 @@ pub fn checkbox(ui: &mut Ui, view: &View, key: &Key, focus: &mut Option<Key>) {
         painter.circle_filled(center, 1.7, COLOR.gamma_multiply(amount));
         painter.line_segment(
             [
-                egui::pos2(rect.left() + 27., rect.bottom() - 3.),
-                egui::pos2(rect.left() + 27. + 38. * amount, rect.bottom() - 3.),
+                egui::pos2(rect.left() + 5., rect.bottom() - 3.),
+                egui::pos2(
+                    rect.left() + 5. + (rect.width() - 10.).max(0.) * amount,
+                    rect.bottom() - 3.,
+                ),
             ],
             egui::Stroke::new(0.8, COLOR.gamma_multiply(amount)),
-        );
-    }
-    if rect.width() >= 62. {
-        painter.text(
-            egui::pos2(rect.left() + 27., rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            "Focus",
-            FontId::monospace(10.),
-            color,
         );
     }
     response
@@ -262,26 +256,57 @@ pub fn checkbox(ui: &mut Ui, view: &View, key: &Key, focus: &mut Option<Key>) {
             "Bring this node's cluster forward and pause rotation; click again to return",
         );
 }
+/// Prefer the left edge, then beside the HUD, then the right edge. Fall back
+/// to the tallest free segment without placing a panel behind another overlay.
+pub fn panel_bounds(rect: Rect, reserved: &[Rect]) -> Rect {
+    let margin = 12_f32.min(rect.width() * 0.05).min(rect.height() * 0.05);
+    let area = rect.shrink(margin);
+    let width = 240_f32.min(area.width().max(1.));
+    let target_height = 320_f32.min(area.height() * 0.45);
+    let mut xs = vec![area.left()];
+    xs.extend(reserved.iter().map(|r| r.right() + 12.));
+    xs.push(area.right() - width);
+    let mut best = Rect::from_min_size(area.min, vec2(width, 0.));
+    for x in xs {
+        if x < area.left() || x + width > area.right() + 0.01 {
+            continue;
+        }
+        let mut intervals: Vec<_> = reserved
+            .iter()
+            .filter(|r| r.left() < x + width + 12. && r.right() + 12. > x)
+            .map(|r| (r.top() - 12., r.bottom() + 12.))
+            .collect();
+        intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut y = area.top();
+        for (top, bottom) in intervals
+            .into_iter()
+            .chain(std::iter::once((area.bottom(), area.bottom())))
+        {
+            let height = target_height.min((top.min(area.bottom()) - y).max(0.));
+            let bounds = Rect::from_min_size(egui::pos2(x, y), vec2(width, height));
+            if height > best.height() {
+                best = bounds;
+            }
+            if height >= target_height && height > 0. {
+                return bounds;
+            }
+            y = y.max(bottom).min(area.bottom());
+        }
+    }
+    best
+}
+
 /// Always-available exit and virtualized complete hierarchy, including sampled detail.
 pub fn panel(
     ui: &mut Ui,
-    sim: &Simulation,
     view: &View,
     rect: Rect,
     focus: &mut Option<Key>,
     reserved: &[Rect],
 ) -> Option<Rect> {
     let node = focus.as_ref().and_then(|key| node_for(view, key))?;
-    let width = 240_f32.min((rect.width() - 24.).max(1.));
-    let bottom = reserved
-        .iter()
-        .filter(|r| r.left() < rect.left() + 12. + width && r.right() > rect.left() + 12.)
-        .map(|r| r.top() - 12.)
-        .fold(rect.bottom() - 12., f32::min);
-    let height = 320_f32
-        .min(rect.height() * 0.45)
-        .min((bottom - rect.top() - 12.).max(1.));
-    let bounds = Rect::from_min_size(rect.left_top() + vec2(12., 12.), vec2(width, height));
+    let bounds = panel_bounds(rect, reserved);
+    let height = bounds.height();
     let painter = ui.painter().with_clip_rect(bounds);
     painter.rect_filled(bounds, 3., Color32::from_rgba_unmultiplied(4, 12, 25, 220));
     painter.rect_stroke(
@@ -310,7 +335,7 @@ pub fn panel(
     }
     let mut child = ui.new_child(
         UiBuilder::new()
-            .id_salt("orb-focus-hierarchy")
+            .id(ui.id().with("orb-focus-hierarchy"))
             .max_rect(bounds.shrink(10.)),
     );
     child.set_clip_rect(bounds.shrink(10.));
@@ -367,11 +392,26 @@ pub fn panel(
                 });
             }
         });
-    // Labels beside projected glyphs; complete names remain accessible above.
-    let Some(id) = sim.id(&node.key) else {
-        return Some(bounds);
+    Some(bounds)
+}
+
+/// Name projection is independent of how much room remains for the hierarchy.
+pub fn labels(
+    ui: &Ui,
+    sim: &Simulation,
+    view: &View,
+    rect: Rect,
+    focus: &Option<Key>,
+    reserved: &[Rect],
+) -> Vec<Rect> {
+    let Some(node) = focus.as_ref().and_then(|key| node_for(view, key)) else {
+        return Vec::new();
     };
-    let mut used = vec![bounds];
+    let Some(id) = sim.id(&node.key) else {
+        return Vec::new();
+    };
+    let mut used = reserved.to_vec();
+    let mut result = Vec::new();
     let mut labelled = 0;
     let mut measured = 0;
     for (&entity, life) in &sim.entities {
@@ -413,10 +453,11 @@ pub fn panel(
                 .with_clip_rect(rect)
                 .galley(label.min, galley, color);
             used.push(label);
+            result.push(label);
             labelled += 1;
         }
     }
-    Some(bounds)
+    result
 }
 
 #[cfg(test)]
@@ -570,7 +611,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    let bounds = panel(ui, &sim, &v, rect, &mut focus, &[dock]).unwrap();
+                    let bounds = panel(ui, &v, rect, &mut focus, &[dock]).unwrap();
                     assert!(bounds.is_finite());
                     assert!(rect.contains_rect(bounds));
                     assert!(!bounds.intersects(dock));
@@ -578,6 +619,40 @@ mod tests {
             );
             output.textures_delta.clear();
         }
+    }
+    #[test]
+    fn projected_names_do_not_depend_on_a_usable_hierarchy_panel() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "done", 1)], 1);
+        let mut sim = Simulation::default();
+        let mut controller = Controller::default();
+        let mut focus = Some(v.scene.as_ref().unwrap().nodes[0].key.clone());
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, vec2(1100., 88.));
+        advance(&mut sim, &v, 0.);
+        controller.update(&mut sim, &mut focus, rect);
+        advance(&mut sim, &v, 2.);
+        controller.update(&mut sim, &mut focus, rect);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                let bounds = panel(ui, &v, rect, &mut focus, &[]).unwrap();
+                assert!(bounds.height() < 40.);
+                let names = labels(ui, &sim, &v, rect, &focus, &[bounds]);
+                assert!(
+                    !names.is_empty(),
+                    "compact hierarchy must not suppress projected names"
+                );
+                assert!(
+                    names
+                        .iter()
+                        .all(|r| rect.contains_rect(*r) && !r.intersects(bounds))
+                );
+            },
+        );
+        output.textures_delta.clear();
     }
     #[test]
     fn custom_reticle_keeps_tab_space_and_enter_checkbox_semantics() {
@@ -619,27 +694,31 @@ mod tests {
         let v = view(vec![node("one", "blocked", 1)], 1);
         let mut focus = None;
         let key = &v.scene.as_ref().unwrap().nodes[0].children[0].children[0].children[0].key;
-        let run = |focus: &mut Option<Key>, events| {
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    events,
-                    ..Default::default()
-                },
-                |ui| checkbox(ui, &v, key, focus),
-            );
-            let point = output
-                .shapes
-                .iter()
-                .find_map(|s| match &s.shape {
-                    egui::Shape::Text(t) if t.galley.text() == "Focus" => {
-                        Some(t.pos + t.galley.size() * 0.5)
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            output.textures_delta.clear();
-            point
-        };
+        let run =
+            |focus: &mut Option<Key>, events| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| checkbox(ui, &v, key, focus),
+                );
+                let point = output
+                    .shapes
+                    .iter()
+                    .find_map(|s| match &s.shape {
+                        egui::Shape::Rect(r) if r.rect.size() == vec2(28., 20.) => {
+                            Some(r.rect.center())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(!output.shapes.iter().any(
+                    |s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "Focus")
+                ));
+                output.textures_delta.clear();
+                point
+            };
         let p = run(&mut focus, vec![]);
         let click = |pressed| {
             vec![

@@ -32,7 +32,12 @@ its real node/session/workspace/agent names, including initial/reconnect snapsho
 counts, selection and timed notices remain independent of W. Working → blocked
 replaces the work card with persistent ATTENTION REQUIRED, and blocked → working
 replaces attention with work. Completed cards remain until the agent changes state
-or disappears, including agents already done at startup/reconnect. A fresh observed
+or disappears, including agents already done at startup/reconnect. **Dismiss**
+acknowledges a completion locally and retracts its card; narrow cards use **×**.
+The acknowledgement lasts for that observed Completed episode, across unchanged
+snapshots/reconnects, until a state change/removal/source reset; a later completion
+appears again. Counts and agent state stay unchanged; selection and Focus remain
+available. Dismissals are local to this viewer launch. A fresh observed
 transition to idle or unknown shows that actual state for ten seconds. Reconnect/stale
 comparisons never invent transition events; retained cards are marked LAST KNOWN. Live removal has a truthful
 no-longer-observed notice. Multiple cards remain pageable without expiring off-page.
@@ -51,7 +56,10 @@ with zoom over 1.5 seconds; focus framing has a further 20% magnification boost.
 **Return to fleet** restores the rotating overview without a camera jump. Focus
 survives callout expiry and W hiding, but releases on node removal/source replacement.
 Live data, attention and heartbeat effects keep running while motion is paused.
-Names appear beside projected glyphs where they fit; the focused-node panel lists
+The reticle has no painted Focus caption; hover and accessibility still identify
+its action. Names appear beside projected glyphs where they fit independently of
+hierarchy-panel space, avoiding all current HUD/observation/activity overlays.
+The focused-node panel uses free space above/beside the HUD or at the other edge and lists
 the full node/session/workspace/agent hierarchy with scrolling, including sampled
 geometry. Interactive focus controls are omitted in passive/screensaver mode.
 
@@ -63,7 +71,7 @@ Persistent cards do not expire while off-page. Timed notices still expire after
 ten seconds, so an exceptionally crowded screen is not a lossless event log.
 Other transient events keep their latest-three bound; activity history is bounded
 separately and persistent attention/work/completion take priority over expired/old history.
-Activity boxes fit their actual heading, names and Focus control, with modest padding. Only
+Activity boxes fit their actual heading, names and compact reticle control, with modest padding. Only
 unusually long content scrolls within a capped card; selection details scroll
 within their bounded observation card.
 
@@ -269,3 +277,5 @@ the single executable. The notice file is not a runtime dependency.
 [Persistent Block specs, review and validation](../docs/orb-persistent-block.md).
 
 [Persistent Completed follow-up specs, review and validation](../docs/orb-persistent-completed.md).
+
+[Focus visibility, completion dismissal and icon-only controls](../docs/orb-focus-and-dismissal.md).
