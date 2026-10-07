@@ -1,4 +1,7 @@
 # Persistent Block — Functional Specification
+Completion lifetime is superseded by [Persistent Completed](orb-persistent-completed.md):
+Completed is now a persistent current state, including startup/reconnect.
+
 Status: reviewed for implementation (2026-10-07).
 Source: [[projects/herdr-tailmesh/Visualization Backlog#Persistent blocked]]; current Orb implementation and user request. Viewer-only; preserve independent --tree and observer architecture.
 
