@@ -506,8 +506,11 @@ fn page_controls(
     }
 }
 
-fn dismiss_completed(ui: &mut Ui, key: &Key, state: &mut Panels, clock: f64, compact: bool) {
-    let response = ui.small_button(if compact { "×" } else { "Dismiss" });
+fn dismiss_completed(ui: &mut Ui, key: &Key, state: &mut Panels, clock: f64) {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(28_f32.min(ui.available_width().max(1.)), 20.),
+        egui::Sense::click(),
+    );
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
@@ -515,12 +518,53 @@ fn dismiss_completed(ui: &mut Ui, key: &Key, state: &mut Panels, clock: f64, com
             "Dismiss completed notification",
         )
     });
-    if response
-        .on_hover_text("Acknowledge this completion; a later completion will appear again")
-        .clicked()
-    {
+    if response.clicked() {
         state.dismissed.insert(key.clone(), clock);
     }
+    let glow = ui.ctx().animate_bool_with_time(
+        response.id.with("glow"),
+        response.hovered() || response.has_focus(),
+        0.2,
+    );
+    let color = Color32::from_rgb(120, 235, 165).gamma_multiply(0.65 + 0.35 * glow);
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        2.,
+        Color32::from_rgba_unmultiplied(8, 30, 22, (25. + 55. * glow) as u8),
+    );
+    let rail = rect.shrink(1_f32.min(rect.width() * 0.25));
+    for (corner, dx, dy) in [
+        (rail.left_top(), 1., 1.),
+        (rail.right_top(), -1., 1.),
+        (rail.left_bottom(), 1., -1.),
+        (rail.right_bottom(), -1., -1.),
+    ] {
+        painter.line_segment(
+            [
+                corner + vec2(dx * 7_f32.min(rail.width().max(0.) * 0.3), 0.),
+                corner,
+            ],
+            Stroke::new(0.8, color),
+        );
+        painter.line_segment(
+            [corner, corner + vec2(0., dy * 5.)],
+            Stroke::new(0.8, color),
+        );
+    }
+    let radius = 3.5_f32.min((rect.width() - 6.).max(0.) * 0.5);
+    for dy in [-1., 1.] {
+        painter.line_segment(
+            [
+                rect.center() + vec2(-radius, -dy * radius),
+                rect.center() + vec2(radius, dy * radius),
+            ],
+            Stroke::new(1.2, color),
+        );
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Dismiss this completion; a later completion will appear again");
 }
 
 pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response {
@@ -783,14 +827,14 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                             .is_some_and(|a| a.state == AgentState::Completed);
                     let compact = ui.available_width() < 100.;
                     if completed && compact {
-                        dismiss_completed(ui, key, state, context.sim.clock, true);
+                        dismiss_completed(ui, key, state, context.sim.clock);
                     }
                     // Removed activity keys do not inherit a recycled geometry slot.
                     if context.sim.anchor(key).is_some() {
                         crate::orb_focus::checkbox(ui, context.view, key, &mut state.focus);
                     }
                     if completed && !compact {
-                        dismiss_completed(ui, key, state, context.sim.clock, false);
+                        dismiss_completed(ui, key, state, context.sim.clock);
                     }
                 }
             });
@@ -1385,8 +1429,10 @@ mod tests {
                 },
             );
             let dismiss = output.shapes.iter().find_map(|s| match &s.shape {
-                egui::Shape::Text(t) if t.galley.text() == "Dismiss" => {
-                    Some(t.pos + t.galley.size() * 0.5)
+                egui::Shape::LineSegment { points, .. }
+                    if points[1] - points[0] == vec2(7., 7.) =>
+                {
+                    Some(points[0] + vec2(3.5, 3.5))
                 }
                 _ => None,
             });

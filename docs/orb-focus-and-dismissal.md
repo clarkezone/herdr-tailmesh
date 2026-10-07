@@ -12,7 +12,9 @@ and the Focus control should show only its reticle/brackets.
   Reserve all current HUD, hierarchy, observation and activity geometry before
   projecting labels, so later-painted flyouts cannot cover them. Small views
   retain bounded fallback and Escape exit rather than overlapping panels.
-- Completed callouts offer Dismiss. Retract with the existing sci-fi animation,
+- Completed callouts offer their own icon-only Dismiss: a bracketed × matching
+  the Focus reticle's rails, with animated hover/keyboard illumination and an
+  accessible button label/hover help. Retract with the existing sci-fi animation,
   then remove their widgets, hit masks and pagination entries. Counts, agent
   state, working/blocked cards, selection and Focus remain independent.
 - A dismissal acknowledges the current observed Completed episode, scoped to
@@ -37,6 +39,11 @@ and the Focus control should show only its reticle/brackets.
   change under admission pressure. Reuse the existing retraction duration/reveal.
 - Dismiss is a local acknowledgement, not setting the mesh agent to Idle/Done or
   removing its observation. Passive launchers offer no interactive dismissal.
+- The icon refinement removes stock button chrome and text. Draw a green × and
+  cut-corner rails in logical display points, bounding them to narrow footer
+  widths. Preserve disabled/reveal clipping, Button metadata, hover help and
+  Tab/Space/Enter. Existing real pointer coverage clicks the icon; native
+  inspection confirms independent acknowledgement and unchanged counts/Focus.
 - Shorten the reticle width and keep its illumination inside its own bounds.
   Test real pointer and keyboard input without depending on a painted Focus label.
 - Adding the hierarchy shifted egui auto widget IDs and dropped keyboard focus
