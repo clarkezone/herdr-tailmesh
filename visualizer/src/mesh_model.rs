@@ -1,6 +1,7 @@
 //! Presentation state derived exclusively from the production observation model.
 use herdr_mesh_visualizer::{
     client::View,
+    diagnostics::json,
     heartbeat::{Pulses, Stamp},
     projection::{Branch, Freshness, Key, Scene},
     summary::summary,
@@ -170,6 +171,13 @@ pub struct Activity {
     pub event: Event,
     pub persistent: bool,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActivityTrace {
+    state: AgentState,
+    episode: Option<u64>,
+    serial: u64,
+    persistent: bool,
+}
 #[derive(Default)]
 pub struct Simulation {
     pub entities: BTreeMap<Id, Life>,
@@ -196,8 +204,69 @@ pub struct Simulation {
     serial: u64,
     completion_episodes: Arc<BTreeMap<Key, u64>>,
     wall: Stamp,
+    diagnostic_revision: Option<(u64, u64, u64, u64, usize, usize)>,
+    diagnostic_activities: BTreeMap<Key, ActivityTrace>,
+    pub diagnostic_renderer: Option<u64>,
 }
 impl Simulation {
+    fn trace_activities(&mut self, view: &View) {
+        let Some(log) = &view.diagnostics else {
+            return;
+        };
+        let renderer = *self
+            .diagnostic_renderer
+            .get_or_insert_with(|| log.new_renderer());
+        let revision = (
+            self.source_generation,
+            view.epoch,
+            view.revision,
+            self.serial,
+            self.activities.len(),
+            self.omitted_activities,
+        );
+        if self.diagnostic_revision == Some(revision) {
+            return;
+        }
+        let source_changed = self
+            .diagnostic_revision
+            .is_some_and(|r| r.0 != self.source_generation);
+        if source_changed {
+            view.diagnostic(
+                "model_source_reset",
+                json!({"renderer":renderer, "source_generation":self.source_generation}),
+            );
+            self.diagnostic_activities.clear();
+        }
+        self.diagnostic_revision = Some(revision);
+        let current: BTreeMap<_, _> = self
+            .activities
+            .iter()
+            .map(|(key, a)| {
+                (
+                    key.clone(),
+                    ActivityTrace {
+                        state: a.state,
+                        episode: a.completion_episode,
+                        serial: a.event.serial,
+                        persistent: a.persistent,
+                    },
+                )
+            })
+            .collect();
+        for (key, trace) in &current {
+            if self.diagnostic_activities.get(key) != Some(trace) {
+                view.diagnostic("activity_changed", json!({"renderer":renderer, "key":key, "state":format!("{:?}", trace.state), "episode":trace.episode, "event_serial":trace.serial, "persistent":trace.persistent, "previous_episode":self.diagnostic_activities.get(key).and_then(|a| a.episode)}));
+            }
+        }
+        for (key, trace) in self
+            .diagnostic_activities
+            .iter()
+            .filter(|(k, _)| !current.contains_key(*k))
+        {
+            view.diagnostic("activity_removed", json!({"renderer":renderer, "key":key, "episode":trace.episode, "event_serial":trace.serial, "reason":"not_retained", "omitted_activities":self.omitted_activities}));
+        }
+        self.diagnostic_activities = current;
+    }
     pub fn summary(&self) -> Summary {
         self.totals
     }
@@ -383,6 +452,7 @@ impl Simulation {
             self.blocked_receipts.clear();
             self.receipts = Default::default();
             self.revision = None;
+            self.trace_activities(view);
             return;
         };
         let source = scene.coordinator.as_ref().map(|b| b.key.clone());
@@ -445,6 +515,7 @@ impl Simulation {
                 })
             })
             .collect();
+        self.trace_activities(view);
     }
     fn reconcile(&mut self, scene: &Scene, emit: bool) {
         let known = summary(scene, self.wall).known;

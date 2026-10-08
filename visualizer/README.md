@@ -42,12 +42,95 @@ then Done rearms its banner even if Working was never drawn. A new completion
 restarts its reveal; unchanged Done/reconnect does not. The acknowledgement lasts for that observed Completed episode, across unchanged
 snapshots/reconnects, until a state change/removal/source reset; a later completion
 appears again. Counts and agent state stay unchanged; selection and Focus remain
-available. Dismissals are local to this viewer launch. A fresh observed
+available. Dismissals are saved locally for this OS user and observer port,
+scoped to the verified coordinator and full agent identity. A dismissed completion
+stays hidden after closing/relaunching the viewer or screensaver; undismissed
+Completed cards still appear at startup. A fresh observed
 transition to idle or unknown shows that actual state for ten seconds. Reconnect/stale
 comparisons never invent transition events; retained cards are marked LAST KNOWN. Live removal has a truthful
 no-longer-observed notice. Multiple cards remain pageable without expiring off-page.
+New completion instances receive first-page priority ahead of older activity,
+so finishing a visible worker cannot silently send its completion behind all
+the still-working cards. That priority has no timeout while the agent stays Done;
+later new completions can move older cards to another page. Initial observations,
+unchanged reconnects and geometry resampling do not replay old completions.
 The viewer cannot detect a new task if the observation stream reports Done twice
 without any intervening state/removal or a distinct completion ID.
+This also applies to work completed entirely while the viewer is closed: an
+unchanged Done snapshot cannot identify a new task. Receiving non-Done/removal
+clears the saved acknowledgement immediately, even without drawing a frame.
+
+Acknowledgements are written when you click ×, without waiting for app exit.
+State is kept in `herdr-mesh-visualizer/dismissals-<port>.bin` under
+`%LOCALAPPDATA%` (Windows), `~/Library/Application Support` (macOS), or
+`$XDG_STATE_HOME` / `~/.local/state` (Linux). The file contains only scoped
+identities and acknowledgement IDs, never agent labels, directories or mesh
+credentials. Independent writers merge changes under a bounded file lock;
+atomic replacement preserves the previous file on failed writes. Storage errors
+are reported in the interactive viewer and logs; observation continues. Delete
+this file while viewers are closed to reset acknowledgements. `--tree` does not
+read or write this state. Native Windows/macOS restart acceptance remains manual.
+
+Orb automatically records completion diagnostics, including Windows screensaver
+and preview launches. No flag or `RUST_LOG` setting is needed. Logs are JSON Lines
+under the same user state root as acknowledgements, in
+`herdr-mesh-visualizer/logs/`:
+
+| Platform | Default directory |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\herdr-mesh-visualizer\logs` |
+| macOS | `~/Library/Application Support/herdr-mesh-visualizer/logs` |
+| Linux | `$XDG_STATE_HOME/herdr-mesh-visualizer/logs`, otherwise `~/.local/state/herdr-mesh-visualizer/logs` |
+
+The current file is `completion-<port>-<slot>.jsonl`; `.1.jsonl` and `.2.jsonl`
+are its older rotations. Each file is capped at 2 MiB. Eight independently locked
+slots support concurrent processes without sharing a writer or deleting an active
+process's log. A launch reuses the first free slot and appends to its previous log;
+the run ID separates launches. The terminal prints the actual current path.
+For a missing banner, retain the matching port's current and rotated files soon
+after the event, together with the approximate time and agent name.
+
+Records identify the build commit/dirty state, run, timestamp, sequence, port,
+coordinator and scoped agent/completion IDs. Completion IDs use decimal strings to preserve
+all 64 bits in JSON tools. Records trace accepted snapshot counts,
+received agent state changes, completion creation/retirement, acknowledgement
+input/save/restore/retirement, model activity changes and per-renderer flyout
+placement. `completion_flyout` explains `drawn`, `revealing`, `off_page`,
+`acknowledged`, `acknowledgement_retracting`, `activity_missing`,
+`activity_episode_mismatch`, `candidate_excluded`, `no_layout_space` or
+`passive_unavailable`. A `drawn` record means the CPU UI submitted the fully
+revealed card; it is not a GPU/display readback guarantee. Counts and paging
+remain independent of acknowledgement.
+
+For a dismissal that returns after relaunch, retain logs from both launches.
+`dismiss_input` identifies the UI action; `ack_saved` confirms the synchronous
+disk transaction succeeded in that frame. `ack_applied` with `persisted: false`
+means it closed locally after a save error, with retries recorded as
+`ack_saved_retry`. Startup logs include `ack_storage_config`,
+`ack_restore_attempt` and `ack_restore_result` with actual file presence and
+matched/excluded/other-source counts. `ack_restore_source_mismatch` identifies
+another saved coordinator namespace without deleting its entries.
+`ack_restore_excluded` explains each retired saved record as `agent_missing`,
+`agent_not_done`, or `completion_changed_during_restore` (an observed cycle while
+the file was unavailable). `ack_restore_failed` records read/lock/write errors;
+`ack_restore_unavailable` explains disabled storage or unverified identity.
+Matching entries emit `ack_restored` before the scene reaches the renderer.
+Compare build, port, source, full key and episode across the two runs. A missing
+or changed identity is evidence to investigate, not proof that the user dismissed
+another task or that the upstream service is at fault.
+
+State and visibility are logged only when they change; receipt counts are logged
+per accepted snapshot, never per animation frame. A bounded background queue
+keeps file I/O out of rendering and observation callbacks. Overflow/oversized
+records are disclosed through sequence gaps, `dropped_before` and a shutdown
+`diagnostic_loss` total; missing records during reported loss cannot prove an
+upstream fault. Storage failures go to stderr and do not stop observation.
+After an unclean exit the final record may be partial. A new launch separates
+that tail before appending; `launch.data.previous_tail_separated` reports it.
+Preserve the partial evidence and skip the malformed tail when parsing older
+records. Logs contain identity/name/state metadata, not full snapshots, prompts, workspace
+directory details, credentials or RPC bodies. `--tree`, `--check`, help and
+screensaver configuration do not start this completion recorder.
 
 Fresh blocked agents cause a gentle amber node beacon and a repeating circuit/ripple
 inside their surface cluster. This uses full observations even when geometry is

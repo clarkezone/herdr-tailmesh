@@ -222,6 +222,9 @@ impl Renderer {
                 self.ui.draw(root, &view, port);
             }
         });
+        for (key, episode) in self.orb_ui.take_dismissals() {
+            shared.acknowledge(&key, episode);
+        }
         if output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -662,14 +665,47 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    let diagnostics = if options.tree {
+        None
+    } else {
+        match herdr_mesh_visualizer::diagnostics::Diagnostics::start(
+            port,
+            env!("CARGO_BIN_NAME"),
+            match options.mode {
+                Mode::Viewer => "viewer",
+                Mode::Fullscreen => "fullscreen",
+                Mode::Preview(_) => "preview",
+                Mode::Configure(_) => "configure",
+            },
+            "orb",
+        ) {
+            Ok(log) => {
+                eprintln!("Completion diagnostic log: {}", log.path().display());
+                Some(log)
+            }
+            Err(error) => {
+                eprintln!("Cannot start completion diagnostics: {error}");
+                None
+            }
+        }
+    };
     let mut builder = EventLoop::<()>::with_user_event();
     #[cfg(target_os = "windows")]
     let shutdown_requested = std::rc::Rc::new(std::cell::Cell::new(false));
     let event_loop = builder.build()?;
     let proxy = event_loop.create_proxy();
-    let shared = Shared::new(move || {
-        let _ = proxy.send_event(());
-    });
+    let shared = if options.tree {
+        Shared::new(move || {
+            let _ = proxy.send_event(());
+        })
+    } else {
+        Shared::persistent(port, move || {
+            let _ = proxy.send_event(());
+        })
+    };
+    if let Some(log) = &diagnostics {
+        shared.attach_diagnostics(log.clone());
+    }
     let worker_shared = shared.clone();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let worker = std::thread::Builder::new()
@@ -701,6 +737,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let result = event_loop.run_app(&mut app);
     let _ = stop_tx.send(true);
     worker.join().map_err(|_| "observer worker panicked")?;
+    if let Some(log) = &diagnostics {
+        log.event("shutdown", herdr_mesh_visualizer::diagnostics::json!({"event_loop_ok":result.is_ok(), "app_error":app.error}));
+        log.flush();
+    }
     result?;
     if let Some(e) = app.error {
         return Err(e.into());

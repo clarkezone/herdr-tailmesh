@@ -24,13 +24,127 @@ and the Focus control should show only its reticle/brackets.
   to rearm the next completion. Retain it across unchanged snapshots,
   reconnect, renames, freshness aging and geometry/history sampling. Clear it
   on an observed state change, removal or source replacement; a later completion
-  appears again. Dismissals are local to the viewer launch, never mesh mutations.
+  appears again. Dismissals are saved locally across viewer/screensaver launches,
+  scoped additionally to observer port and verified coordinator; never mesh mutations.
 - Show only the checkbox reticle, brackets and checked illumination. Keep the
   Focus hover hint and pointer/Tab/Space/Enter/accessibility semantics.
 - Preserve passive screensaver behavior, independent --tree, observation protocol
   and current persistence/admission/count invariants.
 
 ## Implementation and adversarial review
+
+### Completion visibility under callout overflow
+
+- A worker finishing must receive first-page completion priority even when other
+  Working/Blocked cards fill the viewport. The previous state-priority sort could
+  move its new Completed card to an unseen page while the count rose; no dismissal
+  was involved. A no-input render regression fails before this fix and passes after.
+- Track newly observed completion instances by scoped key plus receive-time token,
+  independently of geometry/history event serials. Put newer completions first;
+  keep that order while Done until acknowledgement/state change. There is no
+  ten-second priority timeout. More cards than fit remain explicitly pageable;
+  later new completions may move earlier completions to another page.
+- Initial observations retain normal ordering; unchanged reconnect, aging and
+  resampling do not promote/replay old completions. Source reset discards local
+  order. Preserve acknowledgement retraction, complete counts, independent Focus,
+  passive page rotation, and --tree. Rendering Working is not required when the
+  receiver reports a changed completion token.
+- Review/test the crowded 1100×600 first page, no input/acknowledgement, the same
+  episode after one minute/reconnect, old history readmission with a newer event
+  serial, and independent explicit dismissal without reducing counts.
+
+### Completion diagnostics follow-up
+
+- The user still reports missing Completed flyouts. Add diagnostics to the open
+  PR #19; do not treat the prior paging fix as proof that all cases are resolved.
+- Default-on Orb JSONL recording covers viewer, screensaver and preview. Include
+  build commit/dirty state, launch/run, wall and monotonic times, ordered sequence,
+  observer port, verified/source identity and full scoped agent/episode key.
+  Record accepted counts, agent state changes, completion creation/retirement,
+  acknowledgement input/restoration/save/retirement, activity changes, and flyout
+  placement or exclusion. Preserve source and renderer boundaries.
+- Explain drawn/revealing, off-page, acknowledged/retracting, missing activity,
+  episode mismatch, candidate exclusion, no layout space and passive unavailability.
+  Keep activity and flyout renderer IDs aligned across multiple windows. Encode
+  opaque completion IDs as decimal strings so JSON tools retain all 64 bits.
+  Separate a previous crash tail before append without deleting its evidence;
+  report that recovery in launch metadata.
+  Record actual clicked input separately from receiver acceptance/stale rejection.
+  Do not assert a CPU draw record proves GPU/display output or upstream fault.
+- Changes only for states/model/visibility; one summary per accepted snapshot.
+  Preserve wake coalescing: diagnostic reads must not consume `Shared::read()`'s
+  wake flag. Keep render/source/dismissal behavior unchanged. Build launcher names
+  use the binary identity, not the screensaver feature shared by both binaries.
+- Use existing platform state roots, 2 MiB × three rotations per port/writer
+  slot, eight separately locked slots, append/reuse across launches and unique run
+  IDs. Close files before rotating on Windows. File writes run on a bounded
+  background queue; disclose dropped/oversized records rather than claiming
+  complete evidence. Failure leaves observation usable. Never record RPC bodies,
+  full snapshots, prompts, credentials or workspace directory details. Keep
+  independent `--tree`, checks/help/configuration free of this recorder.
+- Test actual files: escaping, bounded rotation/restart, concurrent slots, capacity
+  and unavailable storage, actual rotation-write failures, partial-tail recovery,
+  exact maximum-u64 IDs, bounded queue loss/writer failure, receiver transitions
+  and restored/stale acknowledgements, unchanged-state silence and preserved wake
+  flags. Render tests compare diagnostic drawn counts with actual egui headings,
+  distinguish off-page/missing/mismatched/no-space/passive states, and prove twenty
+  identical frames produce no new records. Real pointer dismissal logs exactly
+  one input with the correct key/episode while existing count/Focus checks pass.
+
+### Durable acknowledgement follow-up
+
+- Restart recurrence investigation: log the actual acknowledgement-file presence,
+  restore attempts/results, other coordinator namespaces, and per-record
+  exclusion/retirement reasons. Distinguish absent scoped agent, non-Done state,
+  and a completion cycle received during delayed restoration. Keep synchronous
+  click saving and existing identity/membership semantics; no speculative relaxation
+  of incarnation or completion identity. Tests use real files across independent
+  receiver instances and explain missing files, source mismatch, absent/non-Done
+  membership, lock contention and a received cycle during that contention.
+- Review keeps restoration metadata inside the same locked disk transaction;
+  file presence comes from opening the file rather than a separate existence
+  check. Other namespaces are counted without changing their entries. Index
+  received agent states once when explaining exclusions, avoiding repeated full
+  tree scans. Report disk retirement only after the transaction succeeds.
+- Review also found locally preserved input could be logged as `ack_restored`
+  during a delayed startup load. Emit that event only for records actually read
+  from disk; local preservation and a successful later save have separate events.
+  A locked-file regression verifies this distinction and the pending save retry.
+
+- Save each explicit × acknowledgement immediately, before app exit. Restore
+  matching Done membership before publishing the first scene, so dismissed cards
+  cannot flash back or consume pagination/hit masks. Undismissed Completed cards
+  remain visible, including startup. Share acknowledgements with passive Orb
+  launchers; preserve the independent `--tree` path.
+- Keep a bounded, versioned local protobuf file with identity keys and episode
+  IDs only. Use platform user state directories, per-port files, and verified
+  coordinator namespaces. Randomly seed new launch counters; restore saved IDs
+  only for acknowledged Done agents. Labels/freshness/heartbeat changes do not
+  alter acknowledgement lifetime.
+- Accept UI dismissal commands after frame generation and revalidate the clicked
+  episode under the receiver mutex. A stale click cannot dismiss a newer instance.
+  Retire saved acknowledgement on every accepted non-Done/removal, including when
+  the UI is hidden or Working/Done coalesce; retry temporary save/retirement
+  failures on accepted observations. Mismatching pending IDs never hide new cards.
+  If startup load is delayed, restrict restoration to episodes that stayed Done
+  throughout that delay, so a received cycle cannot inherit an old dismissal.
+- Merge writers using a separate nonblocking lock file. Compare IDs when retiring
+  so an older viewer cannot erase a newer saved acknowledgement. Sync a temporary
+  file in the same directory and [atomically replace](https://docs.rs/tempfile/3.27.0/tempfile/struct.NamedTempFile.html#method.persist)
+  the destination. Bound the file to 8 MiB / 8,000 acknowledgements; reject invalid,
+  duplicate or future-format data without overwriting it. Report real storage
+  failures and keep observations usable. Ordinary restart is tested; power-loss
+  durability and native Windows/macOS graphical acceptance are separate concerns.
+- The observer has no durable per-task completion identity. A Done→Working→Done
+  cycle entirely while the viewer is closed cannot be distinguished from unchanged
+  Done on restart. Preserve the explicit acknowledgement until a state change is
+  actually received; do not infer new tasks from timestamps or metadata.
+- Adversarial checks cover real storage reload, early Working retirement before
+  closing, renderer coalescing, stale clicks, independent agents/ports/coordinators,
+  startup removal, atomic overwrite, writer merge/conditional retirement, locked
+  storage retries and corrupt/oversized/future data. Render tests check first-frame
+  suppression in interactive/passive Orb, counts/pagination and real pointer
+  forwarding without changing retraction or Focus.
 
 - Separate overlay placement, hierarchy rendering and projected-name rendering;
   projected names cannot sit after a compact-panel early return. Choose a free
@@ -64,8 +178,8 @@ and the Focus control should show only its reticle/brackets.
 
 ## Validation
 
-Formatting, strict screensaver-feature all-target clippy and 105 distinct portable
-Rust tests passed (190 executions across viewer/screensaver launchers; optional
+Formatting, strict screensaver-feature all-target clippy and 125 distinct portable
+Rust tests passed (213 executions across viewer/screensaver launchers; optional
 GPU readback excluded). Optimized Linux builds passed for both launchers.
 
 Native Linux synthetic-observer inspection at 1100×600 confirmed projected names
@@ -75,6 +189,43 @@ retracted and left pagination while the fleet retained four Completed agents and
 Focus stayed active. K hiding relocated the hierarchy without losing labels;
 Escape returned to the fleet and the viewer closed cleanly. The temporary native
 fixture and screenshots are not shipped.
+
+The durable follow-up's final optimized build was also checked through an actual
+close/relaunch using isolated user storage and the same synthetic observer port.
+Dismissing one of four completions saved its acknowledgement immediately. After
+relaunch, that card stayed hidden, the three independent cards remained visible,
+and the fleet still counted four Completed agents. Back-to-back Working/Done
+then restored its new completion and pagination. Both windows closed cleanly.
+
+The overflow follow-up was checked in an optimized native 1100×600 window with
+twelve Working callouts and no keyboard/mouse input. Completing two agents put
+both Completed banners on the first page, alongside a remaining Working card;
+the fleet showed ten Working and two Completed, with all twelve callouts retained.
+Both completion banners remained visible twelve seconds later, and no dismissal
+file was created. The temporary synthetic fixture and screenshots are not shipped.
+
+The diagnostics follow-up passed real-file rotation/restart/concurrent writer,
+queue overflow/disconnect, actual rotation-write failure, crash-tail separation
+and maximum-u64 identity checks. Receiver logs follow state/episode creation,
+saved/restored/retired acknowledgements and stale click rejection without
+consuming UI wakes. Render logs match actual egui completion headings, explain
+hidden states, align model/flyout renderer IDs and remain silent across twenty
+unchanged frames. Actual pointer input logs one matching key/token.
+
+Optimized native synthetic-observer inspection recorded both independent
+completions through receipt, model and drawn-flyout stages among twelve callouts,
+with both banners retained twelve seconds later, no dismissal input/file or
+reported diagnostic loss, and a clean shutdown record. Temporary fixtures/logs
+and captures are not shipped. This validates instrumentation on that synthetic
+case; the user's latest missing flyout remains unexplained until captured.
+
+Restart diagnostics were exercised through native UI dismissal and two separate
+viewer processes, isolated user storage and one continuously running synthetic
+observer. The log confirmed immediate `ack_saved`, first-snapshot `ack_restored`
+with the same full key/episode, three visible cards/four counted agents on relaunch,
+and a new drawn completion after received Working/Done. Both runs shut down
+cleanly without reported loss or storage failures. This did not reproduce the
+user's reported recurrence; retain both launches' logs to identify its cause.
 
 Cross-platform compilation/tests, wire contract and packaging are checked in PR
 CI. Native Windows/macOS graphical and mixed-DPI acceptance remain manual.
