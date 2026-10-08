@@ -78,6 +78,7 @@ impl OrbUi {
         let generation = self.sim.source_generation;
         self.sim.update(view, wall_now(), clock);
         if self.sim.source_generation != generation {
+            view.diagnostic("panels_source_reset", herdr_mesh_visualizer::diagnostics::json!({"source_generation":self.sim.source_generation}));
             self.selected = None;
             self.panels.reset_source();
             self.focus.reset();
@@ -91,6 +92,8 @@ impl OrbUi {
             self.selected = None;
         }
         if passive && (!view.live || view.scene.is_none()) {
+            self.panels
+                .trace_unavailable(&self.sim, view, passive, root.max_rect());
             self.selected = None;
             self.panels.projects = false;
             self.panels.focus = None;

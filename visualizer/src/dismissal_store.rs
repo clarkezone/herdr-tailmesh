@@ -33,33 +33,36 @@ struct Record {
     #[prost(uint64, tag = "3")]
     episode: u64,
 }
+pub(crate) fn user_state_directory() -> io::Result<PathBuf> {
+    fn env(name: &str) -> Option<PathBuf> {
+        std::env::var_os(name)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    }
+    #[cfg(target_os = "windows")]
+    let root = env("LOCALAPPDATA");
+    #[cfg(target_os = "macos")]
+    let root = env("HOME").map(|p| p.join("Library/Application Support"));
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let root = env("XDG_STATE_HOME")
+        .filter(|p| p.is_absolute())
+        .or_else(|| env("HOME").map(|p| p.join(".local/state")));
+    let root = root.filter(|p| p.is_absolute()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "User state directory is unavailable",
+        )
+    })?;
+    Ok(root.join("herdr-mesh-visualizer"))
+}
+
 impl Store {
     pub(crate) fn at(path: PathBuf) -> Self {
         Self { path }
     }
     pub(crate) fn for_port(port: u16) -> io::Result<Self> {
-        fn env(name: &str) -> Option<PathBuf> {
-            std::env::var_os(name)
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-        }
-        #[cfg(target_os = "windows")]
-        let root = env("LOCALAPPDATA");
-        #[cfg(target_os = "macos")]
-        let root = env("HOME").map(|p| p.join("Library/Application Support"));
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let root = env("XDG_STATE_HOME")
-            .filter(|p| p.is_absolute())
-            .or_else(|| env("HOME").map(|p| p.join(".local/state")));
-        let root = root.filter(|p| p.is_absolute()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "User state directory is unavailable",
-            )
-        })?;
         Ok(Self::at(
-            root.join("herdr-mesh-visualizer")
-                .join(format!("dismissals-{port}.bin")),
+            user_state_directory()?.join(format!("dismissals-{port}.bin")),
         ))
     }
     fn read(&self) -> io::Result<Saved> {

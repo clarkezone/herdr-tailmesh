@@ -1,4 +1,5 @@
 pub mod client;
+pub mod diagnostics;
 mod dismissal_store;
 pub mod heartbeat;
 pub mod projection;

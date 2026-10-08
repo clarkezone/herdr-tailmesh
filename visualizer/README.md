@@ -71,6 +71,50 @@ are reported in the interactive viewer and logs; observation continues. Delete
 this file while viewers are closed to reset acknowledgements. `--tree` does not
 read or write this state. Native Windows/macOS restart acceptance remains manual.
 
+Orb automatically records completion diagnostics, including Windows screensaver
+and preview launches. No flag or `RUST_LOG` setting is needed. Logs are JSON Lines
+under the same user state root as acknowledgements, in
+`herdr-mesh-visualizer/logs/`:
+
+| Platform | Default directory |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\herdr-mesh-visualizer\logs` |
+| macOS | `~/Library/Application Support/herdr-mesh-visualizer/logs` |
+| Linux | `$XDG_STATE_HOME/herdr-mesh-visualizer/logs`, otherwise `~/.local/state/herdr-mesh-visualizer/logs` |
+
+The current file is `completion-<port>-<slot>.jsonl`; `.1.jsonl` and `.2.jsonl`
+are its older rotations. Each file is capped at 2 MiB. Eight independently locked
+slots support concurrent processes without sharing a writer or deleting an active
+process's log. A launch reuses the first free slot and appends to its previous log;
+the run ID separates launches. The terminal prints the actual current path.
+For a missing banner, retain the matching port's current and rotated files soon
+after the event, together with the approximate time and agent name.
+
+Records identify the build commit/dirty state, run, timestamp, sequence, port,
+coordinator and scoped agent/completion IDs. Completion IDs use decimal strings to preserve
+all 64 bits in JSON tools. Records trace accepted snapshot counts,
+received agent state changes, completion creation/retirement, acknowledgement
+input/save/restore/retirement, model activity changes and per-renderer flyout
+placement. `completion_flyout` explains `drawn`, `revealing`, `off_page`,
+`acknowledged`, `acknowledgement_retracting`, `activity_missing`,
+`activity_episode_mismatch`, `candidate_excluded`, `no_layout_space` or
+`passive_unavailable`. A `drawn` record means the CPU UI submitted the fully
+revealed card; it is not a GPU/display readback guarantee. Counts and paging
+remain independent of acknowledgement.
+
+State and visibility are logged only when they change; receipt counts are logged
+per accepted snapshot, never per animation frame. A bounded background queue
+keeps file I/O out of rendering and observation callbacks. Overflow/oversized
+records are disclosed through sequence gaps, `dropped_before` and a shutdown
+`diagnostic_loss` total; missing records during reported loss cannot prove an
+upstream fault. Storage failures go to stderr and do not stop observation.
+After an unclean exit the final record may be partial. A new launch separates
+that tail before appending; `launch.data.previous_tail_separated` reports it.
+Preserve the partial evidence and skip the malformed tail when parsing older
+records. Logs contain identity/name/state metadata, not full snapshots, prompts, workspace
+directory details, credentials or RPC bodies. `--tree`, `--check`, help and
+screensaver configuration do not start this completion recorder.
+
 Fresh blocked agents cause a gentle amber node beacon and a repeating circuit/ripple
 inside their surface cluster. This uses full observations even when geometry is
 sampled, ages with inventory freshness, and remains separate from receipt heartbeat

@@ -1,4 +1,5 @@
 use crate::{
+    diagnostics::{Diagnostics, Value, json},
     dismissal_store::Store,
     pb::local_observer_client::LocalObserverClient,
     projection::{Branch, Key, Scene, coordinator, project},
@@ -31,6 +32,7 @@ pub struct View {
     pub acknowledged_completions: Arc<BTreeMap<Key, u64>>,
     pub acknowledgement_revision: u64,
     pub persistence_error: Option<String>,
+    pub diagnostics: Option<Arc<Diagnostics>>,
 }
 impl Default for View {
     fn default() -> Self {
@@ -46,7 +48,89 @@ impl Default for View {
             acknowledged_completions: Default::default(),
             acknowledgement_revision: 0,
             persistence_error: None,
+            diagnostics: None,
         }
+    }
+}
+impl View {
+    pub fn diagnostic(&self, event: &str, mut data: Value) {
+        if let Some(log) = &self.diagnostics {
+            data["epoch"] = json!(self.epoch);
+            data["revision"] = json!(self.revision);
+            data["source"] = json!(
+                self.scene
+                    .as_ref()
+                    .and_then(|s| s.coordinator.as_ref())
+                    .map(|c| &c.key)
+            );
+            log.event(event, data);
+        }
+    }
+    fn trace_receipt(&self, previous: &View, agents: &mut BTreeMap<Key, String>) {
+        fn collect(branch: &Branch, agents: &mut BTreeMap<Key, (String, String)>) {
+            if branch.kind == "agent" {
+                agents.insert(
+                    branch.key.clone(),
+                    (branch.status.clone(), branch.label.clone()),
+                );
+            }
+            for child in &branch.children {
+                collect(child, agents);
+            }
+        }
+        let old_source = previous
+            .scene
+            .as_ref()
+            .and_then(|s| s.coordinator.as_ref())
+            .map(|c| &c.key);
+        let source = self
+            .scene
+            .as_ref()
+            .and_then(|s| s.coordinator.as_ref())
+            .map(|c| &c.key);
+        if old_source != source {
+            self.diagnostic("source_changed", json!({"previous_source":old_source}));
+            agents.clear();
+        }
+        let mut current = BTreeMap::new();
+        if let Some(scene) = &self.scene {
+            for node in &scene.nodes {
+                collect(node, &mut current);
+            }
+            self.diagnostic("snapshot_accepted", json!({
+                "observed_seconds":scene.observed_at.seconds, "observed_nanos":scene.observed_at.nanos,
+                "nodes":scene.nodes.len(), "agents":current.len(),
+                "completed":self.completion_episodes.len(), "working":scene.working, "blocked":scene.blocked,
+            }));
+        }
+        for (key, (state, label)) in &current {
+            if agents.get(key) != Some(state) {
+                self.diagnostic(
+                    "agent_state",
+                    json!({
+                        "key":key, "label":label, "previous_state":agents.get(key), "state":state,
+                        "episode":self.completion_episodes.get(key),
+                    }),
+                );
+            }
+        }
+        for (key, state) in agents.iter().filter(|(key, _)| !current.contains_key(*key)) {
+            self.diagnostic("agent_removed", json!({"key":key, "previous_state":state}));
+        }
+        for (key, episode) in previous.completion_episodes.iter() {
+            if old_source != source || self.completion_episodes.get(key) != Some(episode) {
+                self.diagnostic(
+                    "completion_retired",
+                    json!({"key":key, "episode":episode, "previous_source":old_source}),
+                );
+            }
+        }
+        for (key, episode) in self.completion_episodes.iter() {
+            if old_source != source || previous.completion_episodes.get(key) != Some(episode) {
+                self.diagnostic("completion_created", json!({"key":key, "episode":episode}));
+            }
+        }
+        *agents = current.into_iter().map(|(k, (s, _))| (k, s)).collect();
     }
 }
 pub struct Shared {
@@ -62,6 +146,7 @@ struct Received {
     restored_source: Option<Key>,
     restore_candidates: BTreeMap<Key, u64>,
     unsaved_acknowledgements: BTreeMap<Key, u64>,
+    diagnostic_agents: BTreeMap<Key, String>,
 }
 fn verified_source(view: &View) -> Option<Key> {
     view.scene
@@ -75,6 +160,7 @@ fn storage_error(view: &mut View, error: impl std::fmt::Display) {
     let message = format!("Completion dismissals could not be saved/restored: {error}");
     if view.persistence_error.as_ref() != Some(&message) {
         log::warn!("{message}");
+        view.diagnostic("ack_storage_error", json!({"error":message}));
     }
     view.persistence_error = Some(message);
 }
@@ -137,6 +223,13 @@ impl Shared {
         self.wake_pending.store(false, Ordering::Release);
         self.received.lock().unwrap().view.clone()
     }
+    pub fn attach_diagnostics(&self, diagnostics: Arc<Diagnostics>) {
+        self.received.lock().unwrap().view.diagnostics = Some(diagnostics);
+    }
+    fn diagnostic(&self, event: &str, data: Value) {
+        // Instrumentation must not consume the UI wake_pending flag via read().
+        self.received.lock().unwrap().view.diagnostic(event, data);
+    }
     fn update(&self, f: impl FnOnce(&mut View)) {
         {
             let mut received = self.received.lock().unwrap();
@@ -146,7 +239,9 @@ impl Shared {
                 restored_source,
                 restore_candidates,
                 unsaved_acknowledgements,
+                diagnostic_agents,
             } = &mut *received;
+            let diagnostic_previous = view.diagnostics.as_ref().map(|_| view.clone());
             let revision = view.revision;
             let previous_verified_source = verified_source(view);
             let source = view
@@ -188,6 +283,10 @@ impl Shared {
                                 // Restore only actual Done membership, before the first UI frame.
                                 for (key, id) in &acknowledged {
                                     current.insert(key.clone(), *id);
+                                    view.diagnostic(
+                                        "ack_restored",
+                                        json!({"key":key, "episode":id}),
+                                    );
                                 }
                                 view.acknowledged_completions = Arc::new(acknowledged);
                                 view.acknowledgement_revision =
@@ -223,6 +322,9 @@ impl Shared {
                         // Mismatching IDs never suppress cards. Keep failed retirements
                         // pending here so later accepted snapshots retry the disk update.
                         if saved {
+                            for (key, id) in &retired {
+                                view.diagnostic("ack_retired", json!({"key":key, "episode":id}));
+                            }
                             Arc::make_mut(&mut view.acknowledged_completions)
                                 .retain(|key, _| !retired.contains_key(key));
                             view.acknowledgement_revision =
@@ -236,6 +338,10 @@ impl Shared {
                         match store.acknowledge(source, key, *id) {
                             Ok(()) => {
                                 view.persistence_error = None;
+                                view.diagnostic(
+                                    "ack_saved_retry",
+                                    json!({"key":key, "episode":id}),
+                                );
                                 false
                             }
                             Err(error) => {
@@ -247,6 +353,9 @@ impl Shared {
                 }
                 // Keep only current completions; Working/removal retires the prior episode.
                 view.completion_episodes = Arc::new(current);
+                if let Some(previous) = &diagnostic_previous {
+                    view.trace_receipt(previous, diagnostic_agents);
+                }
             }
         }
         if !self.wake_pending.swap(true, Ordering::AcqRel) {
@@ -257,12 +366,17 @@ impl Shared {
     pub fn acknowledge(&self, key: &Key, episode: u64) -> bool {
         let mut received = self.received.lock().unwrap();
         let view = &mut received.view;
+        view.diagnostic("ack_requested", json!({"key":key, "episode":episode}));
         if view.completion_episodes.get(key) != Some(&episode) {
+            view.diagnostic("ack_rejected_stale", json!({"key":key, "episode":episode, "current_episode":view.completion_episodes.get(key)}));
             return false;
         }
         if let (Some(store), Some(source)) = (&self.store, verified_source(view)) {
             match store.acknowledge(&source, key, episode) {
-                Ok(()) => view.persistence_error = None,
+                Ok(()) => {
+                    view.persistence_error = None;
+                    view.diagnostic("ack_saved", json!({"key":key, "episode":episode}));
+                }
                 Err(error) => {
                     storage_error(view, error);
                     received
@@ -279,6 +393,7 @@ impl Shared {
         let view = &mut received.view;
         Arc::make_mut(&mut view.acknowledged_completions).insert(key.clone(), episode);
         view.acknowledgement_revision = view.acknowledgement_revision.wrapping_add(1);
+        view.diagnostic("ack_applied", json!({"key":key, "episode":episode, "persisted":view.persistence_error.is_none() && self.store.is_some()}));
         drop(received);
         if !self.wake_pending.swap(true, Ordering::AcqRel) {
             (self.wake)();
@@ -337,6 +452,10 @@ fn rpc_error(code: Code) -> String {
     .into()
 }
 async fn observe(port: u16, shared: &Shared) -> Result<(), String> {
+    shared.diagnostic(
+        "connect_attempt",
+        json!({"endpoint":format!("127.0.0.1:{port}")}),
+    );
     let (mut client, info) = connect(port).await?;
     shared.update(|v| {
         v.daemon = crate::projection::label(&info.daemon_name);
@@ -344,6 +463,7 @@ async fn observe(port: u16, shared: &Shared) -> Result<(), String> {
         v.live = false;
         v.status = "Local daemon connected; waiting for mesh snapshot…".into();
     });
+    shared.diagnostic("connected", json!({"api_version":info.api_version, "daemon":crate::projection::label(&info.daemon_name), "handshake_source":info.coordinator.as_ref().map(|c| crate::projection::label(&c.instance_id))}));
     let mut request = Request::new(());
     request.set_timeout(Duration::from_secs(270));
     let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, client.watch_nodes(request))
@@ -364,6 +484,10 @@ async fn observe(port: u16, shared: &Shared) -> Result<(), String> {
             .map_err(|e| rpc_error(e.code()))?
             .ok_or_else(|| "Observation stream ended; reconnecting".to_string())?;
         let mut scene = project(snapshot).map_err(|_| {
+            shared.diagnostic(
+                "snapshot_rejected",
+                json!({"reason":"invalid replacement snapshot"}),
+            );
             "Invalid replacement snapshot — retaining last good observations".to_string()
         })?;
         scene.coordinator = Some(coordinator(info.coordinator.as_ref()));
@@ -385,7 +509,10 @@ pub async fn run(port: u16, shared: Arc<Shared>, mut shutdown: watch::Receiver<b
         let started = Instant::now();
         let result = tokio::select! {
             result=observe(port,&shared)=>result,
-            _=shutdown.changed()=>return,
+            _=shutdown.changed()=>{
+                shared.diagnostic("observer_stopped", json!({}));
+                return;
+            },
         };
         shared.update(|v| {
             v.live = false;
@@ -393,6 +520,13 @@ pub async fn run(port: u16, shared: Arc<Shared>, mut shutdown: watch::Receiver<b
         });
         if started.elapsed() > Duration::from_secs(10) {
             delay = 1;
+        }
+        {
+            let received = shared.received.lock().unwrap();
+            received.view.diagnostic(
+                "disconnected",
+                json!({"reason":received.view.status, "retry_seconds":delay}),
+            );
         }
         tokio::select! { _=tokio::time::sleep(Duration::from_secs(delay))=>{}, _=shutdown.changed()=>return }
         delay = (delay * 2).min(8);
@@ -456,6 +590,92 @@ mod tests {
             view.revision += 1;
             view.live = true;
         });
+    }
+    #[test]
+    fn diagnostics_follow_received_episodes_ack_restore_and_retirement_without_consuming_wakes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Diagnostics::at(&dir.path().join("logs"), 8790).unwrap();
+        let store = Store::at(dir.path().join("ack.bin"));
+        let first = Shared::with_store(|| {}, Some(store.clone()), 100);
+        first.attach_diagnostics(log.clone());
+        accept(&first, scene("working", "source"));
+        assert!(first.wake_pending.load(Ordering::Relaxed));
+        first.diagnostic("connected", json!({}));
+        assert!(
+            first.wake_pending.load(Ordering::Relaxed),
+            "logging must not consume UI wakeups"
+        );
+        accept(&first, scene("done", "source"));
+        let completed = first.read();
+        let key = completed
+            .completion_episodes
+            .keys()
+            .find(|k| k[1] == "node")
+            .unwrap()
+            .clone();
+        let episode = completed.completion_episodes[&key];
+        assert!(first.acknowledge(&key, episode));
+        let second = Shared::with_store(|| {}, Some(store), 200);
+        second.attach_diagnostics(log.clone());
+        accept(&second, scene("done", "source"));
+        assert_eq!(second.read().acknowledged_completions[&key], episode);
+        accept(&second, scene("working", "source"));
+        accept(&second, scene("done", "source"));
+        assert!(!second.acknowledge(&key, episode));
+        let latest = second.read().completion_episodes[&key];
+        log.flush();
+        let records: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        let agent_events: Vec<_> = records
+            .iter()
+            .filter(|r| r["data"]["key"] == json!(key))
+            .collect();
+        for name in [
+            "agent_state",
+            "completion_created",
+            "ack_requested",
+            "ack_saved",
+            "ack_applied",
+            "ack_restored",
+            "completion_retired",
+            "ack_retired",
+            "ack_rejected_stale",
+        ] {
+            assert!(
+                agent_events.iter().any(|r| r["event"] == name),
+                "missing {name}"
+            );
+        }
+        assert!(agent_events.iter().any(|r| {
+            r["event"] == "completion_created"
+                && r["data"]["episode"]
+                    .as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    == Some(latest)
+        }));
+        assert!(
+            agent_events
+                .iter()
+                .all(|r| r["data"]["source"] == json!(["coordinator", "source"]))
+        );
+        let state_events = agent_events
+            .iter()
+            .filter(|r| r["event"] == "agent_state")
+            .count();
+        accept(&second, scene("done", "source"));
+        log.flush();
+        let unchanged = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(
+            unchanged
+                .lines()
+                .map(|s| serde_json::from_str::<Value>(s).unwrap())
+                .filter(|r| r["event"] == "agent_state" && r["data"]["key"] == json!(key))
+                .count(),
+            state_events
+        );
     }
     #[test]
     fn completion_instances_advance_even_when_ui_never_reads_the_working_snapshot() {

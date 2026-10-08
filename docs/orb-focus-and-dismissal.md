@@ -53,6 +53,44 @@ and the Focus control should show only its reticle/brackets.
   episode after one minute/reconnect, old history readmission with a newer event
   serial, and independent explicit dismissal without reducing counts.
 
+### Completion diagnostics follow-up
+
+- The user still reports missing Completed flyouts. Add diagnostics to the open
+  PR #19; do not treat the prior paging fix as proof that all cases are resolved.
+- Default-on Orb JSONL recording covers viewer, screensaver and preview. Include
+  build commit/dirty state, launch/run, wall and monotonic times, ordered sequence,
+  observer port, verified/source identity and full scoped agent/episode key.
+  Record accepted counts, agent state changes, completion creation/retirement,
+  acknowledgement input/restoration/save/retirement, activity changes, and flyout
+  placement or exclusion. Preserve source and renderer boundaries.
+- Explain drawn/revealing, off-page, acknowledged/retracting, missing activity,
+  episode mismatch, candidate exclusion, no layout space and passive unavailability.
+  Keep activity and flyout renderer IDs aligned across multiple windows. Encode
+  opaque completion IDs as decimal strings so JSON tools retain all 64 bits.
+  Separate a previous crash tail before append without deleting its evidence;
+  report that recovery in launch metadata.
+  Record actual clicked input separately from receiver acceptance/stale rejection.
+  Do not assert a CPU draw record proves GPU/display output or upstream fault.
+- Changes only for states/model/visibility; one summary per accepted snapshot.
+  Preserve wake coalescing: diagnostic reads must not consume `Shared::read()`'s
+  wake flag. Keep render/source/dismissal behavior unchanged. Build launcher names
+  use the binary identity, not the screensaver feature shared by both binaries.
+- Use existing platform state roots, 2 MiB × three rotations per port/writer
+  slot, eight separately locked slots, append/reuse across launches and unique run
+  IDs. Close files before rotating on Windows. File writes run on a bounded
+  background queue; disclose dropped/oversized records rather than claiming
+  complete evidence. Failure leaves observation usable. Never record RPC bodies,
+  full snapshots, prompts, credentials or workspace directory details. Keep
+  independent `--tree`, checks/help/configuration free of this recorder.
+- Test actual files: escaping, bounded rotation/restart, concurrent slots, capacity
+  and unavailable storage, actual rotation-write failures, partial-tail recovery,
+  exact maximum-u64 IDs, bounded queue loss/writer failure, receiver transitions
+  and restored/stale acknowledgements, unchanged-state silence and preserved wake
+  flags. Render tests compare diagnostic drawn counts with actual egui headings,
+  distinguish off-page/missing/mismatched/no-space/passive states, and prove twenty
+  identical frames produce no new records. Real pointer dismissal logs exactly
+  one input with the correct key/episode while existing count/Focus checks pass.
+
 ### Durable acknowledgement follow-up
 
 - Save each explicit × acknowledgement immediately, before app exit. Restore
@@ -122,8 +160,8 @@ and the Focus control should show only its reticle/brackets.
 
 ## Validation
 
-Formatting, strict screensaver-feature all-target clippy and 115 distinct portable
-Rust tests passed (202 executions across viewer/screensaver launchers; optional
+Formatting, strict screensaver-feature all-target clippy and 123 distinct portable
+Rust tests passed (211 executions across viewer/screensaver launchers; optional
 GPU readback excluded). Optimized Linux builds passed for both launchers.
 
 Native Linux synthetic-observer inspection at 1100×600 confirmed projected names
@@ -147,6 +185,21 @@ both Completed banners on the first page, alongside a remaining Working card;
 the fleet showed ten Working and two Completed, with all twelve callouts retained.
 Both completion banners remained visible twelve seconds later, and no dismissal
 file was created. The temporary synthetic fixture and screenshots are not shipped.
+
+The diagnostics follow-up passed real-file rotation/restart/concurrent writer,
+queue overflow/disconnect, actual rotation-write failure, crash-tail separation
+and maximum-u64 identity checks. Receiver logs follow state/episode creation,
+saved/restored/retired acknowledgements and stale click rejection without
+consuming UI wakes. Render logs match actual egui completion headings, explain
+hidden states, align model/flyout renderer IDs and remain silent across twenty
+unchanged frames. Actual pointer input logs one matching key/token.
+
+Optimized native synthetic-observer inspection recorded both independent
+completions through receipt, model and drawn-flyout stages among twelve callouts,
+with both banners retained twelve seconds later, no dismissal input/file or
+reported diagnostic loss, and a clean shutdown record. Temporary fixtures/logs
+and captures are not shipped. This validates instrumentation on that synthetic
+case; the user's latest missing flyout remains unexplained until captured.
 
 Cross-platform compilation/tests, wire contract and packaging are checked in PR
 CI. Native Windows/macOS graphical and mixed-DPI acceptance remain manual.
