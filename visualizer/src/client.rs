@@ -156,6 +156,25 @@ fn verified_source(view: &View) -> Option<Key> {
         .filter(|c| c.status == "verified upstream identity")
         .map(|c| c.key.clone())
 }
+fn observed_agent_statuses(view: &View) -> BTreeMap<&Key, &str> {
+    fn collect<'a>(branch: &'a Branch, states: &mut BTreeMap<&'a Key, &'a str>) {
+        if branch.kind == "agent" {
+            states.insert(&branch.key, &branch.status);
+        }
+        for child in &branch.children {
+            collect(child, states);
+        }
+    }
+    let mut states = BTreeMap::new();
+    if view.diagnostics.is_some()
+        && let Some(scene) = &view.scene
+    {
+        for node in &scene.nodes {
+            collect(node, &mut states);
+        }
+    }
+    states
+}
 fn storage_error(view: &mut View, error: impl std::fmt::Display) {
     let message = format!("Completion dismissals could not be saved/restored: {error}");
     if view.persistence_error.as_ref() != Some(&message) {
@@ -224,7 +243,14 @@ impl Shared {
         self.received.lock().unwrap().view.clone()
     }
     pub fn attach_diagnostics(&self, diagnostics: Arc<Diagnostics>) {
-        self.received.lock().unwrap().view.diagnostics = Some(diagnostics);
+        let mut received = self.received.lock().unwrap();
+        received.view.diagnostics = Some(diagnostics);
+        received.view.diagnostic(
+            "ack_storage_config",
+            json!({
+                "enabled":self.store.is_some(), "error":received.view.persistence_error,
+            }),
+        );
     }
     fn diagnostic(&self, event: &str, data: Value) {
         // Instrumentation must not consume the UI wake_pending flag via read().
@@ -260,6 +286,13 @@ impl Shared {
                     }
                 }
                 let source = verified_source(view);
+                if (source.is_none() || self.store.is_none())
+                    && (revision == 0 || source != previous_verified_source)
+                {
+                    view.diagnostic("ack_restore_unavailable", json!({
+                        "reason":if self.store.is_none() { "storage_unavailable" } else { "no_verified_source" },
+                    }));
+                }
                 if source != previous_verified_source {
                     // Retrying a failed load must not restore a completion that
                     // left Done while storage was unavailable.
@@ -272,8 +305,50 @@ impl Shared {
                 }
                 if source != *restored_source {
                     if let (Some(store), Some(source)) = (&self.store, &source) {
+                        view.diagnostic(
+                            "ack_restore_attempt",
+                            json!({"candidates":restore_candidates.len()}),
+                        );
                         match store.restore(source, restore_candidates) {
-                            Ok(mut acknowledged) => {
+                            Ok(restoration) => {
+                                view.diagnostic("ack_restore_result", json!({
+                                    "file_present":restoration.file_present,
+                                    "matched":restoration.acknowledged.len(),
+                                    "excluded":restoration.excluded.len(),
+                                    "other_source_records":restoration.other_sources.values().sum::<usize>(),
+                                }));
+                                for (saved_source, records) in &restoration.other_sources {
+                                    view.diagnostic(
+                                        "ack_restore_source_mismatch",
+                                        json!({
+                                            "saved_source":saved_source, "records":records,
+                                        }),
+                                    );
+                                }
+                                let states = observed_agent_statuses(view);
+                                for (key, id) in &restoration.excluded {
+                                    let state = states.get(key).copied();
+                                    view.diagnostic(
+                                        "ack_restore_excluded",
+                                        json!({
+                                            "key":key, "episode":id, "state":state,
+                                            "current_episode":current.get(key),
+                                            "reason":match state {
+                                                None => "agent_missing",
+                                                Some("done") => "completion_changed_during_restore",
+                                                Some(_) => "agent_not_done",
+                                            },
+                                            "retired_from_disk":true,
+                                        }),
+                                    );
+                                }
+                                let mut acknowledged = restoration.acknowledged;
+                                for (key, id) in &acknowledged {
+                                    view.diagnostic(
+                                        "ack_restored",
+                                        json!({"key":key, "episode":id}),
+                                    );
+                                }
                                 // Preserve explicit local input during a temporary load failure.
                                 for (key, id) in view.acknowledged_completions.iter() {
                                     if current.get(key) == Some(id) {
@@ -283,10 +358,6 @@ impl Shared {
                                 // Restore only actual Done membership, before the first UI frame.
                                 for (key, id) in &acknowledged {
                                     current.insert(key.clone(), *id);
-                                    view.diagnostic(
-                                        "ack_restored",
-                                        json!({"key":key, "episode":id}),
-                                    );
                                 }
                                 view.acknowledged_completions = Arc::new(acknowledged);
                                 view.acknowledgement_revision =
@@ -295,7 +366,10 @@ impl Shared {
                                 *restored_source = Some(source.clone());
                                 restore_candidates.clear();
                             }
-                            Err(error) => storage_error(view, error),
+                            Err(error) => {
+                                view.diagnostic("ack_restore_failed", json!({"error_kind":format!("{:?}",error.kind()), "error":error.to_string()}));
+                                storage_error(view, error);
+                            }
                         }
                     } else {
                         *restored_source = source.clone();
@@ -322,8 +396,9 @@ impl Shared {
                         // Mismatching IDs never suppress cards. Keep failed retirements
                         // pending here so later accepted snapshots retry the disk update.
                         if saved {
+                            let states = observed_agent_statuses(view);
                             for (key, id) in &retired {
-                                view.diagnostic("ack_retired", json!({"key":key, "episode":id}));
+                                view.diagnostic("ack_retired", json!({"key":key, "episode":id, "state":states.get(key), "current_episode":current.get(key)}));
                             }
                             Arc::make_mut(&mut view.acknowledged_completions)
                                 .retain(|key, _| !retired.contains_key(key));
@@ -675,6 +750,194 @@ mod tests {
                 .filter(|r| r["event"] == "agent_state" && r["data"]["key"] == json!(key))
                 .count(),
             state_events
+        );
+    }
+    #[test]
+    fn local_input_preserved_during_failed_startup_load_is_not_logged_as_disk_restoration() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Diagnostics::at(&dir.path().join("logs"), 8790).unwrap();
+        let path = dir.path().join("ack.bin");
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let shared = Shared::with_store(|| {}, Some(Store::at(path)), 100);
+        shared.attach_diagnostics(log.clone());
+        accept(&shared, scene("done", "source"));
+        let view = shared.read();
+        let key = view.completion_episodes.keys().next().unwrap().clone();
+        let episode = view.completion_episodes[&key];
+        assert!(shared.acknowledge(&key, episode));
+        assert!(shared.read().persistence_error.is_some());
+        drop(lock);
+        accept(&shared, scene("done", "source"));
+        let saved = shared.read();
+        assert_eq!(saved.acknowledged_completions[&key], episode);
+        assert!(saved.persistence_error.is_none());
+        log.flush();
+        let records: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert!(records.iter().any(|r| r["event"] == "ack_restore_result"
+            && r["data"]["matched"] == 0
+            && r["data"]["file_present"] == false));
+        assert!(
+            records
+                .iter()
+                .any(|r| r["event"] == "ack_applied" && r["data"]["persisted"] == false)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r["event"] == "ack_saved_retry" && r["data"]["key"] == json!(key))
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|r| r["event"] == "ack_restored" && r["data"]["key"] == json!(key))
+        );
+    }
+    #[test]
+    fn restart_diagnostics_explain_missing_file_source_state_membership_and_delayed_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Diagnostics::at(&dir.path().join("logs"), 8790).unwrap();
+        let path = dir.path().join("ack.bin");
+        let store = Store::at(path.clone());
+        let first = Shared::with_store(|| {}, Some(store.clone()), 100);
+        first.attach_diagnostics(log.clone());
+        accept(&first, scene("done", "source"));
+        let initial = first.read();
+        let key = initial
+            .completion_episodes
+            .keys()
+            .find(|k| k[1] == "node")
+            .unwrap()
+            .clone();
+        assert!(first.acknowledge(&key, initial.completion_episodes[&key]));
+        drop(first);
+
+        // A namespace mismatch must be explained without modifying the other source.
+        let other = Shared::with_store(|| {}, Some(store.clone()), 200);
+        other.attach_diagnostics(log.clone());
+        accept(&other, scene("done", "another-source"));
+        assert!(other.read().acknowledged_completions.is_empty());
+        drop(other);
+
+        let unchanged = Shared::with_store(|| {}, Some(store.clone()), 300);
+        unchanged.attach_diagnostics(log.clone());
+        accept(&unchanged, scene("done", "source"));
+        assert_eq!(
+            unchanged.read().acknowledged_completions[&key],
+            initial.completion_episodes[&key]
+        );
+        drop(unchanged);
+
+        let not_done = Shared::with_store(|| {}, Some(store.clone()), 400);
+        not_done.attach_diagnostics(log.clone());
+        accept(&not_done, scene("working", "source"));
+        assert!(not_done.read().acknowledged_completions.is_empty());
+        drop(not_done);
+
+        store
+            .acknowledge(&vec!["coordinator".into(), "source".into()], &key, 500)
+            .unwrap();
+        let missing = Shared::with_store(|| {}, Some(store.clone()), 600);
+        missing.attach_diagnostics(log.clone());
+        let mut absent = scene("done", "source");
+        Arc::get_mut(&mut absent)
+            .unwrap()
+            .nodes
+            .retain(|n| n.key[1] != "node");
+        accept(&missing, absent);
+        assert!(missing.read().acknowledged_completions.is_empty());
+        drop(missing);
+
+        store
+            .acknowledge(&vec!["coordinator".into(), "source".into()], &key, 700)
+            .unwrap();
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let delayed = Shared::with_store(|| {}, Some(store), 800);
+        delayed.attach_diagnostics(log.clone());
+        accept(&delayed, scene("done", "source"));
+        accept(&delayed, scene("working", "source"));
+        accept(&delayed, scene("done", "source"));
+        drop(lock);
+        accept(&delayed, scene("done", "source"));
+        assert!(delayed.read().acknowledged_completions.is_empty());
+        assert!(delayed.read().persistence_error.is_none());
+
+        let unavailable = Shared::new(|| {});
+        unavailable.attach_diagnostics(log.clone());
+        accept(&unavailable, scene("done", "source"));
+        let unknown =
+            Shared::with_store(|| {}, Some(Store::at(dir.path().join("unknown.bin"))), 900);
+        unknown.attach_diagnostics(log.clone());
+        let mut unverified = scene("done", "source");
+        Arc::get_mut(&mut unverified).unwrap().coordinator = Some(coordinator(None));
+        accept(&unknown, unverified);
+
+        log.flush();
+        let records: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert!(records.iter().any(|r| r["event"] == "ack_restore_result"
+            && r["data"]["file_present"] == false
+            && r["data"]["matched"] == 0));
+        assert!(
+            records
+                .iter()
+                .any(|r| r["event"] == "ack_restore_source_mismatch"
+                    && r["data"]["saved_source"] == json!(["coordinator", "source"])
+                    && r["data"]["records"] == 1)
+        );
+        let initial_episode = initial.completion_episodes[&key].to_string();
+        assert!(records.iter().any(|r| r["event"] == "ack_restored"
+            && r["data"]["key"] == json!(key)
+            && r["data"]["episode"] == initial_episode));
+        for reason in [
+            "agent_not_done",
+            "agent_missing",
+            "completion_changed_during_restore",
+        ] {
+            assert!(
+                records.iter().any(|r| r["event"] == "ack_restore_excluded"
+                    && r["data"]["key"] == json!(key)
+                    && r["data"]["reason"] == reason
+                    && r["data"]["retired_from_disk"] == true),
+                "missing {reason}"
+            );
+        }
+        assert!(
+            records
+                .iter()
+                .any(|r| r["event"] == "ack_restore_failed"
+                    && r["data"]["error_kind"] == "WouldBlock")
+        );
+        for reason in ["storage_unavailable", "no_verified_source"] {
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r["event"] == "ack_restore_unavailable"
+                        && r["data"]["reason"] == reason),
+                "missing {reason}"
+            );
+        }
+        assert!(
+            !records.iter().any(|r| r["event"] == "diagnostic_loss"
+                || r["dropped_before"].as_u64().unwrap_or(0) > 0)
         );
     }
     #[test]

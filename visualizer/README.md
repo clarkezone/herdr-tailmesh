@@ -102,6 +102,23 @@ placement. `completion_flyout` explains `drawn`, `revealing`, `off_page`,
 revealed card; it is not a GPU/display readback guarantee. Counts and paging
 remain independent of acknowledgement.
 
+For a dismissal that returns after relaunch, retain logs from both launches.
+`dismiss_input` identifies the UI action; `ack_saved` confirms the synchronous
+disk transaction succeeded in that frame. `ack_applied` with `persisted: false`
+means it closed locally after a save error, with retries recorded as
+`ack_saved_retry`. Startup logs include `ack_storage_config`,
+`ack_restore_attempt` and `ack_restore_result` with actual file presence and
+matched/excluded/other-source counts. `ack_restore_source_mismatch` identifies
+another saved coordinator namespace without deleting its entries.
+`ack_restore_excluded` explains each retired saved record as `agent_missing`,
+`agent_not_done`, or `completion_changed_during_restore` (an observed cycle while
+the file was unavailable). `ack_restore_failed` records read/lock/write errors;
+`ack_restore_unavailable` explains disabled storage or unverified identity.
+Matching entries emit `ack_restored` before the scene reaches the renderer.
+Compare build, port, source, full key and episode across the two runs. A missing
+or changed identity is evidence to investigate, not proof that the user dismissed
+another task or that the upstream service is at fault.
+
 State and visibility are logged only when they change; receipt counts are logged
 per accepted snapshot, never per animation frame. A bounded background queue
 keeps file I/O out of rendering and observation callbacks. Overflow/oversized

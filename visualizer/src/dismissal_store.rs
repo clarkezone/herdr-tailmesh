@@ -16,6 +16,12 @@ const MAX_RECORDS: usize = 8000;
 pub(crate) struct Store {
     path: PathBuf,
 }
+pub(crate) struct Restoration {
+    pub file_present: bool,
+    pub acknowledged: BTreeMap<Key, u64>,
+    pub excluded: BTreeMap<Key, u64>,
+    pub other_sources: BTreeMap<Key, usize>,
+}
 // Private on-disk schema; deliberately separate from the observer protocol.
 #[derive(Clone, PartialEq, Message)]
 struct Saved {
@@ -65,14 +71,17 @@ impl Store {
             user_state_directory()?.join(format!("dismissals-{port}.bin")),
         ))
     }
-    fn read(&self) -> io::Result<Saved> {
+    fn read(&self) -> io::Result<(Saved, bool)> {
         let file = match File::open(&self.path) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(Saved {
-                    version: VERSION,
-                    records: vec![],
-                });
+                return Ok((
+                    Saved {
+                        version: VERSION,
+                        records: vec![],
+                    },
+                    false,
+                ));
             }
             Err(e) => return Err(e),
         };
@@ -102,9 +111,12 @@ impl Store {
         {
             return Err(invalid("Unsupported or invalid acknowledgement records"));
         }
-        Ok(saved)
+        Ok((saved, true))
     }
-    fn transaction<T>(&self, change: impl FnOnce(&mut Saved) -> io::Result<T>) -> io::Result<T> {
+    fn transaction<T>(
+        &self,
+        change: impl FnOnce(&mut Saved, bool) -> io::Result<T>,
+    ) -> io::Result<T> {
         let parent = self
             .path
             .parent()
@@ -118,9 +130,9 @@ impl Store {
             .truncate(false)
             .open(self.path.with_extension("lock"))?;
         lock.try_lock()?;
-        let mut saved = self.read()?;
+        let (mut saved, file_present) = self.read()?;
         let before = saved.clone();
-        let result = change(&mut saved)?;
+        let result = change(&mut saved, file_present)?;
         if saved != before {
             let bytes = saved.encode_to_vec();
             if saved.records.len() > MAX_RECORDS || bytes.len() as u64 > MAX_BYTES {
@@ -137,21 +149,36 @@ impl Store {
         &self,
         source: &Key,
         done: &BTreeMap<Key, u64>,
-    ) -> io::Result<BTreeMap<Key, u64>> {
-        self.transaction(|saved| {
+    ) -> io::Result<Restoration> {
+        self.transaction(|saved, file_present| {
+            let mut result = Restoration {
+                file_present,
+                acknowledged: BTreeMap::new(),
+                excluded: BTreeMap::new(),
+                other_sources: BTreeMap::new(),
+            };
+            for record in &saved.records {
+                if &record.source != source {
+                    *result
+                        .other_sources
+                        .entry(record.source.clone())
+                        .or_default() += 1;
+                } else if done.contains_key(&record.key) {
+                    result
+                        .acknowledged
+                        .insert(record.key.clone(), record.episode);
+                } else {
+                    result.excluded.insert(record.key.clone(), record.episode);
+                }
+            }
             saved
                 .records
                 .retain(|r| &r.source != source || done.contains_key(&r.key));
-            Ok(saved
-                .records
-                .iter()
-                .filter(|r| &r.source == source)
-                .map(|r| (r.key.clone(), r.episode))
-                .collect())
+            Ok(result)
         })
     }
     pub(crate) fn acknowledge(&self, source: &Key, key: &Key, episode: u64) -> io::Result<()> {
-        self.transaction(|saved| {
+        self.transaction(|saved, _| {
             saved
                 .records
                 .retain(|r| &r.source != source || &r.key != key);
@@ -164,7 +191,7 @@ impl Store {
         })
     }
     pub(crate) fn retire(&self, source: &Key, retired: &BTreeMap<Key, u64>) -> io::Result<()> {
-        self.transaction(|saved| {
+        self.transaction(|saved, _| {
             // Another viewer may have acknowledged a newer instance in the meantime.
             saved
                 .records
@@ -212,11 +239,19 @@ mod tests {
             .unwrap();
         let done = BTreeMap::from([(key("a"), 0), (key("b"), 0)]);
         assert_eq!(
-            a.restore(&source("one"), &done).unwrap(),
+            a.restore(&source("one"), &done).unwrap().acknowledged,
             BTreeMap::from([(key("a"), 3), (key("b"), 2)])
         );
-        assert!(a.restore(&source("two"), &done).unwrap().is_empty());
-        assert_eq!(a.restore(&source("one"), &done).unwrap().len(), 2);
+        assert!(
+            a.restore(&source("two"), &done)
+                .unwrap()
+                .acknowledged
+                .is_empty()
+        );
+        assert_eq!(
+            a.restore(&source("one"), &done).unwrap().acknowledged.len(),
+            2
+        );
     }
     #[test]
     fn corrupt_oversized_or_future_state_is_not_overwritten_and_lock_contention_is_bounded() {
