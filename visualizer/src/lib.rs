@@ -2,6 +2,7 @@ pub mod client;
 pub mod diagnostics;
 mod dismissal_store;
 pub mod heartbeat;
+pub mod outcomes;
 pub mod projection;
 pub mod summary;
 // Canonical control messages include large oneofs; the viewer never constructs

@@ -1,6 +1,7 @@
 use crate::{
     diagnostics::{Diagnostics, Value, json},
     dismissal_store::Store,
+    outcomes::{Outcome, OutcomeStore, Tracker},
     pb::local_observer_client::LocalObserverClient,
     projection::{Branch, Key, Scene, coordinator, project},
 };
@@ -28,6 +29,12 @@ pub struct View {
     pub revision: u64,
     /// IDs of currently observed completion episodes, updated before UI coalescing.
     pub completion_episodes: Arc<BTreeMap<Key, u64>>,
+    /// Latest outcomes, keyed by card identity independently of current agent status.
+    pub outcome_notices: Option<Arc<BTreeMap<Key, Outcome>>>,
+    /// Directly observed Working -> Idle stops, retained only while still Idle.
+    pub idle_stop_episodes: Arc<BTreeMap<Key, u64>>,
+    /// Session-only acknowledgement of observed Idle stops; never stored as Done.
+    pub acknowledged_idle_stops: Arc<BTreeMap<Key, u64>>,
     /// Local acknowledgements restored before the first scene is published.
     pub acknowledged_completions: Arc<BTreeMap<Key, u64>>,
     pub acknowledgement_revision: u64,
@@ -45,6 +52,9 @@ impl Default for View {
             epoch: 0,
             revision: 0,
             completion_episodes: Default::default(),
+            outcome_notices: None,
+            idle_stop_episodes: Default::default(),
+            acknowledged_idle_stops: Default::default(),
             acknowledged_completions: Default::default(),
             acknowledgement_revision: 0,
             persistence_error: None,
@@ -53,6 +63,54 @@ impl Default for View {
     }
 }
 impl View {
+    pub fn stop_episode(&self, key: &Key) -> Option<u64> {
+        if let Some(notice) = self.outcome_notices.as_ref().and_then(|n| n.get(key)) {
+            return Some(notice.episode);
+        }
+        self.completion_episodes
+            .get(key)
+            .or_else(|| self.idle_stop_episodes.get(key))
+            .copied()
+    }
+    pub fn stop_episodes(&self) -> impl Iterator<Item = (&Key, &u64)> {
+        self.completion_episodes
+            .iter()
+            .filter(|_| self.outcome_notices.is_none())
+            .chain(
+                self.idle_stop_episodes
+                    .iter()
+                    .filter(|_| self.outcome_notices.is_none()),
+            )
+            .chain(
+                self.outcome_notices
+                    .iter()
+                    .flat_map(|m| m.iter())
+                    .map(|(k, n)| (k, &n.episode)),
+            )
+    }
+    pub fn agent_key<'a>(&'a self, key: &'a Key) -> &'a Key {
+        self.outcome_notices
+            .as_ref()
+            .and_then(|n| n.get(key))
+            .map_or(key, |n| &n.agent)
+    }
+    pub fn stop_is_idle(&self, key: &Key) -> bool {
+        self.outcome_notices
+            .as_ref()
+            .and_then(|n| n.get(key))
+            .is_some_and(|n| n.kind == "idle")
+            || self.idle_stop_episodes.contains_key(key)
+    }
+    pub fn stop_acknowledged(&self, key: &Key, episode: u64) -> bool {
+        self.outcome_notices
+            .as_ref()
+            .and_then(|n| n.get(key))
+            .is_some_and(|n| n.episode == episode && n.dismissed)
+            || self.acknowledged_completions.get(key) == Some(&episode)
+                && self.completion_episodes.get(key) == Some(&episode)
+            || self.acknowledged_idle_stops.get(key) == Some(&episode)
+                && self.idle_stop_episodes.get(key) == Some(&episode)
+    }
     pub fn diagnostic(&self, event: &str, mut data: Value) {
         if let Some(log) = &self.diagnostics {
             data["epoch"] = json!(self.epoch);
@@ -100,7 +158,7 @@ impl View {
             self.diagnostic("snapshot_accepted", json!({
                 "observed_seconds":scene.observed_at.seconds, "observed_nanos":scene.observed_at.nanos,
                 "nodes":scene.nodes.len(), "agents":current.len(),
-                "completed":self.completion_episodes.len(), "working":scene.working, "blocked":scene.blocked,
+                "completed":self.completion_episodes.len(), "idle_stops":self.idle_stop_episodes.len(), "working":scene.working, "blocked":scene.blocked,
             }));
         }
         for (key, (state, label)) in &current {
@@ -110,6 +168,7 @@ impl View {
                     json!({
                         "key":key, "label":label, "previous_state":agents.get(key), "state":state,
                         "episode":self.completion_episodes.get(key),
+                        "idle_stop_episode":self.idle_stop_episodes.get(key),
                     }),
                 );
             }
@@ -130,7 +189,34 @@ impl View {
                 self.diagnostic("completion_created", json!({"key":key, "episode":episode}));
             }
         }
+        for (key, episode) in previous.idle_stop_episodes.iter() {
+            if old_source != source || self.idle_stop_episodes.get(key) != Some(episode) {
+                self.diagnostic("idle_stop_retired", json!({"key":key, "episode":episode}));
+            }
+        }
+        for (key, episode) in self.idle_stop_episodes.iter() {
+            if old_source != source || previous.idle_stop_episodes.get(key) != Some(episode) {
+                self.diagnostic("idle_stop_created", json!({"key":key, "episode":episode, "previous_state":"working", "state":"idle"}));
+            }
+        }
         *agents = current.into_iter().map(|(k, (s, _))| (k, s)).collect();
+    }
+}
+fn trace_outcomes(
+    view: &View,
+    previous: Option<&BTreeMap<Key, Outcome>>,
+    current: &BTreeMap<Key, Outcome>,
+) {
+    for (key, n) in current {
+        let old = previous.and_then(|p| p.get(key));
+        if old.is_none_or(|o| o.episode != n.episode) {
+            view.diagnostic("outcome_available",json!({"key":n.agent,"episode":n.episode,"kind":n.kind,"dismissed":n.dismissed,"previous_episode":old.map(|o|o.episode),"previous_kind":old.map(|o|&o.kind),"supersedes_previous":old.is_some()}));
+        } else if old.is_some_and(|o| !o.dismissed && n.dismissed) {
+            view.diagnostic(
+                "outcome_ack_imported",
+                json!({"key":n.agent,"episode":n.episode}),
+            );
+        }
     }
 }
 pub struct Shared {
@@ -147,6 +233,8 @@ struct Received {
     restore_candidates: BTreeMap<Key, u64>,
     unsaved_acknowledgements: BTreeMap<Key, u64>,
     diagnostic_agents: BTreeMap<Key, String>,
+    outcomes: Tracker,
+    outcome_error: Option<String>,
 }
 fn verified_source(view: &View) -> Option<Key> {
     view.scene
@@ -157,23 +245,13 @@ fn verified_source(view: &View) -> Option<Key> {
         .map(|c| c.key.clone())
 }
 fn observed_agent_statuses(view: &View) -> BTreeMap<&Key, &str> {
-    fn collect<'a>(branch: &'a Branch, states: &mut BTreeMap<&'a Key, &'a str>) {
-        if branch.kind == "agent" {
-            states.insert(&branch.key, &branch.status);
-        }
-        for child in &branch.children {
-            collect(child, states);
-        }
-    }
-    let mut states = BTreeMap::new();
     if view.diagnostics.is_some()
         && let Some(scene) = &view.scene
     {
-        for node in &scene.nodes {
-            collect(node, &mut states);
-        }
+        agent_statuses(scene)
+    } else {
+        BTreeMap::new()
     }
-    states
 }
 fn storage_error(view: &mut View, error: impl std::fmt::Display) {
     let message = format!("Completion dismissals could not be saved/restored: {error}");
@@ -203,6 +281,45 @@ fn completions(
         completions(child, previous, serial, current);
     }
 }
+fn agent_statuses(scene: &Scene) -> BTreeMap<&Key, &str> {
+    fn collect<'a>(branch: &'a Branch, states: &mut BTreeMap<&'a Key, &'a str>) {
+        if branch.kind == "agent" {
+            states.insert(&branch.key, &branch.status);
+        }
+        for child in &branch.children {
+            collect(child, states);
+        }
+    }
+    let mut result = BTreeMap::new();
+    for node in &scene.nodes {
+        collect(node, &mut result);
+    }
+    result
+}
+fn idle_stops(
+    scene: &Scene,
+    previous: &BTreeMap<Key, u64>,
+    previous_states: &BTreeMap<&Key, &str>,
+    serial: &mut u64,
+) -> BTreeMap<Key, u64> {
+    agent_statuses(scene)
+        .into_iter()
+        .filter_map(|(key, state)| {
+            if state != "idle" {
+                return None;
+            }
+            let episode = if let Some(episode) = previous.get(key) {
+                *episode
+            } else if previous_states.get(key) == Some(&"working") {
+                *serial = serial.wrapping_add(1);
+                *serial
+            } else {
+                return None;
+            };
+            Some((key.clone(), episode))
+        })
+        .collect()
+}
 impl Shared {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
         Self::with_store(wake, None, 0)
@@ -231,6 +348,7 @@ impl Shared {
         Arc::new(Self {
             received: Mutex::new(Received {
                 completion_serial: serial,
+                outcomes: Tracker::new(store.as_ref().map(|s| OutcomeStore::at(s.outcome_path()))),
                 ..Default::default()
             }),
             wake_pending: AtomicBool::new(false),
@@ -266,9 +384,13 @@ impl Shared {
                 restore_candidates,
                 unsaved_acknowledgements,
                 diagnostic_agents,
+                outcomes,
+                outcome_error,
             } = &mut *received;
             let diagnostic_previous = view.diagnostics.as_ref().map(|_| view.clone());
             let revision = view.revision;
+            let previous_scene = view.scene.clone();
+            let previous_live = view.live;
             let previous_verified_source = verified_source(view);
             let source = view
                 .scene
@@ -278,11 +400,22 @@ impl Shared {
             f(view);
             if view.revision != revision {
                 let mut current = BTreeMap::new();
+                let mut idle_current = BTreeMap::new();
                 if let Some(scene) = &view.scene {
                     let same_source = source == scene.coordinator.as_ref().map(|c| c.key.clone());
                     let previous = same_source.then_some(view.completion_episodes.as_ref());
                     for node in &scene.nodes {
                         completions(node, previous, completion_serial, &mut current);
+                    }
+                    let continuous =
+                        same_source && (verified_source(view).is_some() || previous_live);
+                    if continuous && let Some(previous_scene) = &previous_scene {
+                        idle_current = idle_stops(
+                            scene,
+                            &view.idle_stop_episodes,
+                            &agent_statuses(previous_scene),
+                            completion_serial,
+                        );
                     }
                 }
                 let source = verified_source(view);
@@ -428,6 +561,56 @@ impl Shared {
                 }
                 // Keep only current completions; Working/removal retires the prior episode.
                 view.completion_episodes = Arc::new(current);
+                if view
+                    .acknowledged_idle_stops
+                    .iter()
+                    .any(|(key, id)| idle_current.get(key) != Some(id))
+                {
+                    Arc::make_mut(&mut view.acknowledged_idle_stops)
+                        .retain(|key, id| idle_current.get(key) == Some(id));
+                    view.acknowledgement_revision = view.acknowledgement_revision.wrapping_add(1);
+                }
+                view.idle_stop_episodes = Arc::new(idle_current);
+                if let Some(scene) = &view.scene {
+                    let same_source = previous_scene
+                        .as_ref()
+                        .and_then(|s| s.coordinator.as_ref())
+                        .map(|c| &c.key)
+                        == scene.coordinator.as_ref().map(|c| &c.key);
+                    let continuous =
+                        same_source && (verified_source(view).is_some() || previous_live);
+                    let (notices, error) = outcomes.observe(
+                        scene,
+                        previous_scene.as_deref().filter(|_| continuous),
+                        verified_source(view).is_some(),
+                        completion_serial,
+                        &view.completion_episodes,
+                        &view.acknowledged_completions,
+                    );
+                    if let Some(error) = error {
+                        if outcome_error.as_ref() != Some(&error) {
+                            view.diagnostic("outcome_journal_error", json!({"error":error}));
+                        }
+                        storage_error(view, &error);
+                        *outcome_error = Some(error);
+                    } else {
+                        if let Some(error) = outcome_error.take() {
+                            if view.persistence_error.as_ref()
+                                == Some(&format!(
+                                    "Completion dismissals could not be saved/restored: {error}"
+                                ))
+                            {
+                                view.persistence_error = None;
+                            }
+                            view.diagnostic("outcome_journal_recovered", json!({"persisted":verified_source(view).is_some() && self.store.is_some()}));
+                        }
+                        if view.outcome_notices.as_deref() != Some(&notices) {
+                            view.diagnostic("outcome_journal_ready", json!({"persisted":verified_source(view).is_some() && self.store.is_some(),"records":notices.len(),"pending":notices.values().filter(|n|!n.dismissed).count(),"dismissed":notices.values().filter(|n|n.dismissed).count(),"initial_publication":view.outcome_notices.is_none()}));
+                        }
+                    }
+                    trace_outcomes(view, view.outcome_notices.as_deref(), &notices);
+                    view.outcome_notices = Some(Arc::new(notices));
+                }
                 if let Some(previous) = &diagnostic_previous {
                     view.trace_receipt(previous, diagnostic_agents);
                 }
@@ -440,10 +623,77 @@ impl Shared {
     /// Revalidate the clicked frame against the latest accepted completion.
     pub fn acknowledge(&self, key: &Key, episode: u64) -> bool {
         let mut received = self.received.lock().unwrap();
+        if let Some(notice) = received
+            .view
+            .outcome_notices
+            .as_ref()
+            .and_then(|n| n.get(key))
+            .cloned()
+        {
+            if notice.episode != episode {
+                received.view.diagnostic(
+                    "outcome_ack_rejected_stale",
+                    json!({"key":notice.agent,"episode":episode,"current_episode":notice.episode}),
+                );
+                return false;
+            }
+            let verified = verified_source(&received.view).is_some();
+            received.view.diagnostic(
+                "outcome_ack_requested",
+                json!({"key":notice.agent,"episode":episode,"kind":notice.kind}),
+            );
+            let mut persisted = false;
+            let accepted = match received.outcomes.acknowledge(
+                &notice.source,
+                &notice.agent,
+                episode,
+                verified,
+            ) {
+                Ok(accepted) => {
+                    if accepted {
+                        persisted = verified && self.store.is_some();
+                        received.view.diagnostic("outcome_ack_saved",json!({"key":notice.agent,"episode":episode,"persisted":verified && self.store.is_some()}));
+                    }
+                    accepted
+                }
+                Err(error) => {
+                    received.outcome_error = Some(error.to_string());
+                    received.view.diagnostic(
+                        "outcome_journal_error",
+                        json!({"error":error.to_string(),"operation":"dismiss"}),
+                    );
+                    storage_error(&mut received.view, error);
+                    true
+                }
+            };
+            let notices = received.outcomes.publish(&notice.source);
+            received.view.outcome_notices = Some(Arc::new(notices));
+            received.view.diagnostic("outcome_ack_applied",json!({"key":notice.agent,"episode":episode,"accepted":accepted,"persisted":persisted}));
+            received.view.acknowledgement_revision =
+                received.view.acknowledgement_revision.wrapping_add(1);
+            drop(received);
+            if !self.wake_pending.swap(true, Ordering::AcqRel) {
+                (self.wake)();
+            }
+            return accepted;
+        }
         let view = &mut received.view;
         view.diagnostic("ack_requested", json!({"key":key, "episode":episode}));
+        if view.idle_stop_episodes.get(key) == Some(&episode) {
+            Arc::make_mut(&mut view.acknowledged_idle_stops).insert(key.clone(), episode);
+            view.acknowledgement_revision = view.acknowledgement_revision.wrapping_add(1);
+            view.diagnostic("idle_stop_ack_applied", json!({"key":key, "episode":episode, "lifetime":"viewer_process", "persisted":false}));
+            drop(received);
+            if !self.wake_pending.swap(true, Ordering::AcqRel) {
+                (self.wake)();
+            }
+            return true;
+        }
         if view.completion_episodes.get(key) != Some(&episode) {
-            view.diagnostic("ack_rejected_stale", json!({"key":key, "episode":episode, "current_episode":view.completion_episodes.get(key)}));
+            view.diagnostic(
+                "ack_rejected_stale",
+                json!({"key":key, "episode":episode, "current_episode":view.stop_episode(key)}),
+            );
             return false;
         }
         if let (Some(store), Some(source)) = (&self.store, verified_source(view)) {
@@ -469,6 +719,25 @@ impl Shared {
         Arc::make_mut(&mut view.acknowledged_completions).insert(key.clone(), episode);
         view.acknowledgement_revision = view.acknowledgement_revision.wrapping_add(1);
         view.diagnostic("ack_applied", json!({"key":key, "episode":episode, "persisted":view.persistence_error.is_none() && self.store.is_some()}));
+        if let Some(notice) = received
+            .view
+            .outcome_notices
+            .as_ref()
+            .and_then(|n| n.values().find(|n| &n.agent == key && n.kind == "done"))
+            .cloned()
+        {
+            let verified = verified_source(&received.view).is_some();
+            if let Err(error) = received.outcomes.acknowledge(
+                &notice.source,
+                &notice.agent,
+                notice.episode,
+                verified,
+            ) {
+                storage_error(&mut received.view, error);
+            }
+            received.view.outcome_notices =
+                Some(Arc::new(received.outcomes.publish(&notice.source)));
+        }
         drop(received);
         if !self.wake_pending.swap(true, Ordering::AcqRel) {
             (self.wake)();
@@ -665,6 +934,366 @@ mod tests {
             view.revision += 1;
             view.live = true;
         });
+    }
+    fn latest(shared: &Shared) -> Outcome {
+        shared
+            .read()
+            .outcome_notices
+            .unwrap()
+            .values()
+            .find(|n| n.agent[1] == "node")
+            .unwrap()
+            .clone()
+    }
+    #[test]
+    fn latest_outcome_retains_done_through_idle_work_and_removal_then_supersedes_on_next_stop() {
+        let shared = Shared::new(|| {});
+        accept(&shared, scene("working", "source"));
+        accept(&shared, scene("done", "source"));
+        accept(&shared, scene("idle", "source")); // No render of Done.
+        let first = latest(&shared);
+        assert_eq!(first.kind, "done");
+        assert!(!first.dismissed);
+        assert!(!shared.read().completion_episodes.contains_key(&first.agent));
+        accept(&shared, scene("working", "source"));
+        assert_eq!(latest(&shared).episode, first.episode);
+        accept(&shared, scene("done", "source"));
+        let second = latest(&shared);
+        assert_eq!(second.kind, "done");
+        assert_ne!(first.episode, second.episode);
+        assert!(!shared.acknowledge(&first.card_key(), first.episode));
+        accept(&shared, scene("working", "source"));
+        assert_eq!(latest(&shared).episode, second.episode);
+        accept(&shared, scene("idle", "source"));
+        let idle = latest(&shared);
+        assert_eq!(idle.kind, "idle");
+        assert_ne!(idle.episode, second.episode);
+        assert!(!shared.acknowledge(&second.card_key(), second.episode));
+        assert!(shared.acknowledge(&idle.card_key(), idle.episode));
+        assert!(latest(&shared).dismissed);
+        accept(&shared, scene("working", "source"));
+        accept(&shared, scene("done", "source"));
+        let done = latest(&shared);
+        assert!(!done.dismissed);
+        let mut missing = scene("idle", "source");
+        Arc::get_mut(&mut missing).unwrap().nodes.clear();
+        accept(&shared, missing);
+        assert_eq!(latest(&shared).episode, done.episode);
+        accept(&shared, scene("idle", "other-source"));
+        assert!(
+            !shared
+                .read()
+                .outcome_notices
+                .unwrap()
+                .values()
+                .any(|n| n.agent == done.agent)
+        );
+    }
+    #[test]
+    fn latest_outcomes_save_on_observation_and_dismissal_restore_in_idle_and_rearm_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("ack.bin"));
+        let first = Shared::with_store(|| {}, Some(store.clone()), 10);
+        accept(&first, scene("working", "source"));
+        accept(&first, scene("done", "source"));
+        let done = latest(&first);
+        assert!(store.outcome_path().exists());
+        accept(&first, scene("idle", "source"));
+        let while_working = Shared::with_store(|| {}, Some(store.clone()), 50);
+        accept(&while_working, scene("working", "source"));
+        assert_eq!(latest(&while_working), done);
+        let restarted = Shared::with_store(|| {}, Some(store.clone()), 100);
+        accept(&restarted, scene("idle", "source"));
+        assert_eq!(latest(&restarted), done);
+        assert!(restarted.acknowledge(&done.card_key(), done.episode));
+        let next = Shared::with_store(|| {}, Some(store.clone()), 200);
+        accept(&next, scene("idle", "source"));
+        assert!(latest(&next).dismissed);
+        accept(&next, scene("working", "source"));
+        accept(&next, scene("idle", "source"));
+        let idle = latest(&next);
+        assert_eq!(idle.kind, "idle");
+        assert!(!idle.dismissed);
+        assert_ne!(idle.episode, done.episode);
+        let again = Shared::with_store(|| {}, Some(store), 300);
+        accept(&again, scene("idle", "source"));
+        assert_eq!(latest(&again), idle);
+    }
+    #[test]
+    fn latest_outcome_diagnostics_correlate_saved_superseded_dismissed_and_restored_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("ack.bin"));
+        let log = Diagnostics::at(dir.path(), 8790).unwrap();
+        let first = Shared::with_store(|| {}, Some(store.clone()), 10);
+        first.attach_diagnostics(log.clone());
+        accept(&first, scene("working", "source"));
+        accept(&first, scene("done", "source"));
+        let old = latest(&first);
+        accept(&first, scene("idle", "source"));
+        assert_eq!(latest(&first).episode, old.episode);
+        accept(&first, scene("working", "source"));
+        accept(&first, scene("idle", "source"));
+        let fresh = latest(&first);
+        assert!(first.acknowledge(&fresh.card_key(), fresh.episode));
+        let second = Shared::with_store(|| {}, Some(store), 100);
+        second.attach_diagnostics(log.clone());
+        accept(&second, scene("idle", "source"));
+        assert_eq!(latest(&second), latest(&first));
+        log.flush();
+        let records: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let fresh_text = fresh.episode.to_string();
+        let old_text = old.episode.to_string();
+        assert!(records.iter().any(|r| r["event"] == "outcome_available"
+            && r["data"]["episode"].as_str() == Some(fresh_text.as_str())
+            && r["data"]["previous_episode"].as_str() == Some(old_text.as_str())
+            && r["data"]["supersedes_previous"] == true));
+        assert!(records.iter().any(|r| r["event"] == "outcome_ack_saved"
+            && r["data"]["episode"].as_str() == Some(fresh_text.as_str())
+            && r["data"]["persisted"] == true));
+        assert!(records.iter().any(|r| r["event"] == "outcome_journal_ready"
+            && r["data"]["initial_publication"] == true
+            && r["data"]["persisted"] == true
+            && r["data"]["dismissed"] == 1));
+    }
+    #[test]
+    fn delayed_outcome_load_cannot_leave_an_idle_stop_as_the_latest_result_of_current_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("ack.bin"));
+        let first = Shared::with_store(|| {}, Some(store.clone()), 10);
+        accept(&first, scene("working", "source"));
+        accept(&first, scene("idle", "source"));
+        assert_eq!(latest(&first).kind, "idle");
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(store.outcome_path().with_extension("lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let second = Shared::with_store(|| {}, Some(store.clone()), 100);
+        accept(&second, scene("done", "source"));
+        assert_eq!(latest(&second).kind, "done");
+        drop(lock);
+        accept(&second, scene("done", "source"));
+        assert_eq!(latest(&second).kind, "done");
+        assert!(!latest(&second).dismissed);
+        let third = Shared::with_store(|| {}, Some(store), 200);
+        accept(&third, scene("idle", "source"));
+        assert_eq!(latest(&third), latest(&second));
+    }
+    #[test]
+    fn latest_outcomes_retry_locked_capture_and_click_without_restoring_stale_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("ack.bin"));
+        let first = Shared::with_store(|| {}, Some(store.clone()), 10);
+        accept(&first, scene("done", "source"));
+        let old = latest(&first);
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(store.outcome_path().with_extension("lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let second = Shared::with_store(|| {}, Some(store.clone()), 100);
+        accept(&second, scene("working", "source"));
+        accept(&second, scene("idle", "source"));
+        let fresh = latest(&second);
+        assert_eq!(fresh.kind, "idle");
+        assert_ne!(fresh.episode, old.episode);
+        assert!(second.read().persistence_error.is_some());
+        assert!(second.acknowledge(&fresh.card_key(), fresh.episode));
+        assert!(latest(&second).dismissed);
+        drop(lock);
+        accept(&second, scene("idle", "source"));
+        let third = Shared::with_store(|| {}, Some(store), 500);
+        accept(&third, scene("idle", "source"));
+        assert_eq!(latest(&third).episode, fresh.episode);
+        assert!(latest(&third).dismissed);
+    }
+    #[test]
+    fn idle_stops_track_coalesced_work_and_rearm_each_cycle_before_rendering() {
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = wakes.clone();
+        let shared = Shared::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+        accept(&shared, scene("working", "source"));
+        accept(&shared, scene("idle", "source")); // No read/render between observations.
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        let first = shared.read();
+        assert_eq!(first.idle_stop_episodes.len(), 1);
+        assert_eq!(first.completion_episodes.len(), 1); // Other node is genuinely Done.
+        let key = first.idle_stop_episodes.keys().next().unwrap().clone();
+        let episode = first.idle_stop_episodes[&key];
+        assert!(shared.acknowledge(&key, episode));
+        accept(&shared, scene("idle", "source"));
+        assert!(shared.read().stop_acknowledged(&key, episode));
+        accept(&shared, scene("working", "source"));
+        accept(&shared, scene("idle", "source"));
+        let second = shared.read();
+        assert_ne!(second.idle_stop_episodes[&key], episode);
+        assert!(second.acknowledged_idle_stops.is_empty());
+        assert!(!shared.acknowledge(&key, episode));
+        assert!(!second.completion_episodes.contains_key(&key));
+    }
+    #[test]
+    fn idle_baselines_and_non_working_transitions_do_not_invent_a_work_stop() {
+        for before in ["idle", "blocked", "done", "unknown"] {
+            let shared = Shared::new(|| {});
+            accept(&shared, scene(before, "source"));
+            accept(&shared, scene("idle", "source"));
+            assert!(
+                shared.read().idle_stop_episodes.is_empty(),
+                "{before} -> Idle"
+            );
+        }
+        let shared = Shared::new(|| {});
+        accept(&shared, scene("working", "old"));
+        accept(&shared, scene("idle", "new"));
+        assert!(shared.read().idle_stop_episodes.is_empty());
+        accept(&shared, scene("working", "new"));
+        let mut missing = scene("idle", "new");
+        Arc::get_mut(&mut missing)
+            .unwrap()
+            .nodes
+            .retain(|n| n.key[1] != "node");
+        accept(&shared, missing);
+        accept(&shared, scene("idle", "new"));
+        assert!(shared.read().idle_stop_episodes.is_empty());
+    }
+    #[test]
+    fn idle_stop_dismissal_does_not_change_completed_disk_records_or_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.bin");
+        let store = Store::at(path.clone());
+        let shared = Shared::with_store(|| {}, Some(store.clone()), 100);
+        accept(&shared, scene("working", "source"));
+        let v = shared.read();
+        let done_key = v.completion_episodes.keys().next().unwrap().clone();
+        assert!(shared.acknowledge(&done_key, v.completion_episodes[&done_key]));
+        let saved = std::fs::read(&path).unwrap();
+        accept(&shared, scene("idle", "source"));
+        let v = shared.read();
+        let key = v.idle_stop_episodes.keys().next().unwrap().clone();
+        assert!(shared.acknowledge(&key, v.idle_stop_episodes[&key]));
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        let restarted = Shared::with_store(|| {}, Some(store), 200);
+        accept(&restarted, scene("idle", "source"));
+        let v = restarted.read();
+        assert!(v.idle_stop_episodes.is_empty());
+        assert!(v.acknowledged_idle_stops.is_empty());
+        assert_eq!(v.acknowledged_completions[&done_key], 101);
+    }
+    #[test]
+    fn idle_stops_preserve_verified_reconnect_but_not_unknown_source_baselines() {
+        for verified in [true, false] {
+            let shared = Shared::new(|| {});
+            let input = |status| {
+                let mut s = scene(status, "source");
+                if !verified {
+                    Arc::get_mut(&mut s)
+                        .unwrap()
+                        .coordinator
+                        .as_mut()
+                        .unwrap()
+                        .status = "unknown".into();
+                }
+                s
+            };
+            accept(&shared, input("working"));
+            accept(&shared, input("idle"));
+            let old = shared.read().idle_stop_episodes;
+            assert_eq!(old.len(), 1);
+            shared.update(|v| {
+                v.live = false;
+                v.epoch += 1;
+            });
+            accept(&shared, input("idle"));
+            let new = shared.read().idle_stop_episodes;
+            if verified {
+                assert_eq!(old, new);
+            } else {
+                assert!(new.is_empty());
+            }
+        }
+    }
+    #[test]
+    fn idle_stops_are_scoped_independent_and_retire_on_any_departure_from_idle() {
+        let shared = Shared::new(|| {});
+        let both = |state| {
+            let mut s = scene(state, "source");
+            Arc::get_mut(&mut s).unwrap().nodes[1].children[0].children[0].children[0].status =
+                state.into();
+            s
+        };
+        accept(&shared, both("working"));
+        accept(&shared, both("idle"));
+        let v = shared.read();
+        assert_eq!(v.idle_stop_episodes.len(), 2);
+        assert!(v.completion_episodes.is_empty());
+        let entries: Vec<_> = v.idle_stop_episodes.iter().collect();
+        assert_eq!(entries[0].0.last(), entries[1].0.last());
+        assert_ne!(entries[0].1, entries[1].1);
+        let (dismissed, episode) = entries[0];
+        assert!(shared.acknowledge(dismissed, *episode));
+        let v = shared.read();
+        assert_eq!(v.acknowledged_idle_stops.len(), 1);
+        assert!(!v.stop_acknowledged(entries[1].0, *entries[1].1));
+        for next in ["working", "blocked", "done", "unknown"] {
+            accept(&shared, both(next));
+            assert!(
+                shared.read().idle_stop_episodes.is_empty(),
+                "Idle -> {next}"
+            );
+            assert!(shared.read().acknowledged_idle_stops.is_empty());
+            accept(&shared, both("working"));
+            accept(&shared, both("idle"));
+            assert_eq!(shared.read().idle_stop_episodes.len(), 2);
+        }
+        let mut removed = scene("idle", "source");
+        Arc::get_mut(&mut removed).unwrap().nodes.clear();
+        accept(&shared, removed);
+        assert!(shared.read().idle_stop_episodes.is_empty());
+        accept(&shared, both("idle"));
+        assert!(shared.read().idle_stop_episodes.is_empty());
+    }
+    #[test]
+    fn idle_stop_diagnostics_have_exact_tokens_without_a_saved_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Diagnostics::at(dir.path(), 8790).unwrap();
+        let shared = Shared::with_store(|| {}, None, u64::MAX - 10);
+        shared.attach_diagnostics(log.clone());
+        accept(&shared, scene("working", "source"));
+        accept(&shared, scene("idle", "source"));
+        let v = shared.read();
+        let (key, episode) = v.idle_stop_episodes.iter().next().unwrap();
+        shared.acknowledge(key, *episode);
+        accept(&shared, scene("working", "source"));
+        log.flush();
+        let records: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let episode_text = episode.to_string();
+        for name in [
+            "idle_stop_created",
+            "idle_stop_ack_applied",
+            "idle_stop_retired",
+        ] {
+            assert!(records.iter().any(|r| r["event"] == name
+                && r["data"]["episode"].as_str() == Some(episode_text.as_str())));
+        }
+        assert!(records.iter().any(|r| r["event"] == "agent_state"
+            && r["data"]["idle_stop_episode"].as_str() == Some(episode_text.as_str())));
+        assert!(!records.iter().any(|r| r["event"] == "ack_saved"));
     }
     #[test]
     fn diagnostics_follow_received_episodes_ack_restore_and_retirement_without_consuming_wakes() {

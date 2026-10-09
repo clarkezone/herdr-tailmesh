@@ -165,7 +165,7 @@ pub struct Event {
 }
 pub struct Activity {
     pub state: AgentState,
-    pub completion_episode: Option<u64>,
+    pub stop_episode: Option<u64>,
     pub freshness: Freshness,
     pub offline: bool,
     pub event: Event,
@@ -203,6 +203,11 @@ pub struct Simulation {
     receipts: Pulses,
     serial: u64,
     completion_episodes: Arc<BTreeMap<Key, u64>>,
+    idle_stop_episodes: Arc<BTreeMap<Key, u64>>,
+    outcome_agents: BTreeMap<Key, Key>,
+    outcomes_managed: bool,
+    outcome_dismissed: BTreeMap<Key, f64>,
+    outcome_revision: Option<(u64, u64, u64)>,
     wall: Stamp,
     diagnostic_revision: Option<(u64, u64, u64, u64, usize, usize)>,
     diagnostic_activities: BTreeMap<Key, ActivityTrace>,
@@ -246,7 +251,7 @@ impl Simulation {
                     key.clone(),
                     ActivityTrace {
                         state: a.state,
-                        episode: a.completion_episode,
+                        episode: a.stop_episode,
                         serial: a.event.serial,
                         persistent: a.persistent,
                     },
@@ -255,7 +260,7 @@ impl Simulation {
             .collect();
         for (key, trace) in &current {
             if self.diagnostic_activities.get(key) != Some(trace) {
-                view.diagnostic("activity_changed", json!({"renderer":renderer, "key":key, "state":format!("{:?}", trace.state), "episode":trace.episode, "event_serial":trace.serial, "persistent":trace.persistent, "previous_episode":self.diagnostic_activities.get(key).and_then(|a| a.episode)}));
+                view.diagnostic("activity_changed", json!({"renderer":renderer, "key":view.agent_key(key), "card_key":key, "state":format!("{:?}", trace.state), "episode":trace.episode, "event_serial":trace.serial, "persistent":trace.persistent, "previous_episode":self.diagnostic_activities.get(key).and_then(|a| a.episode)}));
             }
         }
         for (key, trace) in self
@@ -263,7 +268,7 @@ impl Simulation {
             .iter()
             .filter(|(k, _)| !current.contains_key(*k))
         {
-            view.diagnostic("activity_removed", json!({"renderer":renderer, "key":key, "episode":trace.episode, "event_serial":trace.serial, "reason":"not_retained", "omitted_activities":self.omitted_activities}));
+            view.diagnostic("activity_removed", json!({"renderer":renderer, "key":view.agent_key(key), "card_key":key, "episode":trace.episode, "event_serial":trace.serial, "reason":"not_retained", "omitted_activities":self.omitted_activities}));
         }
         self.diagnostic_activities = current;
     }
@@ -301,6 +306,7 @@ impl Simulation {
             .is_some_and(|a| !self.live || a.offline || !a.freshness.is_live(self.wall))
     }
     pub fn anchor(&self, key: &Key) -> Option<Id> {
+        let key = self.outcome_agents.get(key).unwrap_or(key);
         self.id(key)
             .or_else(|| key.get(..2).and_then(|node| self.id(&node.to_vec())))
     }
@@ -394,16 +400,16 @@ impl Simulation {
         freshness: Freshness,
         offline: bool,
     ) {
-        let persistent = state.persistent();
-        let completion_episode = self
-            .completion_episodes
-            .get(key)
-            .copied()
-            .filter(|_| state == AgentState::Completed);
+        let persistent = self.persistent_state(key, state);
+        let stop_episode = match state {
+            AgentState::Completed => self.completion_episodes.get(key).copied(),
+            AgentState::Idle => self.idle_stop_episodes.get(key).copied(),
+            _ => None,
+        };
         if let Some(activity) = self.activities.get_mut(key)
             && activity.persistent
             && activity.state == state
-            && activity.completion_episode == completion_episode
+            && activity.stop_episode == stop_episode
             && persistent
         {
             activity.event.text = text;
@@ -416,7 +422,7 @@ impl Simulation {
             key.clone(),
             Activity {
                 state,
-                completion_episode,
+                stop_episode,
                 freshness,
                 offline,
                 persistent,
@@ -428,6 +434,7 @@ impl Simulation {
                         AgentState::Working => "AGENT WORKING",
                         AgentState::Completed => "AGENT COMPLETED",
                         AgentState::Blocked => "ATTENTION REQUIRED",
+                        AgentState::Idle if stop_episode.is_some() => "WORK STOPPED — IDLE",
                         AgentState::Idle => "AGENT IDLE",
                         AgentState::Unknown => "AGENT STATE UNKNOWN",
                     },
@@ -442,6 +449,25 @@ impl Simulation {
         self.time = clock as f32;
         self.wall = wall;
         self.completion_episodes = Arc::clone(&view.completion_episodes);
+        self.idle_stop_episodes = Arc::clone(&view.idle_stop_episodes);
+        self.outcomes_managed = view.outcome_notices.is_some();
+        self.outcome_agents = view
+            .outcome_notices
+            .iter()
+            .flat_map(|m| m.iter())
+            .map(|(k, n)| (k.clone(), n.agent.clone()))
+            .collect();
+        // Retire superseded outcome instances before admission; an old card
+        // must not occupy the replacement's bounded presentation slot.
+        if let Some(notices) = &view.outcome_notices {
+            self.activities.retain(|key, a| {
+                key.len() != 11
+                    || key.last().is_none_or(|s| s != "outcome")
+                    || notices
+                        .get(key)
+                        .is_some_and(|n| a.stop_episode == Some(n.episode))
+            });
+        }
         self.callouts = true;
         let freed = self.prune();
         let Some(scene) = &view.scene else {
@@ -515,6 +541,14 @@ impl Simulation {
                 })
             })
             .collect();
+        let outcome_revision = (view.epoch, view.revision, view.acknowledgement_revision);
+        let retracting = self.outcome_dismissed.iter().any(|(k, t)| {
+            self.clock - *t >= f64::from(CALLOUT_FADE) && self.activities.contains_key(k)
+        });
+        if self.outcome_revision != Some(outcome_revision) || freed || retracting {
+            self.reconcile_outcomes(view, scene);
+            self.outcome_revision = Some(outcome_revision);
+        }
         self.trace_activities(view);
     }
     fn reconcile(&mut self, scene: &Scene, emit: bool) {
@@ -595,7 +629,12 @@ impl Simulation {
                 let joined = emit && branch.kind == "node" && existing.is_none();
                 // Persistent cards reconcile from the complete observation below,
                 // independently of which agents have GPU geometry.
-                if attention && !state.persistent() && !self.activities.contains_key(&branch.key) {
+                if attention
+                    && !self.persistent_state(&branch.key, state)
+                    && !(self.outcomes_managed
+                        && matches!(state, AgentState::Completed | AgentState::Idle))
+                    && !self.activities.contains_key(&branch.key)
+                {
                     let title = match state {
                         AgentState::Blocked => "ATTENTION REQUIRED",
                         AgentState::Working => "AGENT WORKING",
@@ -682,7 +721,9 @@ impl Simulation {
             .activities
             .iter()
             .filter(|(key, a)| {
-                a.persistent && !self.ids.get(*key).is_some_and(|id| selected.contains(id))
+                a.persistent
+                    && !self.outcome_agents.contains_key(*key)
+                    && !self.ids.get(*key).is_some_and(|id| selected.contains(id))
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -699,6 +740,9 @@ impl Simulation {
             reported(&scene.nodes, &missing, &mut present);
         }
         self.activities.retain(|key, activity| {
+            if self.outcome_agents.contains_key(key) {
+                return true;
+            }
             if activity.persistent && !self.ids.get(key).is_some_and(|id| selected.contains(id)) {
                 if present.contains(key) {
                     return true;
@@ -738,8 +782,9 @@ impl Simulation {
         for node in &scene.nodes {
             collect_agents(node, &mut Vec::new(), node, &mut agents);
         }
-        agents
-            .sort_by_key(|(b, _, _)| std::cmp::Reverse(AgentState::observed(&b.status).priority()));
+        agents.sort_by_key(|(b, _, _)| {
+            std::cmp::Reverse(self.activity_priority(&b.key, AgentState::observed(&b.status)))
+        });
         for (branch, names, node) in &agents {
             let Some(previous) = self.activities.get(&branch.key) else {
                 continue;
@@ -749,8 +794,10 @@ impl Simulation {
                 && branch.freshness.is_live(self.wall)
                 && previous.persistent
                 && previous.state != state
+                && !(self.outcomes_managed
+                    && matches!(state, AgentState::Completed | AgentState::Idle))
                 && previous.freshness.is_live(self.wall);
-            if state.persistent() || transition {
+            if self.persistent_state(&branch.key, state) || transition {
                 let Some(id) = self.id(&branch.key).or_else(|| self.id(&node.key)) else {
                     continue;
                 };
@@ -770,17 +817,22 @@ impl Simulation {
                 self.activities.remove(&branch.key); // Baselines cannot invent a resolution.
             }
         }
+        self.activities.retain(|key, a| {
+            key.len() != 11
+                || key.last().is_none_or(|k| k != "outcome")
+                || self.outcome_agents.contains_key(key) && a.persistent
+        });
         let mut incoming = [0usize; 4];
         for (branch, _, node) in &agents {
             let state = AgentState::observed(&branch.status);
-            if state.persistent()
+            if self.persistent_state(&branch.key, state)
                 && !self.activities.contains_key(&branch.key)
                 && self
                     .id(&branch.key)
                     .or_else(|| self.id(&node.key))
                     .is_some()
             {
-                incoming[state.priority() as usize] += 1;
+                incoming[self.activity_priority(&branch.key, state) as usize] += 1;
             }
         }
         let mut evict: Vec<_> = self
@@ -788,7 +840,11 @@ impl Simulation {
             .iter()
             .map(|(key, a)| {
                 (
-                    if a.persistent { a.state.priority() } else { 0 },
+                    if a.persistent {
+                        self.activity_priority(key, a.state)
+                    } else {
+                        0
+                    },
                     a.event.serial,
                     key.clone(),
                 )
@@ -803,7 +859,9 @@ impl Simulation {
         }
         for (branch, names, node) in agents {
             let state = AgentState::observed(&branch.status);
-            if state.persistent() && !self.activities.contains_key(&branch.key) {
+            if self.persistent_state(&branch.key, state)
+                && !self.activities.contains_key(&branch.key)
+            {
                 if self.activities.len() >= MAX_ENTITIES {
                     continue;
                 }
@@ -825,8 +883,123 @@ impl Simulation {
             }
         }
         // Disclose the fixed presentation/history bound independently of GPU sampling.
-        self.omitted_activities = (known.working + known.blocked + known.done)
-            .saturating_sub(self.activities.values().filter(|a| a.persistent).count());
+        self.omitted_activities =
+            (known.working + known.blocked + known.done + self.idle_stop_episodes.len())
+                .saturating_sub(self.activities.values().filter(|a| a.persistent).count());
+    }
+    fn reconcile_outcomes(&mut self, view: &View, scene: &Scene) {
+        let Some(notices) = &view.outcome_notices else {
+            return;
+        };
+        self.activities.retain(|key, a| {
+            key.len() != 11
+                || key.last().is_none_or(|s| s != "outcome")
+                || notices
+                    .get(key)
+                    .is_some_and(|n| a.stop_episode == Some(n.episode))
+        });
+        self.outcome_dismissed
+            .retain(|key, _| notices.get(key).is_some_and(|n| n.dismissed));
+        let mut agents = BTreeMap::new();
+        fn scan<'a>(
+            b: &'a Branch,
+            node: &'a Branch,
+            out: &mut BTreeMap<&'a Key, (&'a Branch, &'a Branch)>,
+        ) {
+            if b.kind == "agent" {
+                out.insert(&b.key, (b, node));
+            }
+            for c in &b.children {
+                scan(c, node, out);
+            }
+        }
+        for n in &scene.nodes {
+            scan(n, n, &mut agents);
+        }
+        for (key, n) in notices.iter() {
+            if n.dismissed {
+                let since = *self
+                    .outcome_dismissed
+                    .entry(key.clone())
+                    .or_insert(self.clock);
+                if self.clock - since >= f64::from(CALLOUT_FADE) {
+                    self.activities.remove(key);
+                }
+                continue;
+            }
+            let state = if n.kind == "done" {
+                AgentState::Completed
+            } else {
+                AgentState::Idle
+            };
+            let current = agents.get(&n.agent);
+            let current_state = current.map_or("no longer observed", |(b, _)| b.status.as_str());
+            let text = format!(
+                "Current state: {}\nNode: {}\nSession: {}\nWorkspace: {}\nAgent: {}",
+                current_state, n.names[0], n.names[1], n.names[2], n.names[3]
+            );
+            let freshness = current.map_or(Freshness::Stale, |(b, _)| b.freshness);
+            let offline = current.is_none_or(|(_, node)| node.status != "connected");
+            if let Some(a) = self.activities.get_mut(key)
+                && a.stop_episode == Some(n.episode)
+            {
+                a.event.text = text;
+                a.freshness = freshness;
+                a.offline = offline;
+                continue;
+            }
+            if self.activities.len() >= MAX_ENTITIES {
+                continue;
+            }
+            self.serial = self.serial.wrapping_add(1);
+            let origin = self.anchor(key).unwrap_or(Id::Node(MAX_NODES));
+            self.activities.insert(
+                key.clone(),
+                Activity {
+                    state,
+                    stop_episode: Some(n.episode),
+                    freshness,
+                    offline,
+                    persistent: true,
+                    event: Event {
+                        serial: self.serial,
+                        origin,
+                        started: self.clock,
+                        title: if n.kind == "done" {
+                            "AGENT COMPLETED"
+                        } else {
+                            "WORK STOPPED — IDLE"
+                        },
+                        text,
+                        color: state.color(),
+                    },
+                },
+            );
+        }
+        let demand = self.totals.states[0]
+            + self.totals.states[1]
+            + notices.values().filter(|n| !n.dismissed).count();
+        self.omitted_activities = demand.saturating_sub(
+            self.activities
+                .iter()
+                .filter(|(key, a)| a.persistent && !notices.get(*key).is_some_and(|n| n.dismissed))
+                .count(),
+        );
+    }
+    fn persistent_state(&self, key: &Key, state: AgentState) -> bool {
+        if self.outcomes_managed {
+            return matches!(state, AgentState::Working | AgentState::Blocked);
+        }
+        state.persistent() || state == AgentState::Idle && self.idle_stop_episodes.contains_key(key)
+    }
+    fn activity_priority(&self, key: &Key, state: AgentState) -> u8 {
+        if self.outcome_agents.contains_key(key)
+            || state == AgentState::Idle && self.idle_stop_episodes.contains_key(key)
+        {
+            AgentState::Completed.priority()
+        } else {
+            state.priority()
+        }
     }
 }
 
@@ -896,6 +1069,28 @@ pub mod tests {
             revision,
             ..Default::default()
         }
+    }
+    #[test]
+    fn a_real_agent_id_named_outcome_is_not_treated_as_a_history_card() {
+        let mut n = node("one", "working", 1);
+        n.herdr.as_mut().unwrap().agents[0].id = "outcome".into();
+        let mut v = view(vec![n], 1);
+        v.outcome_notices = Some(Arc::new(BTreeMap::new()));
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        let key = sim
+            .activities
+            .keys()
+            .find(|k| k.last().unwrap() == "outcome")
+            .unwrap()
+            .clone();
+        assert_eq!(key.len(), 10);
+        let serial = sim.activities[&key].event.serial;
+        v.revision += 1;
+        sim.update(&v, Stamp::seconds(201), 2.);
+        assert!(sim.activities[&key].persistent);
+        assert_eq!(sim.activities[&key].event.serial, serial);
+        assert_eq!(sim.activities[&key].state, AgentState::Working);
     }
     #[test]
     fn scoped_identity_rename_order_and_incarnation_are_preserved() {
@@ -1251,6 +1446,85 @@ pub mod tests {
             "unchanged capacity must retain card identities without replaying entrances"
         );
         assert!(sim.activities.values().all(|a| a.persistent));
+    }
+    #[test]
+    fn idle_stop_history_survives_sampling_and_yields_bounded_capacity_to_attention() {
+        let mut v = view(
+            vec![node("one", "idle", 4095), node("two", "idle", 4095)],
+            1,
+        );
+        let keys = v
+            .scene
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .flat_map(|n| &n.children)
+            .flat_map(|s| &s.children)
+            .flat_map(|w| &w.children)
+            .filter(|a| a.kind == "agent")
+            .map(|a| a.key.clone());
+        v.idle_stop_episodes = Arc::new(keys.enumerate().map(|(i, k)| (k, i as u64 + 1)).collect());
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        assert_eq!(sim.activities.len(), MAX_ENTITIES);
+        assert_eq!(sim.omitted_activities, 16380 - MAX_ENTITIES);
+        assert_eq!(sim.summary().states, [0, 0, 0]);
+        let sampled = sim
+            .activities
+            .keys()
+            .find(|k| sim.id(k).is_none())
+            .unwrap()
+            .clone();
+        assert!(matches!(sim.anchor(&sampled), Some(Id::Node(_))));
+        assert_eq!(sim.activities[&sampled].event.title, "WORK STOPPED — IDLE");
+        let serials: BTreeMap<_, _> = sim
+            .activities
+            .iter()
+            .map(|(k, a)| (k.clone(), a.event.serial))
+            .collect();
+        v.revision += 1;
+        sim.update(&v, Stamp::seconds(201), 60.);
+        assert!(
+            sim.activities
+                .iter()
+                .all(|(k, a)| a.persistent && serials.get(k) == Some(&a.event.serial))
+        );
+        let mut mixed = view(
+            vec![
+                node("one", "idle", 4095),
+                node("two", "idle", 4095),
+                node("blocked", "blocked", 100),
+                node("busy", "working", 100),
+            ],
+            3,
+        );
+        mixed.idle_stop_episodes = v.idle_stop_episodes.clone();
+        sim.update(&mixed, Stamp::seconds(202), 61.);
+        assert_eq!(sim.activities.len(), MAX_ENTITIES);
+        assert_eq!(sim.omitted_activities, 16780 - MAX_ENTITIES);
+        assert_eq!(sim.summary().states, [200, 200, 0]);
+        assert_eq!(
+            sim.activities
+                .values()
+                .filter(|a| a.state == AgentState::Idle && a.persistent)
+                .count(),
+            MAX_ENTITIES - 400
+        );
+        assert_eq!(
+            sim.activities
+                .values()
+                .filter(|a| a.state == AgentState::Blocked)
+                .count(),
+            200
+        );
+        assert_eq!(
+            sim.activities
+                .values()
+                .filter(|a| a.state == AgentState::Working)
+                .count(),
+            200
+        );
     }
     #[test]
     fn completed_downgrades_release_capacity_before_sampled_blocked_admission() {

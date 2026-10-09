@@ -31,45 +31,54 @@ its real node/session/workspace/agent names, including initial/reconnect snapsho
 **W** toggles working callouts only; blocked and completed cards remain visible. State and
 counts, selection and timed notices remain independent of W. Working → blocked
 replaces the work card with persistent ATTENTION REQUIRED, and blocked → working
-replaces attention with work. Completed cards remain until the agent changes state
-or disappears, including agents already done at startup/reconnect. A bracketed **×**
-beside the Focus reticle acknowledges that card's completion locally and retracts
-it. The control glows on hover/keyboard focus; hover help identifies Dismiss.
-The acknowledgement is scoped to the agent's full node/session/incarnation/
-workspace/tab identity **and its current completion instance**. Each accepted
-snapshot is tracked before the UI reads the latest scene, so receiving Working
-then Done rearms its banner even if Working was never drawn. A new completion
-restarts its reveal; unchanged Done/reconnect does not. The acknowledgement lasts for that observed Completed episode, across unchanged
-snapshots/reconnects, until a state change/removal/source reset; a later completion
-appears again. Counts and agent state stay unchanged; selection and Focus remain
-available. Dismissals are saved locally for this OS user and observer port,
-scoped to the verified coordinator and full agent identity. A dismissed completion
-stays hidden after closing/relaunching the viewer or screensaver; undismissed
-Completed cards still appear at startup. A fresh observed
-transition to idle or unknown shows that actual state for ten seconds. Reconnect/stale
-comparisons never invent transition events; retained cards are marked LAST KNOWN. Live removal has a truthful
-no-longer-observed notice. Multiple cards remain pageable without expiring off-page.
-New completion instances receive first-page priority ahead of older activity,
-so finishing a visible worker cannot silently send its completion behind all
-the still-working cards. That priority has no timeout while the agent stays Done;
-later new completions can move older cards to another page. Initial observations,
-unchanged reconnects and geometry resampling do not replay old completions.
-The viewer cannot detect a new task if the observation stream reports Done twice
-without any intervening state/removal or a distinct completion ID.
-This also applies to work completed entirely while the viewer is closed: an
-unchanged Done snapshot cannot identify a new task. Receiving non-Done/removal
-clears the saved acknowledgement immediately, even without drawing a frame.
+replaces attention with work. Each agent has one latest outcome card, independent of its current state:
 
-Acknowledgements are written when you click ×, without waiting for app exit.
-State is kept in `herdr-mesh-visualizer/dismissals-<port>.bin` under
-`%LOCALAPPDATA%` (Windows), `~/Library/Application Support` (macOS), or
-`$XDG_STATE_HOME` / `~/.local/state` (Linux). The file contains only scoped
-identities and acknowledgement IDs, never agent labels, directories or mesh
-credentials. Independent writers merge changes under a bounded file lock;
-atomic replacement preserves the previous file on failed writes. Storage errors
-are reported in the interactive viewer and logs; observation continues. Delete
-this file while viewers are closed to reset acknowledgements. `--tree` does not
-read or write this state. Native Windows/macOS restart acceptance remains manual.
+- **Working → Done → Idle** retains **AGENT COMPLETED** until acknowledged.
+- **Working → Idle**, without Done, retains **WORK STOPPED — IDLE** with neutral
+  Idle color. Startup Idle without recorded history creates no stop.
+- Starting work again keeps the previous unread outcome beside the live Working
+  card. The next Done or direct Working → Idle replaces that outcome with a fresh
+  instance. Old dismissal input cannot hide the replacement.
+- Each card shows its outcome, current state and node/session/workspace/agent
+  names. Counts and markers reflect current observations, including Idle after
+  completion; history does not inflate Completed counts. W hides live Working
+  cards only. Focus resolves to the actual agent, not the historical card.
+- A bracketed **×** beside the Focus reticle acknowledges only that outcome
+  instance and retracts it. The control glows on hover/keyboard focus; hover help
+  identifies Dismiss. Received snapshots are tracked before UI coalescing, so
+  intermediate Working or Done does not have to be drawn.
+- Latest outcomes and dismissal survive viewer/screensaver restart, including
+  startup while Idle, Working or no longer observed. Removed agents retain
+  truthful missing-agent context; leaders appear only when an actual agent/node
+  anchor is available. A new coordinator/session incarnation has a separate scope.
+
+Cards retain sci-fi reveal/retract, first-page stop priority, paging and LAST
+KNOWN freshness treatment. Other fresh observed transitions to unknown can show timed notices.
+Historical outcomes are not
+replaced by those notices. Verified same-source reconnect preserves observations;
+unverified reconnect starts a baseline. The viewer cannot reconstruct work
+completed entirely while closed or a Done → Done cycle with no intervening
+observation/completion identifier. See [the spec and review](../docs/orb-persistent-idle-stops.md).
+
+The latest-outcome journal is written immediately when an outcome is observed
+and updated synchronously when × is clicked, without waiting for app exit.
+It is `herdr-mesh-visualizer/dismissals-<port>.outcomes.bin` under `%LOCALAPPDATA%`
+(Windows), `~/Library/Application Support` (macOS), or `$XDG_STATE_HOME` /
+`~/.local/state` (Linux). It contains verified coordinator/full scoped agent
+identity, instance token, outcome kind, hierarchy display names, observation
+stamp and dismissal. It contains no mesh credentials. The older
+`dismissals-<port>.bin` acknowledgement file is retained for migration; its format
+is unchanged. Close viewers and delete both files to reset local outcome history.
+`--tree` does not read or write this state.
+
+Independent writers merge under a bounded file lock with conditional instance
+replacement, atomic file replacement and explicit errors/retries. The journal
+holds up to 8,000 outcomes across sources and 16 MiB. At capacity, only dismissed
+records outside current Done may be recycled; unread history is preserved and
+further admissions report an error. The independent 8,000-card presentation bound
+prioritizes Blocked/Working and discloses omitted cards; fleet totals remain
+complete. Unverified source or unavailable storage allows session-only history.
+Native Windows/macOS graphical/restart acceptance remains manual.
 
 Orb automatically records completion diagnostics, including Windows screensaver
 and preview launches. No flag or `RUST_LOG` setting is needed. Logs are JSON Lines
@@ -102,22 +111,28 @@ placement. `completion_flyout` explains `drawn`, `revealing`, `off_page`,
 revealed card; it is not a GPU/display readback guarantee. Counts and paging
 remain independent of acknowledgement.
 
+The same files record Idle work stops with `idle_stop_created`,
+`idle_stop_retired`, `idle_stop_priority`, `idle_stop_flyout` and
+`idle_stop_flyout_retired`. Raw `completion_created`/`completion_retired` and
+`idle_stop_created`/`idle_stop_retired` describe current observed-state episodes,
+not retained outcome lifetime. `outcome_available` records the latest retained
+kind/token, dismissed state and superseded previous token/kind. UI records use
+`key` for the real agent and `card_key` for independent presentation identity.
+All episode tokens are decimal strings.
+
 For a dismissal that returns after relaunch, retain logs from both launches.
-`dismiss_input` identifies the UI action; `ack_saved` confirms the synchronous
-disk transaction succeeded in that frame. `ack_applied` with `persisted: false`
-means it closed locally after a save error, with retries recorded as
-`ack_saved_retry`. Startup logs include `ack_storage_config`,
-`ack_restore_attempt` and `ack_restore_result` with actual file presence and
-matched/excluded/other-source counts. `ack_restore_source_mismatch` identifies
-another saved coordinator namespace without deleting its entries.
-`ack_restore_excluded` explains each retired saved record as `agent_missing`,
-`agent_not_done`, or `completion_changed_during_restore` (an observed cycle while
-the file was unavailable). `ack_restore_failed` records read/lock/write errors;
-`ack_restore_unavailable` explains disabled storage or unverified identity.
-Matching entries emit `ack_restored` before the scene reaches the renderer.
-Compare build, port, source, full key and episode across the two runs. A missing
-or changed identity is evidence to investigate, not proof that the user dismissed
-another task or that the upstream service is at fault.
+`dismiss_input` identifies the UI action; `outcome_ack_requested`,
+`outcome_ack_saved` and `outcome_ack_applied` report receiver revalidation and
+synchronous journal durability. `persisted: false` means session-only input or a
+storage error, not a successful save. `outcome_journal_ready` records published
+pending/dismissed counts and durability, including the initial publication;
+`outcome_journal_error` and `outcome_journal_recovered` explain failures/retries.
+`outcome_ack_rejected_stale` identifies input for a superseded instance;
+`outcome_ack_imported` reports a concurrent dismissal. Legacy `ack_restore_*`
+records describe migration from the older acknowledgement file and do not retire
+the independently retained latest outcome. Compare build, port, source, full key
+and episode across the two runs. A changed identity is evidence to investigate,
+not proof of user dismissal or an upstream fault.
 
 State and visibility are logged only when they change; receipt counts are logged
 per accepted snapshot, never per animation frame. A bounded background queue
