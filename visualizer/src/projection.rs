@@ -84,6 +84,13 @@ fn bounded_text(s: &str, limit: usize) -> String {
     }
     out
 }
+fn version(value: &str) -> String {
+    if value.is_empty() || value.chars().any(char::is_control) || value.len() > 256 {
+        "unknown".into()
+    } else {
+        label(value)
+    }
+}
 fn named(display: &str, id: &str) -> String {
     label(if display.is_empty() { id } else { display })
 }
@@ -165,12 +172,10 @@ pub fn coordinator(info: Option<&crate::pb::ServerInfo>) -> Branch {
         "identity unavailable"
     }
     .into();
-    if let Some(info) = verified {
-        root.details.push(format!(
-            "Coordinator version: {}",
-            label(&info.implementation_version)
-        ));
-    }
+    root.details.push(format!(
+        "Coordinator version: {}",
+        version(verified.map_or("", |info| &info.implementation_version))
+    ));
     root.details
         .push("Logical control root; execution role is counted separately.".into());
     root
@@ -239,6 +244,7 @@ pub fn project(snapshot: NodeList) -> Result<Scene, String> {
             contexts: vec![],
         };
         node.details.extend([
+            format!("herdr-mesh version: {}", version(&n.implementation_version)),
             format!("Tailscale stable ID: {}", label(&n.tailscale_stable_id)),
             format!(
                 "Readiness: commands {}, workspaces {}, worktrees {}, agents {}, sessions {}",
@@ -250,6 +256,10 @@ pub fn project(snapshot: NodeList) -> Result<Scene, String> {
             ),
             format!("Session discovery error: {}", label(&n.sessions_error_code)),
         ]);
+        node.details.push(format!(
+            "Herdr · Configured default: {}",
+            version(n.herdr.as_ref().map_or("", |h| &h.version))
+        ));
         let discovered = n.sessions_ready
             || n.sessions_received_at.is_some()
             || !n.sessions_error_code.is_empty()
@@ -264,6 +274,7 @@ pub fn project(snapshot: NodeList) -> Result<Scene, String> {
                 receipt(n.herdr_received_at.as_ref(), n.connected, n.stale),
             );
             session.key.push(String::new()); // explicit incarnation component
+
             populate(&mut session, n.herdr.as_ref(), &mut scene)?;
             counts
                 .contexts
@@ -294,6 +305,11 @@ pub fn project(snapshot: NodeList) -> Result<Scene, String> {
                 label(&s.incarnation),
                 label(&s.status),
                 label(&s.error_code)
+            ));
+            node.details.push(format!(
+                "Herdr · {}: {}",
+                label(&s.name),
+                version(s.herdr.as_ref().map_or("", |h| &h.version))
             ));
             populate(&mut session, s.herdr.as_ref(), &mut scene)?;
             if s.status != "ready" {
@@ -372,6 +388,7 @@ fn populate(
 ) -> Result<(), String> {
     let Some(h) = state else {
         session.status = "no observation".into();
+        session.details.push("Herdr version: unknown".into());
         if matches!(session.freshness, Freshness::Receipt(_)) {
             session.freshness = Freshness::Unknown;
         }
@@ -384,7 +401,7 @@ fn populate(
     session.details.push(format!(
         "Herdr {} · version {} · error {}",
         label(&h.status),
-        label(&h.version),
+        version(&h.version),
         label(&h.error_code)
     ));
     if h.workspaces.len() + h.tabs.len() + h.panes.len() + h.agents.len() > MAX_ENTITIES {
@@ -746,5 +763,46 @@ mod tests {
             scene.working, 1,
             "retained observation remains counted as last-known"
         );
+    }
+    #[test]
+    fn additive_node_version_field_survives_protobuf_and_keeps_old_peers_unknown() {
+        use prost::Message;
+        let snapshot = NodeList {
+            nodes: vec![
+                NodeView {
+                    instance_id: "updated".into(),
+                    implementation_version: "member-v5".into(),
+                    ..Default::default()
+                },
+                NodeView {
+                    instance_id: "old".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let decoded = NodeList::decode(snapshot.encode_to_vec().as_slice()).unwrap();
+        let scene = project(decoded).unwrap();
+        assert!(
+            scene
+                .nodes
+                .iter()
+                .find(|n| n.key[1] == "updated")
+                .unwrap()
+                .details
+                .iter()
+                .any(|s| s == "herdr-mesh version: member-v5")
+        );
+        assert!(
+            scene
+                .nodes
+                .iter()
+                .find(|n| n.key[1] == "old")
+                .unwrap()
+                .details
+                .iter()
+                .any(|s| s == "herdr-mesh version: unknown")
+        );
+        assert_eq!(version("bad\nversion"), "unknown");
+        assert_eq!(version(&"v".repeat(257)), "unknown");
     }
 }

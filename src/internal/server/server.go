@@ -270,7 +270,7 @@ func (service *service) Connect(stream grpc.BidiStreamingServer[agentflowv1.Node
 			result = err
 		}
 	}()
-	if err := service.fleet.setLogicalName(entry, hello.Hostname); err != nil {
+	if err := service.fleet.setHelloMetadata(entry, hello.Hostname, hello.ImplementationVersion); err != nil {
 		return err
 	}
 	service.fleet.mu.Lock()

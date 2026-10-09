@@ -3951,9 +3951,11 @@ type NodeView struct {
 	SessionsReceivedAt *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=sessions_received_at,json=sessionsReceivedAt,proto3" json:"sessions_received_at,omitempty"`
 	SessionsErrorCode  string                 `protobuf:"bytes,15,opt,name=sessions_error_code,json=sessionsErrorCode,proto3" json:"sessions_error_code,omitempty"`
 	// Operator-assigned logical node name, not a native machine inventory label.
-	Hostname      string `protobuf:"bytes,16,opt,name=hostname,proto3" json:"hostname,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Hostname string `protobuf:"bytes,16,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	// Read-only implementation metadata supplied in the authenticated node Hello.
+	ImplementationVersion string `protobuf:"bytes,17,opt,name=implementation_version,json=implementationVersion,proto3" json:"implementation_version,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *NodeView) Reset() {
@@ -4094,6 +4096,13 @@ func (x *NodeView) GetSessionsErrorCode() string {
 func (x *NodeView) GetHostname() string {
 	if x != nil {
 		return x.Hostname
+	}
+	return ""
+}
+
+func (x *NodeView) GetImplementationVersion() string {
+	if x != nil {
+		return x.ImplementationVersion
 	}
 	return ""
 }
@@ -5082,7 +5091,7 @@ const file_agentflow_v1_control_proto_rawDesc = "" +
 	"\x04tabs\x18\b \x03(\v2\x19.agentflow.v1.HerdrEntityR\x04tabs\x12/\n" +
 	"\x05panes\x18\t \x03(\v2\x19.agentflow.v1.HerdrEntityR\x05panes\x121\n" +
 	"\x06agents\x18\n" +
-	" \x03(\v2\x19.agentflow.v1.HerdrEntityR\x06agents\"\xce\x05\n" +
+	" \x03(\v2\x19.agentflow.v1.HerdrEntityR\x06agents\"\x85\x06\n" +
 	"\bNodeView\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12.\n" +
@@ -5102,7 +5111,8 @@ const file_agentflow_v1_control_proto_rawDesc = "" +
 	"\x0esessions_ready\x18\r \x01(\bR\rsessionsReady\x12L\n" +
 	"\x14sessions_received_at\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\x12sessionsReceivedAt\x12.\n" +
 	"\x13sessions_error_code\x18\x0f \x01(\tR\x11sessionsErrorCode\x12\x1a\n" +
-	"\bhostname\x18\x10 \x01(\tR\bhostname\"8\n" +
+	"\bhostname\x18\x10 \x01(\tR\bhostname\x125\n" +
+	"\x16implementation_version\x18\x11 \x01(\tR\x15implementationVersion\"8\n" +
 	"\bNodeList\x12,\n" +
 	"\x05nodes\x18\x01 \x03(\v2\x16.agentflow.v1.NodeViewR\x05nodes\"\xc5\x01\n" +
 	"\vAgentTarget\x12\x17\n" +
