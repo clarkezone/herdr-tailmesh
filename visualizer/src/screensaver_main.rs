@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod animation;
+mod compact_window;
 mod fleet_panel;
 mod launch;
 mod mesh_legend;
