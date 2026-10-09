@@ -11,8 +11,20 @@ adversarial review are maintained in ai-core under Object Class Callouts.
   bracketed × to close it. Bulk and clicked cards deduplicate by full projected
   identity. A closed bulk item stays hidden until its class is toggled off/on
   or the item is explicitly selected again.
+- Selected cards show their own name, an **↑ parent** row and **→ direct child**
+  rows with matching role glyphs. Clicking a row replaces the selection, without
+  changing explicit Focus, class toggles or outcome acknowledgements. Coordinator
+  is the logical parent of all nodes; the coordinator has no parent and agent
+  leaves omit children. Relationships use the actual observed tree and complete
+  keys, including session incarnations and agent tab scope.
+- Child inventories are complete, bounded to the scrolling card and virtualized.
+  Long row labels truncate with full-name hover help. Explicit navigation reaches
+  sampled inventory too: those cards disclose the missing marker and have no
+  fallback leader/highlight. Bulk cards remain limited to represented geometry.
+  Passive, unrevealed and exiting cards cannot navigate; targets are checked
+  against the current scene before selection changes.
 - Cards show their actual legend glyph, scoped names, current status/freshness,
-  details and child counts. They connect to their exact GPU representation.
+  details and child counts. Represented cards connect to their exact GPU representation.
   Node cards show that node's herdr-mesh version and its session Herdr versions.
   Missing metadata is unknown; a coordinator version is never a member version.
 - The shared bracketed reticle focuses a descendant's node rose. Coordinator

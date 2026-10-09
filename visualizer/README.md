@@ -21,7 +21,14 @@ not reset these preferences or replay the startup key.
 **N**, **S**, and **W** independently toggle node, session, and workspace
 callouts. Clicking any sphere object opens its typed card with the exact legend
 glyph, scoped names, status and details. Click again, blank space, or its bracketed
-× to close it. Bulk and clicked cards share one identity; closing a bulk card hides
+× to close it. Selected cards also show a clickable **↑ parent** and **→ direct
+children** list with matching role glyphs. Each link replaces the selection, so
+you can walk coordinator → node → session → workspace → agent and back. Agent
+leaves omit children, and the coordinator has no parent. Large lists scroll;
+hover a shortened name to read it in full. Navigation also reaches observed
+objects omitted by geometry sampling: their cards explain the missing marker
+and have no connecting line. Navigation preserves explicit Focus and never
+acknowledges outcomes. Bulk and clicked cards share one identity; closing a bulk card hides
 that item until its class is toggled off/on or it is selected again. Typed × never
 acknowledges historical outcomes. Node cards show herdr-mesh and session Herdr
 versions; old coordinators report the mesh version as unknown. Rebuild the

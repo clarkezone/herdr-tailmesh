@@ -5,7 +5,7 @@ use crate::{
 };
 use herdr_mesh_visualizer::{
     client::View,
-    projection::{Branch, Key, wall_now},
+    projection::{Branch, Key, Scene, wall_now},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -27,10 +27,79 @@ impl Class {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Related {
+    pub key: Key,
+    pub kind: &'static str,
+    pub label: String,
+    pub status: String,
+}
+impl Related {
+    fn from(branch: &Branch) -> Self {
+        Self {
+            key: branch.key.clone(),
+            kind: branch.kind,
+            label: branch.label.clone(),
+            status: branch.status.clone(),
+        }
+    }
+    pub fn glyph(&self) -> Glyph {
+        glyph(self.kind, &self.status)
+    }
+}
+#[derive(Debug, PartialEq, Eq)]
+pub struct Relations {
+    pub label: String,
+    pub parent: Option<Related>,
+    pub children: Vec<Related>,
+}
+// Keys encode different scopes at different levels. Walk the observed tree,
+// including the separately stored logical coordinator, rather than trimming keys.
+fn selected_path<'a>(scene: &'a Scene, key: &Key) -> Option<Vec<&'a Branch>> {
+    fn walk<'a>(branch: &'a Branch, key: &Key, path: &mut Vec<&'a Branch>) -> bool {
+        path.push(branch);
+        if &branch.key == key {
+            return true;
+        }
+        for child in &branch.children {
+            if walk(child, key, path) {
+                return true;
+            }
+        }
+        path.pop();
+        false
+    }
+    let mut path: Vec<_> = scene.coordinator.iter().collect();
+    if path.last().is_some_and(|b| &b.key == key) {
+        return Some(path);
+    }
+    for node in &scene.nodes {
+        if walk(node, key, &mut path) {
+            return Some(path);
+        }
+    }
+    None
+}
+fn glyph(kind: &str, status: &str) -> Glyph {
+    match kind {
+        "coordinator" => Glyph::Coordinator,
+        "node" => Glyph::Node,
+        "session" => Glyph::Session,
+        "workspace" => Glyph::Workspace,
+        _ => Glyph::Agent(match status {
+            "working" => AgentState::Working,
+            "blocked" => AgentState::Blocked,
+            "done" => AgentState::Completed,
+            "idle" => AgentState::Idle,
+            _ => AgentState::Unknown,
+        }),
+    }
+}
 pub struct Object {
     pub key: Key,
     pub event: Event,
     pub glyph: Glyph,
+    pub relations: Option<Relations>,
 }
 #[derive(Default)]
 pub struct Objects {
@@ -88,6 +157,36 @@ impl Objects {
             for node in &scene.nodes {
                 self.scan(node, &mut path, sim, view, &mut desired, &mut present);
             }
+            // Explicit selection can walk the complete observed inventory even
+            // when GPU sampling omits that object or its ancestors.
+            if let Some(selected) = self
+                .selected
+                .as_ref()
+                .and_then(|key| selected_path(scene, key))
+            {
+                let branch = selected[selected.len() - 1];
+                present.insert(branch.key.clone());
+                if !self.suppressed.contains(&branch.key) {
+                    let path = selected[..selected.len() - 1]
+                        .iter()
+                        .map(|b| format!("{}: {}", b.kind, b.label))
+                        .collect::<Vec<_>>();
+                    let children = if branch.kind == "coordinator" {
+                        &scene.nodes
+                    } else {
+                        &branch.children
+                    };
+                    let relations = Relations {
+                        label: branch.label.clone(),
+                        parent: selected.iter().rev().nth(1).map(|b| Related::from(b)),
+                        children: children.iter().map(Related::from).collect(),
+                    };
+                    desired.insert(
+                        branch.key.clone(),
+                        self.object(branch, &path, sim, view, Some(relations)),
+                    );
+                }
+            }
         }
         self.suppressed.retain(|key| present.contains(key));
         self.cards = desired;
@@ -118,94 +217,101 @@ impl Objects {
             "workspace" => self.enabled[2],
             _ => false,
         };
-        let selected = self.selected.as_ref() == Some(&branch.key);
-        if represented && (bulk || selected) && !self.suppressed.contains(&branch.key) {
-            let glyph = match branch.kind {
-                "coordinator" => Glyph::Coordinator,
-                "node" => Glyph::Node,
-                "session" => Glyph::Session,
-                "workspace" => Glyph::Workspace,
-                _ => Glyph::Agent(match branch.status.as_str() {
-                    "working" => AgentState::Working,
-                    "blocked" => AgentState::Blocked,
-                    "done" => AgentState::Completed,
-                    "idle" => AgentState::Idle,
-                    _ => AgentState::Unknown,
-                }),
-            };
-            let mut lines = path.clone();
-            lines.push(format!("{}: {}", branch.kind, branch.label));
-            lines.push(format!(
-                "State: {} · {}",
-                if branch.status.is_empty() {
-                    "not reported"
-                } else {
-                    &branch.status
-                },
-                if view.live && branch.kind == "coordinator" {
-                    "control connection live".into()
-                } else if view.live {
-                    branch.freshness.label_at(wall_now()).to_string()
-                } else {
-                    "LAST KNOWN · disconnected".into()
-                }
-            ));
-            if let Some(stamp) = branch.last_seen {
-                lines.push(format!(
-                    "Last seen: {}",
-                    if stamp <= wall_now() {
-                        format!(
-                            "{}s ago",
-                            (wall_now().nanos() - stamp.nanos()) / 1_000_000_000
-                        )
-                    } else {
-                        "unknown (clock ahead)".into()
-                    }
-                ));
-            }
-            if !branch.children.is_empty() {
-                lines.push(format!(
-                    "{} {}",
-                    branch.children.len(),
-                    match branch.kind {
-                        "node" => "sessions",
-                        "session" => "workspaces",
-                        "workspace" => "agents",
-                        _ => "children",
-                    }
-                ));
-            }
-            lines.extend(branch.details.iter().cloned());
-            let text = lines.join("\n");
-            let title = match branch.kind {
-                "coordinator" => "COORDINATOR",
-                "node" => "NODE",
-                "session" => "SESSION",
-                "workspace" => "WORKSPACE",
-                _ => "AGENT",
-            };
-            let old = self.cards.get(&branch.key).filter(|o| o.event.text == text);
-            let card = old.cloned().unwrap_or_else(|| {
-                Arc::new(Object {
-                    key: branch.key.clone(),
-                    glyph,
-                    event: Event {
-                        serial: 0,
-                        origin: id.unwrap_or(Id::Node(0)),
-                        started: sim.clock,
-                        title,
-                        text,
-                        color: glyph.color(),
-                    },
-                })
-            });
-            cards.insert(branch.key.clone(), card);
+        if bulk && !self.suppressed.contains(&branch.key) {
+            cards.insert(
+                branch.key.clone(),
+                self.object(branch, path, sim, view, None),
+            );
         }
         path.push(format!("{}: {}", branch.kind, branch.label));
         for child in &branch.children {
             self.scan(child, path, sim, view, cards, present);
         }
         path.pop();
+    }
+    fn object(
+        &self,
+        branch: &Branch,
+        path: &[String],
+        sim: &Simulation,
+        view: &View,
+        relations: Option<Relations>,
+    ) -> Arc<Object> {
+        let id = sim.id(&branch.key);
+        let glyph = glyph(branch.kind, &branch.status);
+        let mut lines = path.to_vec();
+        lines.push(format!("{}: {}", branch.kind, branch.label));
+        lines.push(format!(
+            "State: {} · {}",
+            if branch.status.is_empty() {
+                "not reported"
+            } else {
+                &branch.status
+            },
+            if view.live && branch.kind == "coordinator" {
+                "control connection live".into()
+            } else if view.live {
+                branch.freshness.label_at(wall_now()).to_string()
+            } else {
+                "LAST KNOWN · disconnected".into()
+            }
+        ));
+        if let Some(stamp) = branch.last_seen {
+            lines.push(format!(
+                "Last seen: {}",
+                if stamp <= wall_now() {
+                    format!(
+                        "{}s ago",
+                        (wall_now().nanos() - stamp.nanos()) / 1_000_000_000
+                    )
+                } else {
+                    "unknown (clock ahead)".into()
+                }
+            ));
+        }
+        if !branch.children.is_empty() {
+            lines.push(format!(
+                "{} {}",
+                branch.children.len(),
+                match branch.kind {
+                    "node" => "sessions",
+                    "session" => "workspaces",
+                    "workspace" => "agents",
+                    _ => "children",
+                }
+            ));
+        }
+        if id.is_none() && branch.kind != "coordinator" {
+            lines.push("Marker omitted by geometry sampling · no connecting line".into());
+        }
+        lines.extend(branch.details.iter().cloned());
+        let text = lines.join("\n");
+        let title = match branch.kind {
+            "coordinator" => "COORDINATOR",
+            "node" => "NODE",
+            "session" => "SESSION",
+            "workspace" => "WORKSPACE",
+            _ => "AGENT",
+        };
+        let old = self
+            .cards
+            .get(&branch.key)
+            .filter(|o| o.event.text == text && o.relations == relations);
+        old.cloned().unwrap_or_else(|| {
+            Arc::new(Object {
+                key: branch.key.clone(),
+                glyph,
+                relations,
+                event: Event {
+                    serial: 0,
+                    origin: id.unwrap_or(Id::Node(0)),
+                    started: sim.clock,
+                    title,
+                    text,
+                    color: glyph.color(),
+                },
+            })
+        })
     }
 }
 
@@ -214,6 +320,54 @@ mod tests {
     use super::*;
     use crate::mesh_model::tests::{node, view};
     use herdr_mesh_visualizer::heartbeat::Stamp;
+    #[test]
+    fn relationships_walk_actual_root_to_leaf_and_keep_same_names_in_distinct_scopes() {
+        let v = view(vec![node("one", "idle", 1), node("two", "done", 1)], 1);
+        let scene = v.scene.as_ref().unwrap();
+        let root = scene.coordinator.as_ref().unwrap();
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 2.);
+        let mut objects = Objects::default();
+        objects.update(&sim, &v, Some(&root.key));
+        let relations = objects.cards[&root.key].relations.as_ref().unwrap();
+        assert!(relations.parent.is_none());
+        assert_eq!(relations.children.len(), 2);
+        assert_eq!(relations.children[1].key, scene.nodes[1].key);
+        for node in &scene.nodes {
+            let session = &node.children[1];
+            let workspace = &session.children[0];
+            let agent = &workspace.children[0];
+            let chain = [root, node, session, workspace, agent];
+            for (i, object) in chain.iter().enumerate() {
+                objects.update(&sim, &v, Some(&object.key));
+                let relations = objects.cards[&object.key].relations.as_ref().unwrap();
+                assert_eq!(
+                    relations.parent.as_ref().map(|p| &p.key),
+                    i.checked_sub(1).map(|p| &chain[p].key)
+                );
+                if let Some(child) = chain.get(i + 1) {
+                    assert!(relations.children.iter().any(|c| c.key == child.key));
+                } else {
+                    assert!(relations.children.is_empty());
+                    assert!(matches!(objects.cards[&object.key].glyph, Glyph::Agent(_)));
+                }
+            }
+        }
+        let mut no_root = view(vec![node("one", "idle", 1)], 2);
+        Arc::get_mut(no_root.scene.as_mut().unwrap())
+            .unwrap()
+            .coordinator = None;
+        objects.update(&sim, &no_root, Some(&scene.nodes[0].key));
+        assert!(
+            objects.cards[&scene.nodes[0].key]
+                .relations
+                .as_ref()
+                .unwrap()
+                .parent
+                .is_none()
+        );
+    }
+
     #[test]
     fn independent_bulk_toggles_deduplicate_selection_and_close_only_exact_scope() {
         let v = view(
@@ -319,7 +473,32 @@ mod tests {
             .clone();
         let mut objects = Objects::default();
         objects.update(&sim, &v, Some(&omitted));
-        assert!(objects.cards.is_empty());
+        assert!(
+            objects.cards[&omitted]
+                .event
+                .text
+                .contains("Marker omitted by geometry sampling")
+        );
+        assert!(
+            objects.cards[&omitted]
+                .relations
+                .as_ref()
+                .unwrap()
+                .children
+                .is_empty()
+        );
+        let parent = selected_path(v.scene.as_ref().unwrap(), &omitted).unwrap();
+        let workspace = parent[parent.len() - 2];
+        objects.update(&sim, &v, Some(&workspace.key));
+        assert!(
+            objects.cards[&workspace.key]
+                .relations
+                .as_ref()
+                .unwrap()
+                .children
+                .iter()
+                .any(|c| c.key == omitted)
+        );
         objects.toggle(Class::Session);
         objects.update(&sim, &v, None);
         let old = objects

@@ -359,6 +359,7 @@ pub struct Context<'a> {
 pub struct Response {
     pub blocked: Vec<Rect>,
     pub clear_selection: bool,
+    pub navigate_to: Option<Key>,
 }
 struct Dock {
     panel: Panel,
@@ -777,6 +778,9 @@ fn card_anchor(card: &Card<'_>, sim: &Simulation, rect: Rect) -> Option<Pos2> {
     if card.typed.is_some() {
         let key = card.key?;
         let position = if key.first().is_some_and(|k| k == "coordinator") {
+            if sim.coordinator_key() != Some(key) {
+                return None;
+            }
             mesh_orb::coordinator(sim.motion_time())
         } else {
             mesh_orb::visible_position(sim, sim.id(key)?)
@@ -866,15 +870,20 @@ fn card_size(
     );
     vec2(
         width,
-        (heading
-            .size()
-            .y
-            .max(if card.typed.is_some() { 34. } else { 0. })
-            + body.size().y
-            + 34.
-            + 24.
-            + if pager { 28. } else { 0. })
-        .min(limit.y),
+        if card.typed.is_some() && card.pinned {
+            // Hierarchy navigation shares the bounded, scrollable body.
+            limit.y
+        } else {
+            (heading
+                .size()
+                .y
+                .max(if card.typed.is_some() { 34. } else { 0. })
+                + body.size().y
+                + 34.
+                + 24.
+                + if pager { 28. } else { 0. })
+            .min(limit.y)
+        },
     )
 }
 fn places(
@@ -1075,6 +1084,129 @@ fn dismiss_stop(
         } else {
             "Dismiss this completion; a later completion will appear again"
         });
+}
+
+fn related_link(
+    ui: &mut Ui,
+    bounds: Rect,
+    related: &crate::orb_objects::Related,
+    parent: bool,
+    time: f32,
+) -> bool {
+    let response = ui.interact(
+        bounds,
+        ui.id().with(("related-object", &related.key)),
+        egui::Sense::click(),
+    );
+    let painter = ui
+        .painter()
+        .with_clip_rect(bounds.intersect(ui.clip_rect()));
+    let color = Color32::from_rgb(175, 225, 240);
+    let glow = response.hovered() || response.has_focus();
+    painter.rect_filled(
+        bounds,
+        2.,
+        CYAN.gamma_multiply(if glow { 0.15 } else { 0.04 }),
+    );
+    mesh_legend::sample(
+        &painter,
+        related.glyph(),
+        Rect::from_min_size(bounds.min + vec2(2., 2.), vec2(22., 22.)),
+        time,
+    );
+    let mut job = egui::text::LayoutJob::simple(
+        format!(
+            "{} {} · {}",
+            if parent { "↑" } else { "→" },
+            related.kind.to_uppercase(),
+            related.label
+        ),
+        FontId::monospace(10.),
+        color,
+        (bounds.width() - 30.).max(1.),
+    );
+    // Keep each virtualized row a fixed height even for very long names.
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let label = painter.layout_job(job);
+    painter.galley(
+        pos2(
+            bounds.left() + 28.,
+            bounds.center().y - label.size().y * 0.5,
+        ),
+        label,
+        color,
+    );
+    if glow {
+        painter.rect_stroke(
+            bounds.shrink(0.5),
+            2.,
+            Stroke::new(1., CYAN),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let clicked = response.clicked();
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("Select {}: {}", related.kind, related.label));
+    clicked
+}
+
+fn hierarchy_links(
+    ui: &mut Ui,
+    viewport: Rect,
+    relations: &crate::orb_objects::Relations,
+    time: f32,
+    navigate_to: &mut Option<Key>,
+) {
+    let origin = ui.cursor().top();
+    ui.label(
+        egui::RichText::new(&relations.label)
+            .monospace()
+            .size(11.)
+            .strong()
+            .color(CYAN),
+    );
+    if let Some(parent) = &relations.parent {
+        ui.label(
+            egui::RichText::new("PARENT")
+                .monospace()
+                .size(10.)
+                .color(CYAN),
+        );
+        let (_, bounds) = ui.allocate_space(vec2(ui.available_width(), 26.));
+        if related_link(ui, bounds, parent, true, time) {
+            *navigate_to = Some(parent.key.clone());
+        }
+    }
+    if !relations.children.is_empty() {
+        ui.label(
+            egui::RichText::new(format!("CHILDREN ({})", relations.children.len()))
+                .monospace()
+                .size(10.)
+                .color(CYAN),
+        );
+        let row_height = 28.;
+        let (_, list) = ui.allocate_space(vec2(
+            ui.available_width(),
+            row_height * relations.children.len() as f32,
+        ));
+        let offset = list.top() - origin;
+        let first = ((viewport.top() - offset) / row_height).floor().max(0.) as usize;
+        let end = (((viewport.bottom() - offset) / row_height).ceil().max(0.) as usize + 1)
+            .min(relations.children.len());
+        for index in first..end {
+            let child = &relations.children[index];
+            let bounds = Rect::from_min_size(
+                list.min + vec2(0., index as f32 * row_height),
+                vec2(list.width(), 26.),
+            );
+            if related_link(ui, bounds, child, false, time) {
+                *navigate_to = Some(child.key.clone());
+            }
+        }
+    }
+    ui.separator();
 }
 
 pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response {
@@ -1352,7 +1484,24 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         egui::ScrollArea::vertical()
             .max_height(body.height().max(1.))
             .auto_shrink([false, false])
-            .show(&mut child, |ui| {
+            .show_viewport(&mut child, |ui, viewport| {
+                if !context.passive
+                    && index.is_some()
+                    && card.typed.is_some()
+                    && card.key == context.selected
+                    && let Some(relations) = card
+                        .key
+                        .and_then(|key| state.objects.cards.get(key))
+                        .and_then(|object| object.relations.as_ref())
+                {
+                    hierarchy_links(
+                        ui,
+                        viewport,
+                        relations,
+                        context.sim.time,
+                        &mut response.navigate_to,
+                    );
+                }
                 ui.label(
                     egui::RichText::new(&card.event.text)
                         .monospace()
@@ -1619,6 +1768,150 @@ mod tests {
             repeat,
             modifiers: Default::default(),
         }
+    }
+    #[test]
+    fn hierarchy_virtualizes_children_and_scrolling_reaches_the_exact_last_child() {
+        use crate::orb_objects::{Related, Relations};
+        let relations = Relations {
+            label: "Selected workspace".into(),
+            parent: None,
+            children: (0..4096)
+                .map(|i| Related {
+                    key: vec!["scoped-child".into(), i.to_string()],
+                    kind: "agent",
+                    label: format!("Agent {i:04} {}", "long name ".repeat(40)),
+                    status: "idle".into(),
+                })
+                .collect(),
+        };
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(300., 180.));
+        let frame = |events, disabled, offset| {
+            let mut navigation = None;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    if disabled {
+                        ui.disable();
+                    }
+                    let scroll = egui::ScrollArea::vertical()
+                        .max_height(150.)
+                        .auto_shrink([false, false])
+                        .animated(false);
+                    let scroll = if let Some(offset) = offset {
+                        scroll.vertical_scroll_offset(offset)
+                    } else {
+                        scroll
+                    };
+                    scroll.show_viewport(ui, |ui, viewport| {
+                        hierarchy_links(ui, viewport, &relations, 0., &mut navigation);
+                    });
+                },
+            );
+            let labels = out
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(t) = &shape.shape {
+                        let point = t.pos + vec2(10., t.galley.size().y * 0.5);
+                        shape
+                            .clip_rect
+                            .contains(point)
+                            .then(|| (t.galley.text().to_string(), point))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            out.textures_delta.clear();
+            (navigation, labels)
+        };
+        let (_, first) = frame(vec![], false, Some(0.));
+        assert!(
+            first
+                .iter()
+                .any(|(text, _)| text.starts_with("→ AGENT · Agent 0000"))
+        );
+        assert!(
+            first.len() < 12,
+            "only viewport rows should become widgets/galleys"
+        );
+        frame(vec![], false, Some(1_000_000.));
+        // ScrollArea clamps a requested overshoot after measuring the content.
+        let (_, last) = frame(vec![], false, None);
+        assert!(last.len() < 12);
+        let point = last
+            .iter()
+            .find(|(text, _)| text.starts_with("→ AGENT · Agent 4095"))
+            .unwrap_or_else(|| panic!("last child remains reachable: {last:?}"))
+            .1;
+        let click = |pressed| {
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        frame(click(true), true, None);
+        assert!(
+            frame(click(false), true, None).0.is_none(),
+            "unrevealed/exiting controls cannot navigate"
+        );
+        // Register the newly enabled rows before dispatching pointer input.
+        frame(vec![], false, None);
+        frame(click(true), false, None);
+        assert_eq!(
+            frame(click(false), false, None).0.as_ref(),
+            Some(&relations.children[4095].key)
+        );
+    }
+    #[test]
+    fn selected_sampled_agents_and_stale_coordinators_have_no_fallback_leader() {
+        let v = view(vec![node("one", "idle", 3999)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 2.);
+        let scene = v.scene.as_ref().unwrap();
+        let key = scene.nodes[0]
+            .children
+            .iter()
+            .flat_map(|s| &s.children)
+            .flat_map(|w| &w.children)
+            .find(|a| sim.id(&a.key).is_none())
+            .unwrap()
+            .key
+            .clone();
+        let mut objects = crate::orb_objects::Objects::default();
+        objects.update(&sim, &v, Some(&key));
+        let mut card = Card {
+            event: &objects.cards[&key].event,
+            key: Some(&key),
+            persistent: true,
+            working: false,
+            attention: false,
+            acknowledgeable: false,
+            typed: Some(objects.cards[&key].glyph),
+            pinned: true,
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1200., 800.));
+        assert!(card_anchor(&card, &sim, rect).is_none());
+        assert!(
+            sim.entities.contains_key(&card.event.origin),
+            "a fallback node slot exists but must not be used"
+        );
+        card.typed = Some(mesh_orb::Glyph::Coordinator);
+        card.key = Some(&scene.coordinator.as_ref().unwrap().key);
+        assert!(card_anchor(&card, &sim, rect).is_some());
+        let stale = vec!["coordinator".into(), "another-instance".into()];
+        card.key = Some(&stale);
+        assert!(card_anchor(&card, &sim, rect).is_none());
     }
     #[test]
     fn actual_keyboard_events_ignore_repeat_release_passive_and_preserve_source_preferences() {
@@ -3533,6 +3826,7 @@ mod tests {
         let mut state = Panels::default();
         let objects: Vec<_> = (0..192)
             .map(|i| crate::orb_objects::Object {
+                relations: None,
                 key: vec!["coordinator".into(), format!("root-{i}")],
                 glyph: mesh_orb::Glyph::Coordinator,
                 event: Event {

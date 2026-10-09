@@ -152,7 +152,16 @@ impl OrbUi {
         if panels.clear_selection {
             self.selected = None;
         }
+        let navigated = panels.navigate_to.is_some();
         if !passive
+            && let Some(key) = panels.navigate_to
+            && selected_branch(view, &key).is_some()
+        {
+            self.selected = Some(key);
+            self.panels.projects = false;
+        }
+        if !passive
+            && !navigated
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
             && !panels.blocked.iter().any(|bounds| bounds.contains(pointer))
@@ -230,6 +239,114 @@ mod tests {
             egui::Shape::Vec(v) => v.iter().any(|s| text(s, needle)),
             _ => false,
         }
+    }
+    #[test]
+    fn pointer_hierarchy_links_replace_selection_through_the_whole_tree_without_acknowledging() {
+        let context = egui::Context::default();
+        let mut orb = OrbUi::default();
+        let v = view(vec![node("one", "idle", 1), node("two", "done", 1)], 1);
+        let scene = v.scene.as_ref().unwrap();
+        let root = scene.coordinator.as_ref().unwrap();
+        let node = &scene.nodes[1];
+        let session = &node.children[1];
+        let workspace = &session.children[0];
+        let agent = &workspace.children[0];
+        let frame = |orb: &mut OrbUi, clock, events| {
+            let mut out = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1920., 1080.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    orb.draw(ui, &v, 8790, false, clock);
+                },
+            );
+            let labels = out
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(t) = &shape.shape {
+                        let point = t.pos + egui::vec2(8., t.galley.size().y * 0.5);
+                        shape
+                            .clip_rect
+                            .contains(point)
+                            .then(|| (t.galley.text().to_string(), point))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            out.textures_delta.clear();
+            labels
+        };
+        frame(&mut orb, 0., vec![]);
+        orb.selected = Some(root.key.clone());
+        // Bulk toggles and explicit Focus are independent of clicked selection.
+        frame(
+            &mut orb,
+            0.1,
+            vec![egui::Event::Key {
+                key: egui::Key::N,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        orb.panels.focus = Some(scene.nodes[0].key.clone());
+        let focus = orb.panels.focus.clone();
+        let mut clock = 2.;
+        for (target, parent) in [
+            (node, false),
+            (session, false),
+            (workspace, false),
+            (agent, false),
+            (workspace, true),
+            (session, true),
+            (node, true),
+            (root, true),
+        ] {
+            frame(&mut orb, clock, vec![]);
+            clock += 2.;
+            let labels = frame(&mut orb, clock, vec![]);
+            let prefix = format!(
+                "{} {} · {}",
+                if parent { "↑" } else { "→" },
+                target.kind.to_uppercase(),
+                target.label
+            );
+            let point = labels
+                .iter()
+                .find(|(label, _)| label.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("missing {prefix}: {labels:?}"))
+                .1;
+            for pressed in [true, false] {
+                frame(
+                    &mut orb,
+                    clock,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+            }
+            assert_eq!(orb.selected.as_ref(), Some(&target.key));
+            assert_eq!(orb.panels.focus, focus);
+            assert!(orb.take_dismissals().is_empty());
+            assert_eq!(orb.sim.summary().agents, 4);
+            clock += 2.;
+        }
+        let labels = frame(&mut orb, clock, vec![]);
+        assert!(!labels.iter().any(|(s, _)| s == "PARENT"));
     }
     #[test]
     fn passive_disconnect_draws_only_unavailable_and_hides_retained_orb() {
