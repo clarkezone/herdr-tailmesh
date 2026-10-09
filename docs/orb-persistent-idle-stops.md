@@ -56,6 +56,8 @@ preserving real direct Working → Idle stops. PR #20 remains open for user test
   live counts/markers, source/removal and production tonic/protobuf reception.
 - Review caught and fixed a failed-read retry hazard: a click could drop the
   pending supersession condition and restore the older completion after unlock.
+- Presentation-key classification includes full key shape; a real agent ID named
+  `outcome` is not a history card and must keep its live activity identity.
 - Concurrent scope merge, stale writes/dismissals, corrupt/empty/future/oversized
   file preservation and explicit capacity admission are tested.
 - Source gaps cannot reconstruct unseen work. Native Windows/macOS graphical and

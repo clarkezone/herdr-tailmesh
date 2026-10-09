@@ -461,7 +461,8 @@ impl Simulation {
         // must not occupy the replacement's bounded presentation slot.
         if let Some(notices) = &view.outcome_notices {
             self.activities.retain(|key, a| {
-                key.last().is_none_or(|s| s != "outcome")
+                key.len() != 11
+                    || key.last().is_none_or(|s| s != "outcome")
                     || notices
                         .get(key)
                         .is_some_and(|n| a.stop_episode == Some(n.episode))
@@ -817,7 +818,8 @@ impl Simulation {
             }
         }
         self.activities.retain(|key, a| {
-            key.last().is_none_or(|k| k != "outcome")
+            key.len() != 11
+                || key.last().is_none_or(|k| k != "outcome")
                 || self.outcome_agents.contains_key(key) && a.persistent
         });
         let mut incoming = [0usize; 4];
@@ -890,7 +892,8 @@ impl Simulation {
             return;
         };
         self.activities.retain(|key, a| {
-            key.last().is_none_or(|s| s != "outcome")
+            key.len() != 11
+                || key.last().is_none_or(|s| s != "outcome")
                 || notices
                     .get(key)
                     .is_some_and(|n| a.stop_episode == Some(n.episode))
@@ -1066,6 +1069,28 @@ pub mod tests {
             revision,
             ..Default::default()
         }
+    }
+    #[test]
+    fn a_real_agent_id_named_outcome_is_not_treated_as_a_history_card() {
+        let mut n = node("one", "working", 1);
+        n.herdr.as_mut().unwrap().agents[0].id = "outcome".into();
+        let mut v = view(vec![n], 1);
+        v.outcome_notices = Some(Arc::new(BTreeMap::new()));
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        let key = sim
+            .activities
+            .keys()
+            .find(|k| k.last().unwrap() == "outcome")
+            .unwrap()
+            .clone();
+        assert_eq!(key.len(), 10);
+        let serial = sim.activities[&key].event.serial;
+        v.revision += 1;
+        sim.update(&v, Stamp::seconds(201), 2.);
+        assert!(sim.activities[&key].persistent);
+        assert_eq!(sim.activities[&key].event.serial, serial);
+        assert_eq!(sim.activities[&key].state, AgentState::Working);
     }
     #[test]
     fn scoped_identity_rename_order_and_incarnation_are_preserved() {
