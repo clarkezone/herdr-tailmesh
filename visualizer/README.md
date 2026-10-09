@@ -1,5 +1,10 @@
 # Herdr mesh visualizer
 
+Interactive Orb supports **T** for the compact companion window, **Ctrl + / −**
+for compact sizing, and dragging its title rail. It launches at the remembered
+larger size. Omarchy uses scoped Hyprland IPC; Windows native acceptance remains
+a followup. See [compact mode and Windows handoff](../docs/orb-compact-window.md).
+
 A standalone Rust viewer for the managed Herdr mesh daemon. **Orb is the default**
 for both the interactive executable and Windows screensaver/preview. It presents
 real coordinator → node → session → workspace → agent observations using the

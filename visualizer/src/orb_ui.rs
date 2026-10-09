@@ -53,6 +53,12 @@ fn unavailable(ui: &mut egui::Ui) {
         .galley(rect.center() - galley.size() / 2., galley, color);
 }
 impl OrbUi {
+    pub fn compact(&self) -> bool {
+        self.panels.compact
+    }
+    pub fn set_compact(&mut self, compact: bool) {
+        self.panels.set_compact(compact);
+    }
     pub fn take_dismissals(&mut self) -> Vec<(Key, u64)> {
         self.panels.take_dismissals()
     }
