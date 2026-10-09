@@ -227,6 +227,7 @@ impl Diagnostics {
             "previous_episode",
             "current_episode",
             "activity_episode",
+            "idle_stop_episode",
         ] {
             if let Some(value) = data.get_mut(field)
                 && let Some(id) = value.as_u64()

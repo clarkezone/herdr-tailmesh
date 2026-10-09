@@ -45,8 +45,23 @@ appears again. Counts and agent state stay unchanged; selection and Focus remain
 available. Dismissals are saved locally for this OS user and observer port,
 scoped to the verified coordinator and full agent identity. A dismissed completion
 stays hidden after closing/relaunching the viewer or screensaver; undismissed
-Completed cards still appear at startup. A fresh observed
-transition to idle or unknown shows that actual state for ten seconds. Reconnect/stale
+Completed cards still appear at startup.
+
+An observed **Working → Idle** transition creates a persistent **WORK STOPPED —
+IDLE** card, tracked per scoped agent on every accepted snapshot before UI
+coalescing. It remains until × is clicked, the agent leaves Idle or disappears,
+or its observation source changes. A later Working → Idle cycle gets a new card;
+an old dismissal cannot hide it. These cards retain Focus, animated reveal/retract,
+first-page stop priority and paging; W hides Working only. Actual Idle markers
+remain neutral and Completed counts stay unchanged. Idle-stop history and
+dismissal are session-only: launching into Idle cannot establish prior Working
+and does not generate a work-stop banner. Verified same-source reconnects retain
+observed history; an unverified reconnect starts a new baseline. Idle stops use
+the existing bounded history, with explicit omissions at capacity, and yield
+admission to Blocked/Working attention. See [the spec and review](../docs/orb-persistent-idle-stops.md).
+
+Other fresh observed transitions to idle or unknown show that actual state for
+ten seconds. Reconnect/stale
 comparisons never invent transition events; retained cards are marked LAST KNOWN. Live removal has a truthful
 no-longer-observed notice. Multiple cards remain pageable without expiring off-page.
 New completion instances receive first-page priority ahead of older activity,
@@ -101,6 +116,14 @@ placement. `completion_flyout` explains `drawn`, `revealing`, `off_page`,
 `passive_unavailable`. A `drawn` record means the CPU UI submitted the fully
 revealed card; it is not a GPU/display readback guarantee. Counts and paging
 remain independent of acknowledgement.
+
+The same files record Idle work stops with `idle_stop_created`,
+`idle_stop_retired`, `idle_stop_priority`, `idle_stop_flyout` and
+`idle_stop_flyout_retired`. Flyout reasons match completion diagnostics.
+`agent_state.data.idle_stop_episode` identifies the observed cycle;
+`dismiss_input.data.stop_kind` distinguishes Idle from Completed.
+`idle_stop_ack_applied` explicitly reports `persisted: false` and
+`lifetime: viewer_process`; it never claims an Idle dismissal was saved to disk.
 
 For a dismissal that returns after relaunch, retain logs from both launches.
 `dismiss_input` identifies the UI action; `ack_saved` confirms the synchronous

@@ -28,6 +28,10 @@ pub struct View {
     pub revision: u64,
     /// IDs of currently observed completion episodes, updated before UI coalescing.
     pub completion_episodes: Arc<BTreeMap<Key, u64>>,
+    /// Directly observed Working -> Idle stops, retained only while still Idle.
+    pub idle_stop_episodes: Arc<BTreeMap<Key, u64>>,
+    /// Session-only acknowledgement of observed Idle stops; never stored as Done.
+    pub acknowledged_idle_stops: Arc<BTreeMap<Key, u64>>,
     /// Local acknowledgements restored before the first scene is published.
     pub acknowledged_completions: Arc<BTreeMap<Key, u64>>,
     pub acknowledgement_revision: u64,
@@ -45,6 +49,8 @@ impl Default for View {
             epoch: 0,
             revision: 0,
             completion_episodes: Default::default(),
+            idle_stop_episodes: Default::default(),
+            acknowledged_idle_stops: Default::default(),
             acknowledged_completions: Default::default(),
             acknowledgement_revision: 0,
             persistence_error: None,
@@ -53,6 +59,23 @@ impl Default for View {
     }
 }
 impl View {
+    pub fn stop_episode(&self, key: &Key) -> Option<u64> {
+        self.completion_episodes
+            .get(key)
+            .or_else(|| self.idle_stop_episodes.get(key))
+            .copied()
+    }
+    pub fn stop_episodes(&self) -> impl Iterator<Item = (&Key, &u64)> {
+        self.completion_episodes
+            .iter()
+            .chain(self.idle_stop_episodes.iter())
+    }
+    pub fn stop_acknowledged(&self, key: &Key, episode: u64) -> bool {
+        self.acknowledged_completions.get(key) == Some(&episode)
+            && self.completion_episodes.get(key) == Some(&episode)
+            || self.acknowledged_idle_stops.get(key) == Some(&episode)
+                && self.idle_stop_episodes.get(key) == Some(&episode)
+    }
     pub fn diagnostic(&self, event: &str, mut data: Value) {
         if let Some(log) = &self.diagnostics {
             data["epoch"] = json!(self.epoch);
@@ -100,7 +123,7 @@ impl View {
             self.diagnostic("snapshot_accepted", json!({
                 "observed_seconds":scene.observed_at.seconds, "observed_nanos":scene.observed_at.nanos,
                 "nodes":scene.nodes.len(), "agents":current.len(),
-                "completed":self.completion_episodes.len(), "working":scene.working, "blocked":scene.blocked,
+                "completed":self.completion_episodes.len(), "idle_stops":self.idle_stop_episodes.len(), "working":scene.working, "blocked":scene.blocked,
             }));
         }
         for (key, (state, label)) in &current {
@@ -110,6 +133,7 @@ impl View {
                     json!({
                         "key":key, "label":label, "previous_state":agents.get(key), "state":state,
                         "episode":self.completion_episodes.get(key),
+                        "idle_stop_episode":self.idle_stop_episodes.get(key),
                     }),
                 );
             }
@@ -128,6 +152,16 @@ impl View {
         for (key, episode) in self.completion_episodes.iter() {
             if old_source != source || previous.completion_episodes.get(key) != Some(episode) {
                 self.diagnostic("completion_created", json!({"key":key, "episode":episode}));
+            }
+        }
+        for (key, episode) in previous.idle_stop_episodes.iter() {
+            if old_source != source || self.idle_stop_episodes.get(key) != Some(episode) {
+                self.diagnostic("idle_stop_retired", json!({"key":key, "episode":episode}));
+            }
+        }
+        for (key, episode) in self.idle_stop_episodes.iter() {
+            if old_source != source || previous.idle_stop_episodes.get(key) != Some(episode) {
+                self.diagnostic("idle_stop_created", json!({"key":key, "episode":episode, "previous_state":"working", "state":"idle"}));
             }
         }
         *agents = current.into_iter().map(|(k, (s, _))| (k, s)).collect();
@@ -157,23 +191,13 @@ fn verified_source(view: &View) -> Option<Key> {
         .map(|c| c.key.clone())
 }
 fn observed_agent_statuses(view: &View) -> BTreeMap<&Key, &str> {
-    fn collect<'a>(branch: &'a Branch, states: &mut BTreeMap<&'a Key, &'a str>) {
-        if branch.kind == "agent" {
-            states.insert(&branch.key, &branch.status);
-        }
-        for child in &branch.children {
-            collect(child, states);
-        }
-    }
-    let mut states = BTreeMap::new();
     if view.diagnostics.is_some()
         && let Some(scene) = &view.scene
     {
-        for node in &scene.nodes {
-            collect(node, &mut states);
-        }
+        agent_statuses(scene)
+    } else {
+        BTreeMap::new()
     }
-    states
 }
 fn storage_error(view: &mut View, error: impl std::fmt::Display) {
     let message = format!("Completion dismissals could not be saved/restored: {error}");
@@ -202,6 +226,45 @@ fn completions(
     for child in &branch.children {
         completions(child, previous, serial, current);
     }
+}
+fn agent_statuses(scene: &Scene) -> BTreeMap<&Key, &str> {
+    fn collect<'a>(branch: &'a Branch, states: &mut BTreeMap<&'a Key, &'a str>) {
+        if branch.kind == "agent" {
+            states.insert(&branch.key, &branch.status);
+        }
+        for child in &branch.children {
+            collect(child, states);
+        }
+    }
+    let mut result = BTreeMap::new();
+    for node in &scene.nodes {
+        collect(node, &mut result);
+    }
+    result
+}
+fn idle_stops(
+    scene: &Scene,
+    previous: &BTreeMap<Key, u64>,
+    previous_states: &BTreeMap<&Key, &str>,
+    serial: &mut u64,
+) -> BTreeMap<Key, u64> {
+    agent_statuses(scene)
+        .into_iter()
+        .filter_map(|(key, state)| {
+            if state != "idle" {
+                return None;
+            }
+            let episode = if let Some(episode) = previous.get(key) {
+                *episode
+            } else if previous_states.get(key) == Some(&"working") {
+                *serial = serial.wrapping_add(1);
+                *serial
+            } else {
+                return None;
+            };
+            Some((key.clone(), episode))
+        })
+        .collect()
 }
 impl Shared {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
@@ -269,6 +332,8 @@ impl Shared {
             } = &mut *received;
             let diagnostic_previous = view.diagnostics.as_ref().map(|_| view.clone());
             let revision = view.revision;
+            let previous_scene = view.scene.clone();
+            let previous_live = view.live;
             let previous_verified_source = verified_source(view);
             let source = view
                 .scene
@@ -278,11 +343,22 @@ impl Shared {
             f(view);
             if view.revision != revision {
                 let mut current = BTreeMap::new();
+                let mut idle_current = BTreeMap::new();
                 if let Some(scene) = &view.scene {
                     let same_source = source == scene.coordinator.as_ref().map(|c| c.key.clone());
                     let previous = same_source.then_some(view.completion_episodes.as_ref());
                     for node in &scene.nodes {
                         completions(node, previous, completion_serial, &mut current);
+                    }
+                    let continuous =
+                        same_source && (verified_source(view).is_some() || previous_live);
+                    if continuous && let Some(previous_scene) = &previous_scene {
+                        idle_current = idle_stops(
+                            scene,
+                            &view.idle_stop_episodes,
+                            &agent_statuses(previous_scene),
+                            completion_serial,
+                        );
                     }
                 }
                 let source = verified_source(view);
@@ -428,6 +504,16 @@ impl Shared {
                 }
                 // Keep only current completions; Working/removal retires the prior episode.
                 view.completion_episodes = Arc::new(current);
+                if view
+                    .acknowledged_idle_stops
+                    .iter()
+                    .any(|(key, id)| idle_current.get(key) != Some(id))
+                {
+                    Arc::make_mut(&mut view.acknowledged_idle_stops)
+                        .retain(|key, id| idle_current.get(key) == Some(id));
+                    view.acknowledgement_revision = view.acknowledgement_revision.wrapping_add(1);
+                }
+                view.idle_stop_episodes = Arc::new(idle_current);
                 if let Some(previous) = &diagnostic_previous {
                     view.trace_receipt(previous, diagnostic_agents);
                 }
@@ -442,8 +528,21 @@ impl Shared {
         let mut received = self.received.lock().unwrap();
         let view = &mut received.view;
         view.diagnostic("ack_requested", json!({"key":key, "episode":episode}));
+        if view.idle_stop_episodes.get(key) == Some(&episode) {
+            Arc::make_mut(&mut view.acknowledged_idle_stops).insert(key.clone(), episode);
+            view.acknowledgement_revision = view.acknowledgement_revision.wrapping_add(1);
+            view.diagnostic("idle_stop_ack_applied", json!({"key":key, "episode":episode, "lifetime":"viewer_process", "persisted":false}));
+            drop(received);
+            if !self.wake_pending.swap(true, Ordering::AcqRel) {
+                (self.wake)();
+            }
+            return true;
+        }
         if view.completion_episodes.get(key) != Some(&episode) {
-            view.diagnostic("ack_rejected_stale", json!({"key":key, "episode":episode, "current_episode":view.completion_episodes.get(key)}));
+            view.diagnostic(
+                "ack_rejected_stale",
+                json!({"key":key, "episode":episode, "current_episode":view.stop_episode(key)}),
+            );
             return false;
         }
         if let (Some(store), Some(source)) = (&self.store, verified_source(view)) {
@@ -665,6 +764,184 @@ mod tests {
             view.revision += 1;
             view.live = true;
         });
+    }
+    #[test]
+    fn idle_stops_track_coalesced_work_and_rearm_each_cycle_before_rendering() {
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = wakes.clone();
+        let shared = Shared::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+        accept(&shared, scene("working", "source"));
+        accept(&shared, scene("idle", "source")); // No read/render between observations.
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        let first = shared.read();
+        assert_eq!(first.idle_stop_episodes.len(), 1);
+        assert_eq!(first.completion_episodes.len(), 1); // Other node is genuinely Done.
+        let key = first.idle_stop_episodes.keys().next().unwrap().clone();
+        let episode = first.idle_stop_episodes[&key];
+        assert!(shared.acknowledge(&key, episode));
+        accept(&shared, scene("idle", "source"));
+        assert!(shared.read().stop_acknowledged(&key, episode));
+        accept(&shared, scene("working", "source"));
+        accept(&shared, scene("idle", "source"));
+        let second = shared.read();
+        assert_ne!(second.idle_stop_episodes[&key], episode);
+        assert!(second.acknowledged_idle_stops.is_empty());
+        assert!(!shared.acknowledge(&key, episode));
+        assert!(!second.completion_episodes.contains_key(&key));
+    }
+    #[test]
+    fn idle_baselines_and_non_working_transitions_do_not_invent_a_work_stop() {
+        for before in ["idle", "blocked", "done", "unknown"] {
+            let shared = Shared::new(|| {});
+            accept(&shared, scene(before, "source"));
+            accept(&shared, scene("idle", "source"));
+            assert!(
+                shared.read().idle_stop_episodes.is_empty(),
+                "{before} -> Idle"
+            );
+        }
+        let shared = Shared::new(|| {});
+        accept(&shared, scene("working", "old"));
+        accept(&shared, scene("idle", "new"));
+        assert!(shared.read().idle_stop_episodes.is_empty());
+        accept(&shared, scene("working", "new"));
+        let mut missing = scene("idle", "new");
+        Arc::get_mut(&mut missing)
+            .unwrap()
+            .nodes
+            .retain(|n| n.key[1] != "node");
+        accept(&shared, missing);
+        accept(&shared, scene("idle", "new"));
+        assert!(shared.read().idle_stop_episodes.is_empty());
+    }
+    #[test]
+    fn idle_stop_dismissal_does_not_change_completed_disk_records_or_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.bin");
+        let store = Store::at(path.clone());
+        let shared = Shared::with_store(|| {}, Some(store.clone()), 100);
+        accept(&shared, scene("working", "source"));
+        let v = shared.read();
+        let done_key = v.completion_episodes.keys().next().unwrap().clone();
+        assert!(shared.acknowledge(&done_key, v.completion_episodes[&done_key]));
+        let saved = std::fs::read(&path).unwrap();
+        accept(&shared, scene("idle", "source"));
+        let v = shared.read();
+        let key = v.idle_stop_episodes.keys().next().unwrap().clone();
+        assert!(shared.acknowledge(&key, v.idle_stop_episodes[&key]));
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        let restarted = Shared::with_store(|| {}, Some(store), 200);
+        accept(&restarted, scene("idle", "source"));
+        let v = restarted.read();
+        assert!(v.idle_stop_episodes.is_empty());
+        assert!(v.acknowledged_idle_stops.is_empty());
+        assert_eq!(v.acknowledged_completions[&done_key], 101);
+    }
+    #[test]
+    fn idle_stops_preserve_verified_reconnect_but_not_unknown_source_baselines() {
+        for verified in [true, false] {
+            let shared = Shared::new(|| {});
+            let input = |status| {
+                let mut s = scene(status, "source");
+                if !verified {
+                    Arc::get_mut(&mut s)
+                        .unwrap()
+                        .coordinator
+                        .as_mut()
+                        .unwrap()
+                        .status = "unknown".into();
+                }
+                s
+            };
+            accept(&shared, input("working"));
+            accept(&shared, input("idle"));
+            let old = shared.read().idle_stop_episodes;
+            assert_eq!(old.len(), 1);
+            shared.update(|v| {
+                v.live = false;
+                v.epoch += 1;
+            });
+            accept(&shared, input("idle"));
+            let new = shared.read().idle_stop_episodes;
+            if verified {
+                assert_eq!(old, new);
+            } else {
+                assert!(new.is_empty());
+            }
+        }
+    }
+    #[test]
+    fn idle_stops_are_scoped_independent_and_retire_on_any_departure_from_idle() {
+        let shared = Shared::new(|| {});
+        let both = |state| {
+            let mut s = scene(state, "source");
+            Arc::get_mut(&mut s).unwrap().nodes[1].children[0].children[0].children[0].status =
+                state.into();
+            s
+        };
+        accept(&shared, both("working"));
+        accept(&shared, both("idle"));
+        let v = shared.read();
+        assert_eq!(v.idle_stop_episodes.len(), 2);
+        assert!(v.completion_episodes.is_empty());
+        let entries: Vec<_> = v.idle_stop_episodes.iter().collect();
+        assert_eq!(entries[0].0.last(), entries[1].0.last());
+        assert_ne!(entries[0].1, entries[1].1);
+        let (dismissed, episode) = entries[0];
+        assert!(shared.acknowledge(dismissed, *episode));
+        let v = shared.read();
+        assert_eq!(v.acknowledged_idle_stops.len(), 1);
+        assert!(!v.stop_acknowledged(entries[1].0, *entries[1].1));
+        for next in ["working", "blocked", "done", "unknown"] {
+            accept(&shared, both(next));
+            assert!(
+                shared.read().idle_stop_episodes.is_empty(),
+                "Idle -> {next}"
+            );
+            assert!(shared.read().acknowledged_idle_stops.is_empty());
+            accept(&shared, both("working"));
+            accept(&shared, both("idle"));
+            assert_eq!(shared.read().idle_stop_episodes.len(), 2);
+        }
+        let mut removed = scene("idle", "source");
+        Arc::get_mut(&mut removed).unwrap().nodes.clear();
+        accept(&shared, removed);
+        assert!(shared.read().idle_stop_episodes.is_empty());
+        accept(&shared, both("idle"));
+        assert!(shared.read().idle_stop_episodes.is_empty());
+    }
+    #[test]
+    fn idle_stop_diagnostics_have_exact_tokens_without_a_saved_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Diagnostics::at(dir.path(), 8790).unwrap();
+        let shared = Shared::with_store(|| {}, None, u64::MAX - 10);
+        shared.attach_diagnostics(log.clone());
+        accept(&shared, scene("working", "source"));
+        accept(&shared, scene("idle", "source"));
+        let v = shared.read();
+        let (key, episode) = v.idle_stop_episodes.iter().next().unwrap();
+        shared.acknowledge(key, *episode);
+        accept(&shared, scene("working", "source"));
+        log.flush();
+        let records: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let episode_text = episode.to_string();
+        for name in [
+            "idle_stop_created",
+            "idle_stop_ack_applied",
+            "idle_stop_retired",
+        ] {
+            assert!(records.iter().any(|r| r["event"] == name
+                && r["data"]["episode"].as_str() == Some(episode_text.as_str())));
+        }
+        assert!(records.iter().any(|r| r["event"] == "agent_state"
+            && r["data"]["idle_stop_episode"].as_str() == Some(episode_text.as_str())));
+        assert!(!records.iter().any(|r| r["event"] == "ack_saved"));
     }
     #[test]
     fn diagnostics_follow_received_episodes_ack_restore_and_retirement_without_consuming_wakes() {

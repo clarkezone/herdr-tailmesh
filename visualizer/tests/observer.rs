@@ -313,3 +313,55 @@ async fn coordinator_properties_follow_accepted_scene_not_pending_handshake() {
     stop.send(true).unwrap();
     worker.await.unwrap();
 }
+
+#[tokio::test]
+async fn received_work_to_idle_stops_rearm_without_a_renderer_and_reject_old_dismissals() {
+    let f = fixture(1).await;
+    *f.coordinator.lock().unwrap() = Some(pb::ServerInfo {
+        instance_id: "idle-stop-coordinator".into(),
+        ..Default::default()
+    });
+    let snapshot = |state: &str| pb::NodeList {
+        nodes: vec![pb::NodeView {
+            herdr: Some(pb::HerdrState {
+                status: "ready".into(),
+                agents: vec![pb::HerdrEntity {
+                    id: "agent".into(),
+                    workspace_id: "workspace".into(),
+                    agent_status: state.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..node("node")
+        }],
+    };
+    f.tx.send(Ok(snapshot("idle"))).await.unwrap();
+    let shared = Shared::new(|| {});
+    let (stop, rx) = watch::channel(false);
+    let worker = tokio::spawn(client::run(f.port, shared.clone(), rx));
+    until(|| shared.read().live).await;
+    assert!(shared.read().idle_stop_episodes.is_empty());
+    // Production protobuf receive/project/update pipeline, no renderer involved.
+    f.tx.send(Ok(snapshot("working"))).await.unwrap();
+    f.tx.send(Ok(snapshot("idle"))).await.unwrap();
+    until(|| !shared.read().idle_stop_episodes.is_empty()).await;
+    let first = shared.read();
+    let (key, episode) = first.idle_stop_episodes.iter().next().unwrap();
+    assert!(first.completion_episodes.is_empty());
+    assert!(shared.acknowledge(key, *episode));
+    f.tx.send(Ok(snapshot("working"))).await.unwrap();
+    f.tx.send(Ok(snapshot("idle"))).await.unwrap();
+    until(|| {
+        shared
+            .read()
+            .idle_stop_episodes
+            .get(key)
+            .is_some_and(|id| id != episode)
+    })
+    .await;
+    assert!(shared.read().acknowledged_idle_stops.is_empty());
+    assert!(!shared.acknowledge(key, *episode));
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
