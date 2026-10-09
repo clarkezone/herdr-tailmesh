@@ -64,7 +64,6 @@ impl OrbUi {
         passive: bool,
         clock: f64,
     ) -> Option<Rect> {
-        self.panels.handle_input(root, clock, passive);
         if !passive && let Some(error) = &view.persistence_error {
             // Report actual storage failure without hiding observation or crashing.
             egui::Window::new("Completion acknowledgement storage")
@@ -84,6 +83,7 @@ impl OrbUi {
             self.focus.reset();
             self.sim.camera = None;
         }
+        self.panels.handle_input(root, clock, passive);
         if self
             .selected
             .as_ref()
@@ -220,35 +220,6 @@ impl OrbUi {
         best
     }
 }
-pub(crate) fn observations(ui: &mut egui::Ui, branch: &Branch, live: bool) {
-    ui.label(format!("{} · {}", branch.kind, branch.label));
-    ui.label(format!(
-        "{} · {}",
-        branch.status,
-        if !live {
-            "last known"
-        } else if branch.kind == "coordinator" {
-            "control connection live"
-        } else {
-            branch.freshness.label_at(wall_now())
-        }
-    ));
-    if let Some(seen) = branch.last_seen {
-        let now = wall_now();
-        if seen <= now {
-            ui.label(format!(
-                "Last seen {}s ago",
-                (now.nanos() - seen.nanos()) / 1_000_000_000
-            ));
-        } else {
-            ui.label("Last seen unknown (clock ahead)");
-        }
-    }
-    for line in &branch.details {
-        ui.label(line);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,7 +316,7 @@ mod tests {
             .and_then(|id| orb.sim.key(*id))
             .cloned();
         let selected = orb.selected.clone();
-        for clock in [2., 65.] {
+        for clock in [2., 4., 65.] {
             let viewport = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920., 1080.));
             let mut output = context.run_ui(
                 egui::RawInput {
@@ -358,14 +329,17 @@ mod tests {
                 },
             );
             assert_eq!(orb.selected, selected);
-            assert!(output.shapes.iter().any(|s| text(&s.shape, "Observation")));
+            if clock > 2. {
+                assert!(output.shapes.iter().any(|s| text(&s.shape, "AGENT")));
+            }
+            assert!(!output.shapes.iter().any(|s| text(&s.shape, "Observation")));
             assert!(
                 output
                     .shapes
                     .iter()
                     .filter(|s| text(&s.shape, "AGENT WORKING"))
                     .count()
-                    >= 2
+                    >= 1
             );
             assert!(!output.shapes.iter().any(|s| text(&s.shape, "HERDR MESH")));
             output.textures_delta.clear();
@@ -494,7 +468,22 @@ mod tests {
             },
         );
         assert!(orb.selected.is_some());
-        assert!(output.shapes.iter().any(|s| text(&s.shape, "last known")));
         output.textures_delta.clear();
+        // A newly selected typed card unfolds before its text becomes visible.
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320., 600.),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                orb.draw(ui, &view, 8790, false, 5.);
+            },
+        );
+        let last_known = output.shapes.iter().any(|s| text(&s.shape, "LAST KNOWN"));
+        output.textures_delta.clear();
+        assert!(last_known);
     }
 }

@@ -461,6 +461,8 @@ message NodeView {
   string sessions_error_code = 15;
   // Operator-assigned logical node name, not a native machine inventory label.
   string hostname = 16;
+  // Read-only implementation metadata supplied in the authenticated node Hello.
+  string implementation_version = 17;
 }
 
 message NodeList {

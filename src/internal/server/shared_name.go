@@ -1,6 +1,9 @@
 package server
 
 import (
+	"unicode"
+	"unicode/utf8"
+
 	pb "github.com/clarkezone/herdr-distributed-mesh/src/gen/agentflow/v1"
 	"github.com/clarkezone/herdr-distributed-mesh/src/internal/transport"
 	"google.golang.org/grpc/codes"
@@ -15,7 +18,21 @@ func validateLogicalNodeName(name string) error {
 	return nil
 }
 
-func (f *fleetStore) setLogicalName(entry *fleetEntry, name string) error {
+// Invalid display metadata is unknown; it must not prevent an otherwise valid node connecting.
+func displayVersion(version string) string {
+	if len(version) > 256 || !utf8.ValidString(version) {
+		return ""
+	}
+	for _, r := range version {
+		if unicode.IsControl(r) {
+			return ""
+		}
+	}
+	return version
+}
+
+func (f *fleetStore) setHelloMetadata(entry *fleetEntry, name, version string) error {
+	version = displayVersion(version)
 	if err := validateLogicalNodeName(name); err != nil {
 		return err
 	}
@@ -27,11 +44,12 @@ func (f *fleetStore) setLogicalName(entry *fleetEntry, name string) error {
 	if !f.current(entry) {
 		return status.Error(codes.Aborted, "node stream superseded")
 	}
-	if entry.view.Hostname == name {
+	if entry.view.Hostname == name && entry.view.ImplementationVersion == version {
 		return nil
 	}
 	view := proto.Clone(entry.view).(*pb.NodeView)
 	view.Hostname = name
+	view.ImplementationVersion = version
 	if err := f.save(view); err != nil {
 		return err
 	}

@@ -23,15 +23,15 @@ pub const ENTRIES: [Entry; 9] = [
         glyph: Glyph::Coordinator,
     },
     Entry {
-        label: "Node",
+        label: "Node · N",
         glyph: Glyph::Node,
     },
     Entry {
-        label: "Session",
+        label: "Session · S",
         glyph: Glyph::Session,
     },
     Entry {
-        label: "Workspace",
+        label: "Workspace · W",
         glyph: Glyph::Workspace,
     },
     Entry {
@@ -39,7 +39,7 @@ pub const ENTRIES: [Entry; 9] = [
         glyph: Glyph::Agent(AgentState::Working),
     },
     Entry {
-        label: "Working",
+        label: "Working · A",
         glyph: Glyph::Agent(AgentState::Working),
     },
     Entry {

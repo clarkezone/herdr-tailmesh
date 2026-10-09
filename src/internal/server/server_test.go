@@ -210,3 +210,29 @@ func newTestConnection(t *testing.T, api *service) *grpc.ClientConn {
 	t.Cleanup(func() { _ = connection.Close() })
 	return connection
 }
+
+func TestHelloMemberVersionReachesReadOnlyFleet(t *testing.T) {
+	svc := &service{instanceID: "root", identifyPeer: func(context.Context) (transport.PeerIdentity, error) {
+		return transport.PeerIdentity{StableID: "peer"}, nil
+	}}
+	connection := newTestConnection(t, svc)
+	f := &svc.fleet
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := agentflowv1.NewNodeControlClient(connection).Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := nodeHello("member")
+	hello.GetHello().ImplementationVersion = "member-v3"
+	if err := stream.Send(hello); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := f.list(time.Now())
+	if err != nil || len(nodes.Nodes) != 1 || nodes.Nodes[0].ImplementationVersion != "member-v3" {
+		t.Fatalf("Hello version lost: %v %v", nodes, err)
+	}
+}

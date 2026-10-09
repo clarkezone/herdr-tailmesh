@@ -10,6 +10,7 @@ use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Ui, UiBuilder, pos2, ve
 use herdr_mesh_visualizer::{client::View, diagnostics::json, projection::Key};
 use std::collections::{BTreeMap, BTreeSet};
 
+const MAX_PRESENTATIONS: usize = 128; // One visible page and one retracting page.
 const CYAN: Color32 = Color32::from_rgb(90, 216, 235);
 
 struct Dismissal {
@@ -54,9 +55,13 @@ pub struct Panels {
     controls: Controls,
     key_motion: Option<Motion>,
     count_motion: Option<Motion>,
+    project_motion: Option<Motion>,
+    focus_motion: Option<Motion>,
     page_start: usize,
     previous: Vec<usize>,
-    membership: Vec<u64>,
+    membership: Vec<CardId>,
+    objects: crate::orb_objects::Objects,
+    presentations: BTreeMap<CardId, Presentation>,
     page_since: f64,
     diagnostic_renderer: Option<u64>,
     diagnostic_flyouts: BTreeMap<Key, FlyoutTrace>,
@@ -68,6 +73,10 @@ impl Panels {
         self.page_start = 0;
         self.previous.clear();
         self.membership.clear();
+        self.objects = Default::default();
+        self.presentations.clear();
+        self.project_motion = None;
+        self.focus_motion = None;
         self.projects = false;
         self.focus = None;
         self.dismissed.clear();
@@ -204,8 +213,11 @@ impl Panels {
                     }
                     match key {
                         egui::Key::K => self.controls.toggle(Panel::Key, clock),
-                        egui::Key::N => self.controls.toggle(Panel::Counts, clock),
-                        egui::Key::W => self.controls.toggle_workers(clock),
+                        egui::Key::F => self.controls.toggle(Panel::Counts, clock),
+                        egui::Key::N => self.objects.toggle(crate::orb_objects::Class::Node),
+                        egui::Key::S => self.objects.toggle(crate::orb_objects::Class::Session),
+                        egui::Key::W => self.objects.toggle(crate::orb_objects::Class::Workspace),
+                        egui::Key::A => self.controls.toggle_workers(clock),
                         egui::Key::Escape => self.focus = None,
                         _ => {}
                     }
@@ -307,6 +319,10 @@ impl Panels {
             } else if position.is_some_and(|i| i < page_start || i >= page_start + capacity) {
                 "off_page"
             } else if position
+                .is_some_and(|i| !self.presentations.contains_key(&candidates[i].id()))
+            {
+                "waiting_animation_capacity"
+            } else if position
                 .is_some_and(|i| !card_reveal(&candidates[i], context, self).interactive())
             {
                 "revealing"
@@ -353,7 +369,7 @@ fn drift(clock: f64, phase: f64, amplitude: f32) -> f32 {
     ((clock * std::f64::consts::TAU / 48. + phase).sin() as f32) * amplitude
 }
 
-fn bounded(bounds: Rect, viewport: Rect) -> Rect {
+pub(crate) fn bounded(bounds: Rect, viewport: Rect) -> Rect {
     Rect::from_min_max(
         pos2(
             bounds.left().clamp(viewport.left(), viewport.right()),
@@ -517,6 +533,7 @@ fn detail_rect(context: &Context<'_>, reserved: &[Rect]) -> Rect {
     )
 }
 
+#[derive(Clone, Copy)]
 struct Card<'a> {
     event: &'a Event,
     key: Option<&'a Key>,
@@ -524,12 +541,204 @@ struct Card<'a> {
     working: bool,
     attention: bool,
     acknowledgeable: bool,
+    typed: Option<mesh_orb::Glyph>,
+    pinned: bool,
 }
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CardId {
+    Activity(u64),
+    Object(Key),
+}
+impl Card<'_> {
+    fn id(&self) -> CardId {
+        if self.typed.is_some() {
+            CardId::Object(self.key.unwrap().clone())
+        } else {
+            CardId::Activity(self.event.serial)
+        }
+    }
+}
+#[derive(Clone)]
+struct Snapshot {
+    event: Event,
+    key: Option<Key>,
+    persistent: bool,
+    working: bool,
+    attention: bool,
+    acknowledgeable: bool,
+    typed: Option<mesh_orb::Glyph>,
+    pinned: bool,
+}
+impl Snapshot {
+    fn from(card: &Card<'_>) -> Self {
+        Self {
+            event: card.event.clone(),
+            key: card.key.cloned(),
+            persistent: card.persistent,
+            working: card.working,
+            attention: card.attention,
+            acknowledgeable: card.acknowledgeable,
+            typed: card.typed,
+            pinned: card.pinned,
+        }
+    }
+    fn card(&self) -> Card<'_> {
+        Card {
+            event: &self.event,
+            key: self.key.as_ref(),
+            persistent: self.persistent,
+            working: self.working,
+            attention: self.attention,
+            acknowledgeable: self.acknowledgeable,
+            typed: self.typed,
+            pinned: self.pinned,
+        }
+    }
+}
+struct Presentation {
+    snapshot: Snapshot,
+    motion: Motion,
+    visibility: crate::orb_hud::Visibility,
+}
+fn present_cards(
+    candidates: &[Card<'_>],
+    slots: &[Rect],
+    start: usize,
+    state: &mut Panels,
+    context: &Context<'_>,
+) -> Vec<(Snapshot, Rect, Reveal, Option<usize>)> {
+    let clock = context.sim.clock;
+    let active: BTreeMap<_, _> = candidates
+        .iter()
+        .skip(start)
+        .zip(slots)
+        .enumerate()
+        .map(|(i, (card, slot))| (card.id(), (i, card, *slot)))
+        .collect();
+    for (id, presentation) in &mut state.presentations {
+        if !active.contains_key(id) {
+            presentation.visibility.set(false, clock, 0.);
+        }
+    }
+    state.presentations.retain(|_, p| {
+        // Never animate stale outcome content/input after supersession.
+        let obsolete = p.snapshot.acknowledgeable
+            && p.snapshot.key.as_ref().is_some_and(|key| {
+                context
+                    .sim
+                    .activities
+                    .get(key)
+                    .is_none_or(|a| a.event.serial != p.snapshot.event.serial)
+            });
+        !obsolete && p.visibility.occupies(clock)
+    });
+    // Admit in candidate priority order, not scoped-key order. At extreme churn,
+    // wait for exits instead of dropping unread candidates or popping animations.
+    let mut ordered: Vec<_> = active.iter().collect();
+    ordered.sort_by_key(|(_, (index, _, _))| *index);
+    for (id, (index, card, bounds)) in ordered {
+        if !state.presentations.contains_key(id) && state.presentations.len() >= MAX_PRESENTATIONS {
+            continue;
+        }
+        let presentation = state
+            .presentations
+            .entry(id.clone())
+            .or_insert_with(|| Presentation {
+                snapshot: Snapshot::from(card),
+                motion: Motion::new(*bounds, 1., clock),
+                visibility: if card.typed.is_some() {
+                    crate::orb_hud::Visibility::hidden()
+                } else {
+                    crate::orb_hud::Visibility::new(1.)
+                },
+            });
+        presentation.snapshot = Snapshot::from(card);
+        presentation.motion.retarget(*bounds, 1., clock);
+        presentation
+            .visibility
+            .set(true, clock, *index as f64 * 0.2);
+    }
+    // Previous page retracts while new page unfolds. Exits are visual only and never
+    // own input, a pager, or acknowledgement controls.
+    let mut displayed: Vec<_> = state
+        .presentations
+        .iter()
+        .filter_map(|(id, p)| {
+            let card = p.snapshot.card();
+            let reveal = card_reveal(&card, context, state);
+            if !reveal.active() {
+                return None;
+            }
+            let drifted = p.motion.sample(clock).0.translate(vec2(
+                0.,
+                drift(clock, (p.snapshot.event.serial % 3) as f64, 8.),
+            ));
+            Some((
+                p.snapshot.clone(),
+                bounded(drifted, context.rect),
+                reveal,
+                active.get(id).map(|(i, _, _)| *i),
+            ))
+        })
+        .collect();
+    // Exit frames behind active cards; typed/object ordering cannot change priority.
+    displayed.sort_by_key(|(_, _, _, index)| *index);
+    displayed
+}
+fn close_object(ui: &mut Ui) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(28_f32.min(ui.available_width().max(1.)), 20.),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            "Close object callout",
+        )
+    });
+    let color = CYAN.gamma_multiply(if response.hovered() || response.has_focus() {
+        1.
+    } else {
+        0.65
+    });
+    let painter = ui.painter();
+    for (corner, dx, dy) in [
+        (rect.left_top(), 1., 1.),
+        (rect.right_top(), -1., 1.),
+        (rect.left_bottom(), 1., -1.),
+        (rect.right_bottom(), -1., -1.),
+    ] {
+        painter.line_segment(
+            [corner, corner + vec2(dx * 6., 0.)],
+            Stroke::new(0.8, color),
+        );
+        painter.line_segment(
+            [corner, corner + vec2(0., dy * 5.)],
+            Stroke::new(0.8, color),
+        );
+    }
+    for dy in [-1., 1.] {
+        painter.line_segment(
+            [
+                rect.center() + vec2(-3.5, -3.5 * dy),
+                rect.center() + vec2(3.5, 3.5 * dy),
+            ],
+            Stroke::new(1., color),
+        );
+    }
+    response
+        .on_hover_text("Close this object callout; this does not dismiss an agent outcome")
+        .clicked()
+}
+
 fn cards(sim: &Simulation) -> Vec<Card<'_>> {
     let mut cards: Vec<_> = sim
         .activities
         .iter()
         .map(|(key, a)| Card {
+            typed: None,
+            pinned: false,
             event: &a.event,
             key: Some(key),
             persistent: a.persistent,
@@ -540,6 +749,8 @@ fn cards(sim: &Simulation) -> Vec<Card<'_>> {
         })
         .collect();
     cards.extend(sim.events.iter().rev().map(|event| Card {
+        typed: None,
+        pinned: false,
         event,
         key: None,
         persistent: false,
@@ -563,6 +774,15 @@ fn cards(sim: &Simulation) -> Vec<Card<'_>> {
     cards
 }
 fn card_anchor(card: &Card<'_>, sim: &Simulation, rect: Rect) -> Option<Pos2> {
+    if card.typed.is_some() {
+        let key = card.key?;
+        let position = if key.first().is_some_and(|k| k == "coordinator") {
+            mesh_orb::coordinator(sim.motion_time())
+        } else {
+            mesh_orb::visible_position(sim, sim.id(key)?)
+        };
+        return mesh_orb::project_sim(position, sim, rect);
+    }
     let id = match card.key {
         Some(key) => sim.anchor(key)?,
         None => card.event.origin,
@@ -571,7 +791,9 @@ fn card_anchor(card: &Card<'_>, sim: &Simulation, rect: Rect) -> Option<Pos2> {
 }
 
 fn retained(card: &Card<'_>, sim: &Simulation) -> bool {
-    card.persistent && card.key.is_some_and(|key| sim.activity_retained(key))
+    card.typed.is_none()
+        && card.persistent
+        && card.key.is_some_and(|key| sim.activity_retained(key))
 }
 
 fn title(card: &Card<'_>, sim: &Simulation) -> String {
@@ -582,6 +804,19 @@ fn title(card: &Card<'_>, sim: &Simulation) -> String {
     }
 }
 fn card_reveal(card: &Card<'_>, context: &Context<'_>, state: &Panels) -> Reveal {
+    if let Some(presentation) = state.presentations.get(&card.id()) {
+        let own = presentation.visibility.reveal(context.sim.clock);
+        if card.typed.is_some() {
+            return own;
+        }
+        return Reveal::new(
+            own.amount()
+                .min(activity_reveal(card, context, state).amount()),
+        );
+    }
+    activity_reveal(card, context, state)
+}
+fn activity_reveal(card: &Card<'_>, context: &Context<'_>, state: &Panels) -> Reveal {
     let own = Reveal::event(context.sim.clock - card.event.started, card.persistent);
     if let Some(dismissal) = card.key.and_then(|key| state.dismissed.get(key)) {
         return Reveal::new(
@@ -615,13 +850,13 @@ fn card_size(
                 .size()
                 .x,
         )
-        + 24.;
+        + if card.typed.is_some() { 66. } else { 24. };
     let width = natural.max(if pager { 210. } else { 120. }).min(limit.x);
     let heading = painter.layout(
         title(card, sim),
         FontId::monospace(11.),
         CYAN,
-        (width - 24.).max(1.),
+        (width - if card.typed.is_some() { 66. } else { 24. }).max(1.),
     );
     let body = painter.layout(
         card.event.text.clone(),
@@ -631,7 +866,15 @@ fn card_size(
     );
     vec2(
         width,
-        (heading.size().y + body.size().y + 34. + 24. + if pager { 28. } else { 0. }).min(limit.y),
+        (heading
+            .size()
+            .y
+            .max(if card.typed.is_some() { 34. } else { 0. })
+            + body.size().y
+            + 34.
+            + 24.
+            + if pager { 28. } else { 0. })
+        .min(limit.y),
     )
 }
 fn places(
@@ -840,19 +1083,35 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
     let painter = ui.painter().with_clip_rect(rect);
     let docks = dock_layout(context, state);
     let mut response = Response::default();
-    let selected = context
-        .selected
-        .and_then(|key| crate::orb_ui::selected_branch(context.view, key));
+    state
+        .objects
+        .update(context.sim, context.view, context.selected);
+    let objects: Vec<_> = state.objects.cards.values().cloned().collect();
     let mut reserved: Vec<_> = docks.iter().map(|d| d.bounds).collect();
     if !context.passive
-        && let Some(bounds) =
-            crate::orb_focus::panel(ui, context.view, rect, &mut state.focus, &reserved)
+        && let Some(bounds) = crate::orb_focus::panel(
+            ui,
+            context.view,
+            rect,
+            &mut state.focus,
+            &reserved,
+            &mut state.focus_motion,
+            context.sim.clock,
+        )
     {
         reserved.push(bounds);
         response.blocked.push(bounds);
     }
-    let detail = (selected.is_some() || state.projects)
-        .then(|| detail_rect(context, &reserved))
+    let detail = state
+        .projects
+        .then(|| {
+            let target = detail_rect(context, &reserved);
+            let motion = state
+                .project_motion
+                .get_or_insert_with(|| Motion::new(target, 1., context.sim.clock));
+            motion.retarget(target, 1., context.sim.clock);
+            bounded(motion.sample(context.sim.clock).0, rect)
+        })
         .filter(|r| r.width() >= 64. && r.height() >= 64.);
     if let Some(card) = detail {
         reserved.push(card);
@@ -862,28 +1121,50 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         .into_iter()
         .filter(|c| !c.working || state.controls.workers.occupies(context.sim.clock))
         .filter(|c| {
-            card_reveal(c, context, state).active()
+            activity_reveal(c, context, state).active()
                 || c.key.is_none_or(|key| !state.dismissed.contains_key(key))
         })
         .collect();
+    candidates.retain(|c| {
+        c.key
+            .is_none_or(|key| !state.objects.cards.contains_key(key))
+    });
+    candidates.extend(objects.iter().map(|o| Card {
+        event: &o.event,
+        key: Some(&o.key),
+        persistent: true,
+        working: false,
+        attention: false,
+        acknowledgeable: false,
+        typed: Some(o.glyph),
+        pinned: context.selected == Some(&o.key),
+    }));
     // A visible worker must not vanish behind still-working cards when work stops.
     // Keep new Done and observed Idle-stop instances ahead until acknowledged/state change;
     // never derive their order from sampled history/GPU admission event serials.
     candidates.sort_by_key(|card| {
-        std::cmp::Reverse(
-            card.key
-                .filter(|_| card.acknowledgeable)
-                .and_then(|key| state.stop_order.get(key))
-                .map(|(_, order)| *order),
+        (
+            std::cmp::Reverse(card.pinned),
+            card.typed.is_some() && !card.pinned,
+            std::cmp::Reverse(
+                card.key
+                    .filter(|_| card.acknowledgeable)
+                    .and_then(|key| state.stop_order.get(key))
+                    .map(|(_, order)| *order),
+            ),
         )
     });
-    if !state
-        .membership
-        .iter()
-        .copied()
-        .eq(candidates.iter().map(|c| c.event.serial))
+    if state.membership.len() != candidates.len()
+        || !state
+            .membership
+            .iter()
+            .zip(&candidates)
+            .all(|(id, card)| match id {
+                CardId::Object(key) => card.typed.is_some() && card.key == Some(key),
+                CardId::Activity(serial) => card.typed.is_none() && card.event.serial == *serial,
+            })
     {
-        state.membership = candidates.iter().map(|c| c.event.serial).collect();
+        state.membership = candidates.iter().map(|c| c.id()).collect();
         state.page_start = 0;
         state.previous.clear();
         state.page = 0;
@@ -939,17 +1220,25 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
     // Capture this frame's cursor: clicking a pager changes only the next frame.
     let page_start = state.page_start;
     let pager = page_start > 0 || page_start + capacity < candidates.len();
-    // All current overlay geometry must be known before projecting names.
+    let displayed = present_cards(&candidates, &slots, page_start, state, context);
+    let waiting = candidates
+        .iter()
+        .skip(page_start)
+        .take(capacity)
+        .filter(|card| !state.presentations.contains_key(&card.id()))
+        .count();
+    if waiting > 0 {
+        painter.text(
+            rect.left_top() + vec2(0., 28.),
+            egui::Align2::LEFT_TOP,
+            format!("{waiting} callouts waiting for animation"),
+            FontId::monospace(9.),
+            CYAN,
+        );
+    }
+
     let mut label_obstacles = reserved.clone();
-    label_obstacles.extend(slots.iter().zip(candidates.iter().skip(page_start)).map(
-        |(slot, card)| {
-            slot.translate(vec2(
-                0.,
-                drift(context.sim.clock, (card.event.serial % 3) as f64, 8.),
-            ))
-            .expand(3.)
-        },
-    ));
+    label_obstacles.extend(displayed.iter().map(|(_, bounds, _, _)| bounds.expand(3.)));
     if !context.passive {
         crate::orb_focus::labels(
             ui,
@@ -974,64 +1263,40 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             Stroke::new(1., Color32::from_rgb(242, 177, 70)),
         );
     }
-    for (slot, card) in slots.iter().zip(candidates.iter().skip(page_start)) {
-        let bounds = slot.translate(vec2(
-            0.,
-            drift(context.sim.clock, (card.event.serial % 3) as f64, 8.),
-        ));
-        if let Some(anchor) = card_anchor(card, context.sim, rect) {
+    for (snapshot, bounds, reveal, _) in &displayed {
+        let card = snapshot.card();
+        if let Some(anchor) = card_anchor(&card, context.sim, rect) {
             let [r, g, b] = card.event.color;
-            card_reveal(card, context, state).leader(
+            reveal.leader(
                 &painter,
                 anchor,
-                bounds,
+                *bounds,
                 egui::Rgba::from_rgb(r, g, b).into(),
             );
         }
     }
-
-    if let Some(card) = detail {
-        let anchor = context
-            .selected
-            .and_then(|key| {
-                if selected.is_some_and(|b| b.kind == "coordinator") {
-                    Some(mesh_orb::coordinator(context.sim.motion_time()))
-                } else {
-                    context
-                        .sim
-                        .id(key)
-                        .map(|id| mesh_orb::visible_position(context.sim, id))
-                }
-            })
-            .or_else(|| {
-                state
-                    .projects
-                    .then(|| mesh_orb::coordinator(context.sim.motion_time()))
-            })
-            .and_then(|p| mesh_orb::project_sim(p, context.sim, rect));
-        if let Some(anchor) = anchor {
-            leader(&painter, anchor, card, CYAN);
-        }
-    }
-    for (index, (slot, card)) in slots
-        .iter()
-        .zip(candidates.iter().skip(page_start))
-        .enumerate()
+    if let Some(card) = detail
+        && let Some(anchor) = mesh_orb::project_sim(
+            mesh_orb::coordinator(context.sim.motion_time()),
+            context.sim,
+            rect,
+        )
     {
-        let reveal = card_reveal(card, context, state);
+        leader(&painter, anchor, card, CYAN);
+    }
+    for (snapshot, bounds, reveal, index) in &displayed {
+        let card = snapshot.card();
+        let bounds = *bounds;
+        let reveal = *reveal;
         if !reveal.active() {
             continue;
         }
-        let bounds = slot.translate(vec2(
-            0.,
-            drift(context.sim.clock, (card.event.serial % 3) as f64, 8.),
-        ));
         let aperture = reveal.aperture(bounds).intersect(rect);
         response.blocked.push(aperture);
         let [r, g, b] = card.event.color;
         let color: Color32 = egui::Rgba::from_rgb(r, g, b).into();
         let opacity = reveal.opacity()
-            * if retained(card, context.sim) {
+            * if retained(&card, context.sim) {
                 0.65
             } else {
                 1.
@@ -1039,25 +1304,47 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         let mut card_painter = painter.with_clip_rect(aperture);
         frame(&card_painter, aperture, color, ease(opacity + 0.25));
         card_painter.multiply_opacity(opacity);
+        let header_offset = if card.typed.is_some() { 54. } else { 12. };
         let heading = card_painter.layout(
-            title(card, context.sim),
+            title(&card, context.sim),
             FontId::monospace(11.),
             color,
-            (bounds.width() - 24.).max(1.),
+            (bounds.width() - header_offset - 12.).max(1.),
         );
-        card_painter.galley(bounds.min + vec2(12., 12.), heading.clone(), color);
-        let has_pager = index == 0 && pager && !context.passive;
+        if let Some(glyph) = card.typed {
+            mesh_legend::sample(
+                &card_painter,
+                glyph,
+                Rect::from_min_size(bounds.min + vec2(8., 6.), vec2(40., 40.)),
+                context.sim.time,
+            );
+        }
+        card_painter.galley(
+            bounds.min + vec2(header_offset, 12.),
+            heading.clone(),
+            color,
+        );
+        let has_pager = *index == Some(0) && pager && !context.passive;
         let body = Rect::from_min_max(
-            bounds.min + vec2(12., heading.size().y + 22.),
+            bounds.min
+                + vec2(
+                    12.,
+                    heading
+                        .size()
+                        .y
+                        .max(if card.typed.is_some() { 28. } else { 0. })
+                        + 22.,
+                ),
             bounds.max - vec2(12., if has_pager { 64. } else { 36. }),
         );
+        let body = Rect::from_min_max(body.min.min(body.max), body.max);
         let mut child = ui.new_child(
             UiBuilder::new()
-                .id(ui.id().with(("orb-activity", card.event.serial)))
+                .id(ui.id().with(("orb-activity", card.id())))
                 .max_rect(body),
         );
         child.set_clip_rect(body.intersect(aperture));
-        if !reveal.interactive() {
+        if !reveal.interactive() || index.is_none() {
             child.disable();
         }
         child.set_opacity(opacity);
@@ -1087,11 +1374,11 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             let mut child = ui.new_child(
                 UiBuilder::new()
                     // Hierarchy/observation insertion must not change these widget IDs.
-                    .id(ui.id().with(("orb-activity-focus", card.event.serial)))
+                    .id(ui.id().with(("orb-activity-focus", card.id())))
                     .max_rect(footer),
             );
             child.set_clip_rect(footer.intersect(aperture));
-            if !reveal.interactive() {
+            if !reveal.interactive() || index.is_none() {
                 child.disable();
             }
             child.set_opacity(opacity);
@@ -1110,13 +1397,23 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                         );
                     }
                     // Removed activity keys do not inherit a recycled geometry slot.
-                    if context.sim.anchor(key).is_some() {
+                    if card_anchor(&card, context.sim, rect).is_some() {
                         crate::orb_focus::checkbox(
                             ui,
                             context.view,
-                            context.view.agent_key(key),
+                            if card.typed.is_some() {
+                                key
+                            } else {
+                                context.view.agent_key(key)
+                            },
                             &mut state.focus,
                         );
+                    }
+                    if card.typed.is_some() && close_object(ui) {
+                        state.objects.close(key);
+                        if context.selected == Some(key) {
+                            response.clear_selection = true;
+                        }
                     }
                     if acknowledgeable && !compact {
                         dismiss_stop(
@@ -1173,50 +1470,17 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         child.set_clip_rect(body);
         child.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         child.horizontal(|ui| {
-            ui.strong(if selected.is_some() {
-                "Observation"
-            } else {
-                "Projects"
-            });
+            ui.strong("Projects");
             if !context.passive && ui.button("Close").clicked() {
                 response.clear_selection = true;
                 state.projects = false;
             }
         });
-        if !context.passive
-            && let Some(branch) = selected
-        {
-            crate::orb_focus::checkbox(&mut child, context.view, &branch.key, &mut state.focus);
-        }
         egui::ScrollArea::vertical()
             .max_height(child.available_height())
             .auto_shrink([false, false])
             .show(&mut child, |ui| {
-                if let Some(branch) = selected {
-                    if let Some(scene) = &context.view.scene {
-                        fn path<'a>(
-                            branches: &'a [herdr_mesh_visualizer::projection::Branch],
-                            key: &Key,
-                            names: &mut Vec<&'a herdr_mesh_visualizer::projection::Branch>,
-                        ) -> bool {
-                            for branch in branches {
-                                names.push(branch);
-                                if &branch.key == key || path(&branch.children, key, names) {
-                                    return true;
-                                }
-                                names.pop();
-                            }
-                            false
-                        }
-                        let mut names = Vec::new();
-                        if path(&scene.nodes, &branch.key, &mut names) {
-                            for ancestor in names.iter().take(names.len().saturating_sub(1)) {
-                                ui.small(format!("{}: {}", ancestor.kind, ancestor.label));
-                            }
-                        }
-                    }
-                    crate::orb_ui::observations(ui, branch, context.view.live);
-                } else if let Some(scene) = &context.view.scene {
+                if let Some(scene) = &context.view.scene {
                     for project in &scene.projects {
                         ui.label(format!(
                             "{} · {} workspace observations · {} nodes",
@@ -1283,7 +1547,9 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             );
             if dock.panel == Panel::Key {
                 child.horizontal(|ui| {
-                    ui.small("KEY · K");
+                    ui.small("KEY · K").on_hover_text(
+                        "N nodes · S sessions · W workspaces · F fleet · A working agents",
+                    );
                     if !context.passive && ui.selectable_label(state.projects, "Projects").clicked()
                     {
                         state.projects = !state.projects;
@@ -1291,7 +1557,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                     }
                 });
             } else {
-                child.small("FLEET · N");
+                child.small("FLEET · F");
             }
         }
         let body = Rect::from_min_max(
@@ -1312,7 +1578,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         }
         reveal.scan(&painter, dock.bounds);
     }
-    // Sampling is relevant even when K/N are hidden; never disguise partial detail.
+    // Sampling is relevant even when K/F are hidden; never disguise partial detail.
     if context.sim.omitted > 0 {
         painter.text(
             rect.left_top(),
@@ -1368,24 +1634,24 @@ mod tests {
             );
             output.textures_delta.clear();
         };
-        run(vec![key(egui::Key::W, true, false)], false, 2., &mut state);
+        run(vec![key(egui::Key::A, true, false)], false, 2., &mut state);
         assert!(!state.controls.workers.shown);
         run(
             vec![
-                key(egui::Key::W, true, true),
-                key(egui::Key::W, false, false),
+                key(egui::Key::A, true, true),
+                key(egui::Key::A, false, false),
             ],
             false,
             3.,
             &mut state,
         );
         assert!(!state.controls.workers.shown);
-        run(vec![key(egui::Key::W, true, false)], true, 4., &mut state);
+        run(vec![key(egui::Key::A, true, false)], true, 4., &mut state);
         assert!(!state.controls.workers.shown);
         run(
             vec![
                 key(egui::Key::K, true, false),
-                key(egui::Key::N, true, false),
+                key(egui::Key::F, true, false),
             ],
             false,
             5.,
@@ -1393,7 +1659,7 @@ mod tests {
         );
         state.reset_source();
         run(
-            vec![key(egui::Key::W, false, false)],
+            vec![key(egui::Key::A, false, false)],
             false,
             200.,
             &mut state,
@@ -1402,7 +1668,7 @@ mod tests {
         assert!(!state.controls.counts.reveal(200.).active());
         assert!(!state.controls.workers.reveal(200.).active());
         run(
-            vec![key(egui::Key::W, true, false)],
+            vec![key(egui::Key::A, true, false)],
             false,
             201.,
             &mut state,
@@ -1777,11 +2043,11 @@ mod tests {
             );
         }
         assert!(
-            frame(&sim, &v, &mut state, vec![key(egui::Key::W, true, false)])
+            frame(&sim, &v, &mut state, vec![key(egui::Key::A, true, false)])
                 .iter()
                 .any(|t| t == "AGENT COMPLETED")
         );
-        frame(&sim, &v, &mut state, vec![key(egui::Key::W, false, false)]);
+        frame(&sim, &v, &mut state, vec![key(egui::Key::A, false, false)]);
         // Focus resolves the real agent, not its independent outcome card key.
         for _ in 0..20 {
             frame(&sim, &v, &mut state, vec![key(egui::Key::Tab, true, false)]);
@@ -1999,11 +2265,11 @@ mod tests {
         }
         // W hides work, not the retained Idle stop.
         assert!(
-            frame(&sim, &v, &mut state, vec![key(egui::Key::W, true, false)])
+            frame(&sim, &v, &mut state, vec![key(egui::Key::A, true, false)])
                 .iter()
                 .any(|s| s == "WORK STOPPED — IDLE")
         );
-        frame(&sim, &v, &mut state, vec![key(egui::Key::W, false, false)]);
+        frame(&sim, &v, &mut state, vec![key(egui::Key::A, false, false)]);
         for _ in 0..20 {
             frame(&sim, &v, &mut state, vec![key(egui::Key::Tab, true, false)]);
             frame(
@@ -2173,7 +2439,7 @@ mod tests {
         assert!(
             state
                 .membership
-                .contains(&sim.activities[&key].event.serial)
+                .contains(&CardId::Activity(sim.activities[&key].event.serial))
         );
         // Priority has no ten-second expiry and unchanged reconnects cannot replay it.
         let order = state.stop_order[&key];
@@ -2397,7 +2663,7 @@ mod tests {
             assert!(
                 !state
                     .membership
-                    .contains(&sim.activities[&key].event.serial)
+                    .contains(&CardId::Activity(sim.activities[&key].event.serial))
             );
             output.textures_delta.clear();
             // A new instance acknowledged in another renderer replaces the old local ID.
@@ -2543,7 +2809,7 @@ mod tests {
         assert!(
             !state
                 .membership
-                .contains(&sim.activities[&key].event.serial),
+                .contains(&CardId::Activity(sim.activities[&key].event.serial)),
             "acknowledged card must leave pagination and hit masks"
         );
         assert_eq!(sim.summary().states[2], 2);
@@ -3038,5 +3304,285 @@ mod tests {
         }
         assert_eq!(state.page, 1);
         assert!(state.page_start > 0);
+    }
+    #[test]
+    fn bulk_shortcuts_typed_selection_and_pointer_close_do_not_acknowledge_outcomes() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "idle", 1)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        let selected = v.scene.as_ref().unwrap().nodes[0].children[0].children[0]
+            .key
+            .clone();
+        let mut state = Panels::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1920., 1080.));
+        let frame = |state: &mut Panels, sim: &Simulation, selection: Option<&Key>, events| {
+            let mut result = Response::default();
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    state.handle_input(ui, sim.clock, false);
+                    result = draw(
+                        ui,
+                        &Context {
+                            sim,
+                            view: &v,
+                            rect,
+                            selected: selection,
+                            passive: false,
+                        },
+                        state,
+                    );
+                },
+            );
+            let texts = out
+                .shapes
+                .iter()
+                .filter_map(|s| {
+                    if let egui::Shape::Text(t) = &s.shape {
+                        Some(t.galley.text().to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            out.textures_delta.clear();
+            (result, texts)
+        };
+        frame(
+            &mut state,
+            &sim,
+            None,
+            vec![
+                key(egui::Key::N, true, false),
+                key(egui::Key::S, true, false),
+                key(egui::Key::W, true, false),
+            ],
+        );
+        assert_eq!(state.objects.cards.len(), 5);
+        sim.update(&v, Stamp::seconds(201), 3.);
+        let (_, texts) = frame(&mut state, &sim, Some(&selected), vec![]);
+        assert_eq!(state.objects.cards.len(), 5);
+        assert!(texts.iter().any(|t| t == "WORKSPACE"));
+        assert!(!texts.iter().any(|t| t == "Observation"));
+        let id = CardId::Object(selected.clone());
+        let bounds = state.presentations[&id]
+            .motion
+            .sample(sim.clock)
+            .0
+            .translate(vec2(0., drift(sim.clock, 0., 8.)));
+        // Selected card is first and owns the pager when the rest overflow.
+        let pager = state.membership.len()
+            > state
+                .presentations
+                .values()
+                .filter(|p| p.visibility.shown)
+                .count();
+        let point = pos2(
+            bounds.left() + 62.,
+            bounds.bottom() - if pager { 46. } else { 20. },
+        );
+        frame(
+            &mut state,
+            &sim,
+            Some(&selected),
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        let (result, _) = frame(
+            &mut state,
+            &sim,
+            Some(&selected),
+            vec![egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(
+            result.clear_selection,
+            "bracketed × must close the selected typed card"
+        );
+        assert!(state.take_dismissals().is_empty());
+        assert!(state.dismissed.is_empty());
+        sim.update(&v, Stamp::seconds(201), 3.2);
+        frame(&mut state, &sim, None, vec![]);
+        assert!(!state.objects.cards.contains_key(&selected));
+        assert!(
+            state.presentations[&id]
+                .visibility
+                .reveal(sim.clock)
+                .active(),
+            "close animates instead of popping"
+        );
+        sim.update(&v, Stamp::seconds(201), 5.);
+        frame(&mut state, &sim, None, vec![]);
+        assert!(!state.presentations.contains_key(&id));
+        frame(&mut state, &sim, Some(&selected), vec![]);
+        assert!(state.objects.cards.contains_key(&selected));
+        assert_eq!(sim.summary().agents, 2);
+    }
+    #[test]
+    fn callout_reflow_retargets_current_position_and_staggers_each_visible_page() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "idle", 1)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 10.);
+        let mut state = Panels::default();
+        state.objects.toggle(crate::orb_objects::Class::Session);
+        state.objects.update(&sim, &v, None);
+        let objects: Vec<_> = state.objects.cards.values().cloned().collect();
+        let candidates: Vec<_> = objects
+            .iter()
+            .map(|o| Card {
+                event: &o.event,
+                key: Some(&o.key),
+                persistent: true,
+                working: false,
+                attention: false,
+                acknowledgeable: false,
+                typed: Some(o.glyph),
+                pinned: false,
+            })
+            .collect();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
+        let context = Context {
+            sim: &sim,
+            view: &v,
+            rect,
+            selected: None,
+            passive: false,
+        };
+        let slots = vec![
+            Rect::from_min_size(pos2(700., 20.), vec2(300., 200.)),
+            Rect::from_min_size(pos2(700., 250.), vec2(300., 200.)),
+        ];
+        assert!(present_cards(&candidates, &slots, 0, &mut state, &context).is_empty());
+        sim.clock = 10.1;
+        let context = Context {
+            sim: &sim,
+            view: &v,
+            rect,
+            selected: None,
+            passive: false,
+        };
+        let shown = present_cards(&candidates, &slots, 0, &mut state, &context);
+        assert_eq!(shown.len(), 1);
+        sim.clock = 12.;
+        let context = Context {
+            sim: &sim,
+            view: &v,
+            rect,
+            selected: None,
+            passive: false,
+        };
+        let shown = present_cards(&candidates, &slots, 0, &mut state, &context);
+        assert_eq!(shown.len(), 2);
+        let id = candidates[0].id();
+        let before = state.presentations[&id].motion.sample(12.).0;
+        let moved: Vec<_> = slots
+            .iter()
+            .map(|r| r.translate(vec2(-100., 80.)))
+            .collect();
+        present_cards(&candidates, &moved, 0, &mut state, &context);
+        assert_eq!(state.presentations[&id].motion.sample(12.).0, before);
+        let midway = state.presentations[&id].motion.sample(12.2).0;
+        sim.clock = 12.2;
+        let context = Context {
+            sim: &sim,
+            view: &v,
+            rect,
+            selected: None,
+            passive: false,
+        };
+        present_cards(&candidates, &slots, 0, &mut state, &context);
+        assert_eq!(state.presentations[&id].motion.sample(12.2).0, midway);
+        assert_eq!(state.presentations[&id].motion.sample(13.).0, slots[0]);
+        // Page membership drives retraction; retired pages have no input index.
+        let exits = present_cards(&[], &[], 0, &mut state, &context);
+        assert!(exits.iter().all(|(_, _, _, i)| i.is_none()));
+        sim.clock = 14.;
+        let context = Context {
+            sim: &sim,
+            view: &v,
+            rect,
+            selected: None,
+            passive: false,
+        };
+        assert!(present_cards(&[], &[], 0, &mut state, &context).is_empty());
+        assert!(state.presentations.is_empty());
+        drop(ctx);
+    }
+    #[test]
+    fn animation_budget_waits_without_dropping_or_acknowledging_pending_candidates() {
+        let v = view(vec![node("one", "idle", 1)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 10.);
+        let mut state = Panels::default();
+        let objects: Vec<_> = (0..192)
+            .map(|i| crate::orb_objects::Object {
+                key: vec!["coordinator".into(), format!("root-{i}")],
+                glyph: mesh_orb::Glyph::Coordinator,
+                event: Event {
+                    serial: 0,
+                    origin: crate::mesh_model::Id::Node(0),
+                    started: 0.,
+                    title: "COORDINATOR",
+                    text: String::new(),
+                    color: [1., 1., 1.],
+                },
+            })
+            .collect();
+        let cards: Vec<_> = objects
+            .iter()
+            .map(|o| Card {
+                event: &o.event,
+                key: Some(&o.key),
+                persistent: true,
+                working: false,
+                attention: false,
+                acknowledgeable: false,
+                typed: Some(o.glyph),
+                pinned: false,
+            })
+            .collect();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
+        let slots = vec![Rect::from_min_size(pos2(700., 20.), vec2(300., 200.)); 64];
+        for (clock, start) in [(10., 0), (30., 0), (30., 64), (31., 64), (31., 128)] {
+            sim.clock = clock;
+            let context = Context {
+                sim: &sim,
+                view: &v,
+                rect,
+                selected: None,
+                passive: false,
+            };
+            present_cards(&cards, &slots, start, &mut state, &context);
+            assert!(state.presentations.len() <= MAX_PRESENTATIONS);
+        }
+        assert!(!state.presentations.contains_key(&cards[191].id()));
+        sim.clock = 50.;
+        let context = Context {
+            sim: &sim,
+            view: &v,
+            rect,
+            selected: None,
+            passive: false,
+        };
+        present_cards(&cards, &slots, 128, &mut state, &context);
+        assert!(state.presentations.contains_key(&cards[191].id()));
+        assert!(state.take_dismissals().is_empty());
     }
 }

@@ -155,6 +155,7 @@ pub struct Pulse {
     pub started: f64,
     pub color: [f32; 3],
 }
+#[derive(Clone)]
 pub struct Event {
     pub serial: u64,
     pub origin: Id,
@@ -274,6 +275,9 @@ impl Simulation {
     }
     pub fn summary(&self) -> Summary {
         self.totals
+    }
+    pub fn coordinator_key(&self) -> Option<&Key> {
+        self.source.as_ref()
     }
     pub fn key(&self, id: Id) -> Option<&Key> {
         self.records.get(&id).map(|r| &r.key)

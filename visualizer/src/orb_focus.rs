@@ -65,7 +65,10 @@ impl Controller {
             .as_ref()
             .and_then(|key| sim.id(key))
             .filter(|id| matches!(id, Id::Node(_)));
-        if id.is_none() {
+        let root = requested
+            .as_ref()
+            .is_some_and(|key| sim.coordinator_key() == Some(key));
+        if id.is_none() && !root {
             *requested = None;
         }
         let changed = self.key != *requested;
@@ -90,6 +93,18 @@ impl Controller {
                 },
                 rect,
             )
+        } else if root {
+            let time = if changed {
+                current.orbit_time
+            } else {
+                self.target.orbit_time
+            };
+            Pose {
+                rotation: Quat::from_rotation_arc(mesh_orb::coordinator(time).normalize(), Vec3::Z),
+                center: Vec3::ZERO,
+                zoom: 1.,
+                orbit_time: time,
+            }
         } else {
             Pose {
                 rotation: self.spin_offset * mesh_orb::scene_rotation(sim.time),
@@ -162,8 +177,17 @@ pub fn node_for<'a>(view: &'a View, key: &Key) -> Option<&'a Branch> {
         .iter()
         .find(|n| key.starts_with(&n.key))
 }
+fn focus_target<'a>(view: &'a View, key: &Key) -> Option<&'a Branch> {
+    node_for(view, key).or_else(|| {
+        view.scene
+            .as_ref()?
+            .coordinator
+            .as_ref()
+            .filter(|root| &root.key == key)
+    })
+}
 pub fn checkbox(ui: &mut Ui, view: &View, key: &Key, focus: &mut Option<Key>) {
-    let Some(node) = node_for(view, key) else {
+    let Some(node) = focus_target(view, key) else {
         return;
     };
     let mut checked = focus.as_ref() == Some(&node.key);
@@ -252,9 +276,11 @@ pub fn checkbox(ui: &mut Ui, view: &View, key: &Key, focus: &mut Option<Key>) {
     }
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(
-            "Bring this node's cluster forward and pause rotation; click again to return",
-        );
+        .on_hover_text(if node.kind == "coordinator" {
+            "Bring the coordinator forward and pause the fleet; click again to return"
+        } else {
+            "Bring this node's cluster forward and pause rotation; click again to return"
+        });
 }
 /// Prefer the left edge, then beside the HUD, then the right edge. Fall back
 /// to the tallest free segment without placing a panel behind another overlay.
@@ -303,9 +329,17 @@ pub fn panel(
     rect: Rect,
     focus: &mut Option<Key>,
     reserved: &[Rect],
+    motion: &mut Option<crate::animation::Motion>,
+    clock: f64,
 ) -> Option<Rect> {
-    let node = focus.as_ref().and_then(|key| node_for(view, key))?;
-    let bounds = panel_bounds(rect, reserved);
+    let node = focus.as_ref().and_then(|key| focus_target(view, key))?;
+    let target = panel_bounds(rect, reserved);
+    let motion = motion.get_or_insert_with(|| crate::animation::Motion::new(target, 1., clock));
+    motion.retarget(target, 1., clock);
+    let bounds = crate::orb_panels::bounded(motion.sample(clock).0, rect);
+    if !bounds.is_positive() {
+        return None;
+    }
     let height = bounds.height();
     let painter = ui.painter().with_clip_rect(bounds);
     painter.rect_filled(bounds, 3., Color32::from_rgba_unmultiplied(4, 12, 25, 220));
@@ -365,6 +399,13 @@ pub fn panel(
         }
     }
     flatten(node, 0, &mut rows);
+    if node.kind == "coordinator"
+        && let Some(scene) = &view.scene
+    {
+        for member in &scene.nodes {
+            flatten(member, 1, &mut rows);
+        }
+    }
     // Fixed row heights support virtual scrolling without rendering all fleet names.
     egui::ScrollArea::both()
         .id_salt("orb-focus-rows")
@@ -611,7 +652,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    let bounds = panel(ui, &v, rect, &mut focus, &[dock]).unwrap();
+                    let bounds = panel(ui, &v, rect, &mut focus, &[dock], &mut None, 0.).unwrap();
                     assert!(bounds.is_finite());
                     assert!(rect.contains_rect(bounds));
                     assert!(!bounds.intersects(dock));
@@ -638,7 +679,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let bounds = panel(ui, &v, rect, &mut focus, &[]).unwrap();
+                let bounds = panel(ui, &v, rect, &mut focus, &[], &mut None, 0.).unwrap();
                 assert!(bounds.height() < 40.);
                 let names = labels(ui, &sim, &v, rect, &focus, &[bounds]);
                 assert!(
@@ -740,5 +781,37 @@ mod tests {
         run(&mut focus, click(true));
         run(&mut focus, click(false));
         assert!(focus.is_none());
+    }
+    #[test]
+    fn coordinator_focus_is_a_paused_fleet_view_and_rejects_stale_root_keys() {
+        let v = view(vec![node("one", "working", 1)], 1);
+        let mut sim = Simulation::default();
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, vec2(1100., 800.));
+        advance(&mut sim, &v, 0.);
+        let root = v
+            .scene
+            .as_ref()
+            .unwrap()
+            .coordinator
+            .as_ref()
+            .unwrap()
+            .key
+            .clone();
+        assert_eq!(focus_target(&v, &root).unwrap().kind, "coordinator");
+        let mut requested = Some(root);
+        let mut controller = Controller::default();
+        controller.update(&mut sim, &mut requested, rect);
+        advance(&mut sim, &v, 2.);
+        controller.update(&mut sim, &mut requested, rect);
+        let pose = sim.camera.unwrap();
+        advance(&mut sim, &v, 8.);
+        controller.update(&mut sim, &mut requested, rect);
+        assert_eq!(sim.camera.unwrap().orbit_time, pose.orbit_time);
+        assert_eq!(sim.camera.unwrap().center, Vec3::ZERO);
+        assert_eq!(sim.summary().nodes, 1); // Root is never an execution node.
+        requested = Some(vec!["coordinator".into(), "different".into()]);
+        controller.update(&mut sim, &mut requested, rect);
+        assert!(requested.is_none());
+        assert!(sim.camera.unwrap().rotation.dot(pose.rotation).abs() > 0.999);
     }
 }

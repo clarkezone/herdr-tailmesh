@@ -158,7 +158,14 @@ pub struct Visibility {
     since: f64,
 }
 impl Visibility {
-    fn new(from: f32) -> Self {
+    pub fn hidden() -> Self {
+        Self {
+            from: 0.,
+            shown: false,
+            since: 0.,
+        }
+    }
+    pub fn new(from: f32) -> Self {
         Self {
             from,
             shown: true,
@@ -174,7 +181,7 @@ impl Visibility {
             self.from * (1. - t)
         })
     }
-    fn set(&mut self, shown: bool, clock: f64, delay: f64) {
+    pub fn set(&mut self, shown: bool, clock: f64, delay: f64) {
         if self.shown != shown {
             self.from = self.reveal(clock).amount();
             self.shown = shown;

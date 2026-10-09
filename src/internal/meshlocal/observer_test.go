@@ -360,3 +360,22 @@ func TestObserverInfoDeadlineAndCapacity(t *testing.T) {
 		}
 	}
 }
+
+func TestObserverForwardsMemberImplementationVersionAndLegacyUnknown(t *testing.T) {
+	observer, _, _ := observerFixture(t, func(s grpc.ServerStreamingServer[pb.NodeList]) error {
+		return s.Send(&pb.NodeList{Nodes: []*pb.NodeView{{InstanceId: "updated", ImplementationVersion: "member-v4"}, {InstanceId: "legacy"}}})
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := observer.WatchNodes(ctx, &emptypb.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := stream.Recv()
+	if err != nil || len(nodes.GetNodes()) != 2 {
+		t.Fatalf("snapshot %v %v", nodes, err)
+	}
+	if nodes.Nodes[0].ImplementationVersion != "member-v4" || nodes.Nodes[1].ImplementationVersion != "" {
+		t.Fatal("member metadata lost or inferred from coordinator")
+	}
+}

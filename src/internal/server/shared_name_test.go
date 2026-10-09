@@ -20,15 +20,15 @@ func TestLogicalNodeNamePersistsBeforePublicationAndSurvivesRestore(t *testing.T
 		t.Fatal(err)
 	}
 	persistence.beforeSave = func(view *pb.NodeView) {
-		if view.Hostname == "desktop" && entry.view.Hostname != "" {
+		if view.Hostname == "desktop" && (entry.view.Hostname != "" || entry.view.ImplementationVersion != "") {
 			t.Fatal("logical name published before durable write")
 		}
 	}
-	if err := fleet.setLogicalName(entry, "desktop"); err != nil {
+	if err := fleet.setHelloMetadata(entry, "desktop", "v1.2.3"); err != nil {
 		t.Fatal(err)
 	}
 	persistence.beforeSave = nil
-	if entry.view.Hostname != "desktop" || entry.view.InstanceId != "independent-instance" || entry.view.TailscaleStableId != "shared-tsnet" {
+	if entry.view.Hostname != "desktop" || entry.view.InstanceId != "independent-instance" || entry.view.TailscaleStableId != "shared-tsnet" || entry.view.ImplementationVersion != "v1.2.3" {
 		t.Fatalf("name projection changed authenticated identity: %+v", entry.view)
 	}
 	if err := fleet.end(entry); err != nil {
@@ -39,7 +39,7 @@ func TestLogicalNodeNamePersistsBeforePublicationAndSurvivesRestore(t *testing.T
 		t.Fatal(err)
 	}
 	nodes, err := restored.list(now)
-	if err != nil || len(nodes.GetNodes()) != 1 || nodes.Nodes[0].Hostname != "desktop" || nodes.Nodes[0].Connected {
+	if err != nil || len(nodes.GetNodes()) != 1 || nodes.Nodes[0].Hostname != "desktop" || nodes.Nodes[0].ImplementationVersion != "v1.2.3" || nodes.Nodes[0].Connected {
 		t.Fatalf("name did not survive offline restore: %+v %v", nodes, err)
 	}
 }
@@ -64,14 +64,43 @@ func TestLogicalNodeNameRejectsInvalidSupersededAndFailedWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fleet.setLogicalName(original, "old"); status.Code(err) != codes.Aborted {
+	if err := fleet.setHelloMetadata(original, "old", "v0"); status.Code(err) != codes.Aborted {
 		t.Fatalf("superseded stream renamed current node: %v", err)
 	}
 	persistence.saveErr = errors.New("disk failed")
-	if err := fleet.setLogicalName(replacement, "desktop"); status.Code(err) != codes.Unavailable {
+	if err := fleet.setHelloMetadata(replacement, "desktop", "v2"); status.Code(err) != codes.Unavailable {
 		t.Fatalf("failed name persistence not surfaced: %v", err)
 	}
-	if replacement.view.Hostname != "" {
+	if replacement.view.Hostname != "" || replacement.view.ImplementationVersion != "" {
 		t.Fatal("uncommitted logical name was published")
+	}
+}
+
+func TestHelloVersionReplacementAndMalformedDisplayMetadata(t *testing.T) {
+	f := &fleetStore{}
+	first, err := f.begin("n", "stable", false, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.setHelloMetadata(first, "node", "old"); err != nil {
+		t.Fatal(err)
+	}
+	next, err := f.begin("n", "stable", false, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.setHelloMetadata(next, "node", ""); err != nil {
+		t.Fatal(err)
+	}
+	if next.view.ImplementationVersion != "" {
+		t.Fatal("legacy reconnect inherited old version")
+	}
+	for _, malformed := range []string{"bad\nversion", strings.Repeat("x", 257), string([]byte{0xff})} {
+		if err := f.setHelloMetadata(next, "node", malformed); err != nil {
+			t.Fatal(err)
+		}
+		if next.view.ImplementationVersion != "" {
+			t.Fatal("invalid display version exposed")
+		}
 	}
 }

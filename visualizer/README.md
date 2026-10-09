@@ -12,11 +12,24 @@ panels hold the visual key and the seven fleet totals in vertical lists. Their
 backgrounds cover only their own bounds; they gently drift and connect to the
 coordinator. The key appears once for the first minute after launch, then stays
 hidden. **K** toggles it manually, overriding the startup timer indefinitely.
-The separate counts panel starts visible and stays on until **N** toggles it.
+The separate counts panel starts visible and stays on until **F** toggles it.
 When both are visible they stack without overlap. When either is alone it hugs
 the bottom-left margin; showing the other smoothly moves it up before the new
 panel unfolds beneath it. Held keys do not repeatedly toggle. Reconnecting does
 not reset these preferences or replay the startup key.
+
+**N**, **S**, and **W** independently toggle node, session, and workspace
+callouts. Clicking any sphere object opens its typed card with the exact legend
+glyph, scoped names, status and details. Click again, blank space, or its bracketed
+× to close it. Bulk and clicked cards share one identity; closing a bulk card hides
+that item until its class is toggled off/on or it is selected again. Typed × never
+acknowledges historical outcomes. Node cards show herdr-mesh and session Herdr
+versions; old coordinators report the mesh version as unknown. Rebuild the
+coordinator to expose the additive NodeView metadata (existing node Hello already
+reports it). Coordinator Focus pauses a fleet view with the root forward; descendant
+Focus frames its node rose. Cards enter with a 200 ms visible-page stagger and
+reposition over 400 ms with easing. New outcomes/attention take priority over bulk
+cards; overflow remains pageable. Keyboard toggles are omitted in screensaver mode.
 
 Panels and working-agent cards share a holographic reveal: a travelling leader
 beam, expanding light rail, upward unfolding aperture, luminous scan edge,
@@ -28,8 +41,8 @@ independently of whether the key is showing.
 
 Each observed working, blocked or completed agent has an independent persistent callout with
 its real node/session/workspace/agent names, including initial/reconnect snapshots.
-**W** toggles working callouts only; blocked and completed cards remain visible. State and
-counts, selection and timed notices remain independent of W. Working → blocked
+**A** toggles working callouts only; blocked and completed cards remain visible. State and
+counts, selection and timed notices remain independent of A. Working → blocked
 replaces the work card with persistent ATTENTION REQUIRED, and blocked → working
 replaces attention with work. Each agent has one latest outcome card, independent of its current state:
 
@@ -41,7 +54,7 @@ replaces attention with work. Each agent has one latest outcome card, independen
   instance. Old dismissal input cannot hide the replacement.
 - Each card shows its outcome, current state and node/session/workspace/agent
   names. Counts and markers reflect current observations, including Idle after
-  completion; history does not inflate Completed counts. W hides live Working
+  completion; history does not inflate Completed counts. A hides live Working
   cards only. Focus resolves to the actual agent, not the historical card.
 - A bracketed **×** beside the Focus reticle acknowledges only that outcome
   instance and retracts it. The control glows on hover/keyboard focus; hover help
@@ -152,14 +165,14 @@ inside their surface cluster. This uses full observations even when geometry is
 sampled, ages with inventory freshness, and remains separate from receipt heartbeat
 pulses. Sampled agent callouts anchor to their owning node. Callout history is capped
 at 8,000, with blocked attention ahead of working, then completed cards and old timed history; capacity
-omissions are disclosed independently of K/N/W, while totals remain complete.
+omissions are disclosed independently of K/F/A, while totals remain complete.
 
-Every activity callout and selected node/descendant observation offers a compact
+Every activity callout and typed object card offers a compact
 illuminated reticle **Focus** toggle.
 Checking it pauses orbital motion and eases that node's surface cluster forward
 with zoom over 1.5 seconds; focus framing has a further 20% magnification boost. Another node transfers focus; uncheck, **Escape**, or
 **Return to fleet** restores the rotating overview without a camera jump. Focus
-survives callout expiry and W hiding, but releases on node removal/source replacement.
+survives callout expiry and A hiding, but releases on node removal/source replacement.
 Live data, attention and heartbeat effects keep running while motion is paused.
 The reticle has no painted Focus caption; hover and accessibility still identify
 its action. Names appear beside projected glyphs where they fit independently of
