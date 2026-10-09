@@ -71,6 +71,9 @@ impl Store {
             user_state_directory()?.join(format!("dismissals-{port}.bin")),
         ))
     }
+    pub(crate) fn outcome_path(&self) -> PathBuf {
+        self.path.with_extension("outcomes.bin")
+    }
     fn read(&self) -> io::Result<(Saved, bool)> {
         let file = match File::open(&self.path) {
             Ok(file) => file,

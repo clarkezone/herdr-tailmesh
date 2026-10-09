@@ -204,6 +204,10 @@ pub struct Simulation {
     serial: u64,
     completion_episodes: Arc<BTreeMap<Key, u64>>,
     idle_stop_episodes: Arc<BTreeMap<Key, u64>>,
+    outcome_agents: BTreeMap<Key, Key>,
+    outcomes_managed: bool,
+    outcome_dismissed: BTreeMap<Key, f64>,
+    outcome_revision: Option<(u64, u64, u64)>,
     wall: Stamp,
     diagnostic_revision: Option<(u64, u64, u64, u64, usize, usize)>,
     diagnostic_activities: BTreeMap<Key, ActivityTrace>,
@@ -256,7 +260,7 @@ impl Simulation {
             .collect();
         for (key, trace) in &current {
             if self.diagnostic_activities.get(key) != Some(trace) {
-                view.diagnostic("activity_changed", json!({"renderer":renderer, "key":key, "state":format!("{:?}", trace.state), "episode":trace.episode, "event_serial":trace.serial, "persistent":trace.persistent, "previous_episode":self.diagnostic_activities.get(key).and_then(|a| a.episode)}));
+                view.diagnostic("activity_changed", json!({"renderer":renderer, "key":view.agent_key(key), "card_key":key, "state":format!("{:?}", trace.state), "episode":trace.episode, "event_serial":trace.serial, "persistent":trace.persistent, "previous_episode":self.diagnostic_activities.get(key).and_then(|a| a.episode)}));
             }
         }
         for (key, trace) in self
@@ -264,7 +268,7 @@ impl Simulation {
             .iter()
             .filter(|(k, _)| !current.contains_key(*k))
         {
-            view.diagnostic("activity_removed", json!({"renderer":renderer, "key":key, "episode":trace.episode, "event_serial":trace.serial, "reason":"not_retained", "omitted_activities":self.omitted_activities}));
+            view.diagnostic("activity_removed", json!({"renderer":renderer, "key":view.agent_key(key), "card_key":key, "episode":trace.episode, "event_serial":trace.serial, "reason":"not_retained", "omitted_activities":self.omitted_activities}));
         }
         self.diagnostic_activities = current;
     }
@@ -302,6 +306,7 @@ impl Simulation {
             .is_some_and(|a| !self.live || a.offline || !a.freshness.is_live(self.wall))
     }
     pub fn anchor(&self, key: &Key) -> Option<Id> {
+        let key = self.outcome_agents.get(key).unwrap_or(key);
         self.id(key)
             .or_else(|| key.get(..2).and_then(|node| self.id(&node.to_vec())))
     }
@@ -445,6 +450,23 @@ impl Simulation {
         self.wall = wall;
         self.completion_episodes = Arc::clone(&view.completion_episodes);
         self.idle_stop_episodes = Arc::clone(&view.idle_stop_episodes);
+        self.outcomes_managed = view.outcome_notices.is_some();
+        self.outcome_agents = view
+            .outcome_notices
+            .iter()
+            .flat_map(|m| m.iter())
+            .map(|(k, n)| (k.clone(), n.agent.clone()))
+            .collect();
+        // Retire superseded outcome instances before admission; an old card
+        // must not occupy the replacement's bounded presentation slot.
+        if let Some(notices) = &view.outcome_notices {
+            self.activities.retain(|key, a| {
+                key.last().is_none_or(|s| s != "outcome")
+                    || notices
+                        .get(key)
+                        .is_some_and(|n| a.stop_episode == Some(n.episode))
+            });
+        }
         self.callouts = true;
         let freed = self.prune();
         let Some(scene) = &view.scene else {
@@ -518,6 +540,14 @@ impl Simulation {
                 })
             })
             .collect();
+        let outcome_revision = (view.epoch, view.revision, view.acknowledgement_revision);
+        let retracting = self.outcome_dismissed.iter().any(|(k, t)| {
+            self.clock - *t >= f64::from(CALLOUT_FADE) && self.activities.contains_key(k)
+        });
+        if self.outcome_revision != Some(outcome_revision) || freed || retracting {
+            self.reconcile_outcomes(view, scene);
+            self.outcome_revision = Some(outcome_revision);
+        }
         self.trace_activities(view);
     }
     fn reconcile(&mut self, scene: &Scene, emit: bool) {
@@ -600,6 +630,8 @@ impl Simulation {
                 // independently of which agents have GPU geometry.
                 if attention
                     && !self.persistent_state(&branch.key, state)
+                    && !(self.outcomes_managed
+                        && matches!(state, AgentState::Completed | AgentState::Idle))
                     && !self.activities.contains_key(&branch.key)
                 {
                     let title = match state {
@@ -688,7 +720,9 @@ impl Simulation {
             .activities
             .iter()
             .filter(|(key, a)| {
-                a.persistent && !self.ids.get(*key).is_some_and(|id| selected.contains(id))
+                a.persistent
+                    && !self.outcome_agents.contains_key(*key)
+                    && !self.ids.get(*key).is_some_and(|id| selected.contains(id))
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -705,6 +739,9 @@ impl Simulation {
             reported(&scene.nodes, &missing, &mut present);
         }
         self.activities.retain(|key, activity| {
+            if self.outcome_agents.contains_key(key) {
+                return true;
+            }
             if activity.persistent && !self.ids.get(key).is_some_and(|id| selected.contains(id)) {
                 if present.contains(key) {
                     return true;
@@ -756,6 +793,8 @@ impl Simulation {
                 && branch.freshness.is_live(self.wall)
                 && previous.persistent
                 && previous.state != state
+                && !(self.outcomes_managed
+                    && matches!(state, AgentState::Completed | AgentState::Idle))
                 && previous.freshness.is_live(self.wall);
             if self.persistent_state(&branch.key, state) || transition {
                 let Some(id) = self.id(&branch.key).or_else(|| self.id(&node.key)) else {
@@ -777,6 +816,10 @@ impl Simulation {
                 self.activities.remove(&branch.key); // Baselines cannot invent a resolution.
             }
         }
+        self.activities.retain(|key, a| {
+            key.last().is_none_or(|k| k != "outcome")
+                || self.outcome_agents.contains_key(key) && a.persistent
+        });
         let mut incoming = [0usize; 4];
         for (branch, _, node) in &agents {
             let state = AgentState::observed(&branch.status);
@@ -842,11 +885,114 @@ impl Simulation {
             (known.working + known.blocked + known.done + self.idle_stop_episodes.len())
                 .saturating_sub(self.activities.values().filter(|a| a.persistent).count());
     }
+    fn reconcile_outcomes(&mut self, view: &View, scene: &Scene) {
+        let Some(notices) = &view.outcome_notices else {
+            return;
+        };
+        self.activities.retain(|key, a| {
+            key.last().is_none_or(|s| s != "outcome")
+                || notices
+                    .get(key)
+                    .is_some_and(|n| a.stop_episode == Some(n.episode))
+        });
+        self.outcome_dismissed
+            .retain(|key, _| notices.get(key).is_some_and(|n| n.dismissed));
+        let mut agents = BTreeMap::new();
+        fn scan<'a>(
+            b: &'a Branch,
+            node: &'a Branch,
+            out: &mut BTreeMap<&'a Key, (&'a Branch, &'a Branch)>,
+        ) {
+            if b.kind == "agent" {
+                out.insert(&b.key, (b, node));
+            }
+            for c in &b.children {
+                scan(c, node, out);
+            }
+        }
+        for n in &scene.nodes {
+            scan(n, n, &mut agents);
+        }
+        for (key, n) in notices.iter() {
+            if n.dismissed {
+                let since = *self
+                    .outcome_dismissed
+                    .entry(key.clone())
+                    .or_insert(self.clock);
+                if self.clock - since >= f64::from(CALLOUT_FADE) {
+                    self.activities.remove(key);
+                }
+                continue;
+            }
+            let state = if n.kind == "done" {
+                AgentState::Completed
+            } else {
+                AgentState::Idle
+            };
+            let current = agents.get(&n.agent);
+            let current_state = current.map_or("no longer observed", |(b, _)| b.status.as_str());
+            let text = format!(
+                "Current state: {}\nNode: {}\nSession: {}\nWorkspace: {}\nAgent: {}",
+                current_state, n.names[0], n.names[1], n.names[2], n.names[3]
+            );
+            let freshness = current.map_or(Freshness::Stale, |(b, _)| b.freshness);
+            let offline = current.is_none_or(|(_, node)| node.status != "connected");
+            if let Some(a) = self.activities.get_mut(key)
+                && a.stop_episode == Some(n.episode)
+            {
+                a.event.text = text;
+                a.freshness = freshness;
+                a.offline = offline;
+                continue;
+            }
+            if self.activities.len() >= MAX_ENTITIES {
+                continue;
+            }
+            self.serial = self.serial.wrapping_add(1);
+            let origin = self.anchor(key).unwrap_or(Id::Node(MAX_NODES));
+            self.activities.insert(
+                key.clone(),
+                Activity {
+                    state,
+                    stop_episode: Some(n.episode),
+                    freshness,
+                    offline,
+                    persistent: true,
+                    event: Event {
+                        serial: self.serial,
+                        origin,
+                        started: self.clock,
+                        title: if n.kind == "done" {
+                            "AGENT COMPLETED"
+                        } else {
+                            "WORK STOPPED — IDLE"
+                        },
+                        text,
+                        color: state.color(),
+                    },
+                },
+            );
+        }
+        let demand = self.totals.states[0]
+            + self.totals.states[1]
+            + notices.values().filter(|n| !n.dismissed).count();
+        self.omitted_activities = demand.saturating_sub(
+            self.activities
+                .iter()
+                .filter(|(key, a)| a.persistent && !notices.get(*key).is_some_and(|n| n.dismissed))
+                .count(),
+        );
+    }
     fn persistent_state(&self, key: &Key, state: AgentState) -> bool {
+        if self.outcomes_managed {
+            return matches!(state, AgentState::Working | AgentState::Blocked);
+        }
         state.persistent() || state == AgentState::Idle && self.idle_stop_episodes.contains_key(key)
     }
     fn activity_priority(&self, key: &Key, state: AgentState) -> u8 {
-        if state == AgentState::Idle && self.idle_stop_episodes.contains_key(key) {
+        if self.outcome_agents.contains_key(key)
+            || state == AgentState::Idle && self.idle_stop_episodes.contains_key(key)
+        {
             AgentState::Completed.priority()
         } else {
             state.priority()

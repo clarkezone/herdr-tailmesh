@@ -88,8 +88,8 @@ impl Panels {
         self.stop_order
             .retain(|key, (episode, _)| view.stop_episode(key) == Some(*episode));
         for (key, episode) in view.stop_episodes() {
-            let idle = view.idle_stop_episodes.contains_key(key);
-            if (self.previous_episodes.is_some() || idle)
+            let idle = view.stop_is_idle(key);
+            if (self.previous_episodes.is_some() || idle || view.outcome_notices.is_some())
                 && self.previous_episodes.as_ref().and_then(|p| p.get(key)) != Some(episode)
             {
                 self.stop_sequence = self.stop_sequence.wrapping_add(1);
@@ -101,7 +101,7 @@ impl Panels {
                     } else {
                         "completion_priority"
                     },
-                    json!({"key":key, "episode":episode, "arrival_order":self.stop_sequence}),
+                    json!({"key":view.agent_key(key), "card_key":key, "episode":episode, "arrival_order":self.stop_sequence}),
                 );
             }
         }
@@ -114,6 +114,13 @@ impl Panels {
             .acknowledged_completions
             .iter()
             .chain(view.acknowledged_idle_stops.iter())
+            .chain(
+                view.outcome_notices
+                    .iter()
+                    .flat_map(|m| m.iter())
+                    .filter(|(_, n)| n.dismissed)
+                    .map(|(k, n)| (k, &n.episode)),
+            )
         {
             if view.stop_acknowledged(key, *episode)
                 && !self
@@ -121,7 +128,10 @@ impl Panels {
                     .get(key)
                     .is_some_and(|d| d.episode == Some(*episode))
             {
-                view.diagnostic("panel_ack_imported", json!({"key":key, "episode":episode}));
+                view.diagnostic(
+                    "panel_ack_imported",
+                    json!({"key":view.agent_key(key), "card_key":key, "episode":episode}),
+                );
                 self.dismissed.insert(
                     key.clone(),
                     Dismissal {
@@ -158,6 +168,15 @@ impl Panels {
         if let Some(scene) = &view.scene {
             for node in &scene.nodes {
                 scan(node, &self.dismissed, view, &mut retained);
+            }
+        }
+        for (key, n) in view.outcome_notices.iter().flat_map(|m| m.iter()) {
+            if self
+                .dismissed
+                .get(key)
+                .is_some_and(|d| d.episode == Some(n.episode))
+            {
+                retained.insert(key.clone());
             }
         }
         self.dismissed.retain(|key, _| retained.contains(key));
@@ -249,11 +268,11 @@ impl Panels {
             .collect();
         self.diagnostic_flyouts.retain(|key, trace| {
             if context.view.stop_episode(key) == Some(trace.episode) { return true; }
-            context.view.diagnostic(if trace.idle { "idle_stop_flyout_retired" } else { "completion_flyout_retired" }, json!({"renderer":renderer, "key":key, "episode":trace.episode, "previous_reason":trace.reason}));
+            context.view.diagnostic(if trace.idle { "idle_stop_flyout_retired" } else { "completion_flyout_retired" }, json!({"renderer":renderer, "key":context.view.agent_key(key), "card_key":key, "episode":trace.episode, "previous_reason":trace.reason}));
             false
         });
         for (key, episode) in context.view.stop_episodes() {
-            let idle = context.view.idle_stop_episodes.contains_key(key);
+            let idle = context.view.stop_is_idle(key);
             let activity = context.sim.activities.get(key);
             let position = positions.get(key).copied();
             let acknowledged = self
@@ -307,7 +326,7 @@ impl Panels {
                 live: context.view.live,
             };
             if self.diagnostic_flyouts.get(key) != Some(&trace) {
-                context.view.diagnostic(if idle { "idle_stop_flyout" } else { "completion_flyout" }, json!({"renderer":renderer, "key":key, "episode":episode, "reason":reason, "event_serial":trace.event_serial, "activity_episode":activity.and_then(|a| a.stop_episode), "activity_state":activity.map(|a| format!("{:?}", a.state)), "acknowledged":acknowledged, "candidate_index":position, "page_start":page_start, "capacity":capacity, "candidates":candidates.len(), "anchor":trace.anchor, "live":trace.live, "omitted_activities":context.sim.omitted_activities, "previous_reason":self.diagnostic_flyouts.get(key).map(|t| t.reason)}));
+                context.view.diagnostic(if idle { "idle_stop_flyout" } else { "completion_flyout" }, json!({"renderer":renderer, "key":context.view.agent_key(key), "card_key":key, "episode":episode, "reason":reason, "event_serial":trace.event_serial, "activity_episode":activity.and_then(|a| a.stop_episode), "activity_state":activity.map(|a| format!("{:?}", a.state)), "acknowledged":acknowledged, "candidate_index":position, "page_start":page_start, "capacity":capacity, "candidates":candidates.len(), "anchor":trace.anchor, "live":trace.live, "omitted_activities":context.sim.omitted_activities, "previous_reason":self.diagnostic_flyouts.get(key).map(|t| t.reason)}));
                 self.diagnostic_flyouts.insert(key.clone(), trace);
             }
         }
@@ -731,7 +750,7 @@ fn dismiss_stop(
     episode: Option<u64>,
     view: &View,
 ) {
-    let idle = view.idle_stop_episodes.contains_key(key);
+    let idle = view.stop_is_idle(key);
     let (rect, response) = ui.allocate_exact_size(
         vec2(28_f32.min(ui.available_width().max(1.)), 20.),
         egui::Sense::click(),
@@ -748,7 +767,7 @@ fn dismiss_stop(
         )
     });
     if response.clicked() {
-        view.diagnostic("dismiss_input", json!({"key":key, "episode":episode, "stop_kind":if idle { "idle" } else { "completed" }}));
+        view.diagnostic("dismiss_input", json!({"key":view.agent_key(key), "card_key":key, "episode":episode, "stop_kind":if idle { "idle" } else { "completed" }}));
         state
             .dismissed
             .insert(key.clone(), Dismissal { episode, at: clock });
@@ -1092,7 +1111,12 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                     }
                     // Removed activity keys do not inherit a recycled geometry slot.
                     if context.sim.anchor(key).is_some() {
-                        crate::orb_focus::checkbox(ui, context.view, key, &mut state.focus);
+                        crate::orb_focus::checkbox(
+                            ui,
+                            context.view,
+                            context.view.agent_key(key),
+                            &mut state.focus,
+                        );
                     }
                     if acknowledgeable && !compact {
                         dismiss_stop(
@@ -1664,6 +1688,246 @@ mod tests {
             state.focus.is_some(),
             "acknowledgement must leave Focus active"
         );
+    }
+    #[test]
+    fn latest_outcome_card_survives_live_idle_and_work_then_replaces_and_dismisses_by_instance() {
+        use herdr_mesh_visualizer::outcomes::Outcome;
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 600.));
+        let mut n = node("one", "working", 12);
+        n.herdr.as_mut().unwrap().agents[0].agent_status = "idle".into();
+        let mut v = view(vec![n.clone()], 1);
+        let scene = v.scene.as_ref().unwrap();
+        let agent = scene.nodes[0]
+            .children
+            .iter()
+            .flat_map(|s| &s.children)
+            .flat_map(|w| &w.children)
+            .find(|a| a.status == "idle")
+            .unwrap()
+            .key
+            .clone();
+        let mut notice = Outcome {
+            source: scene.coordinator.as_ref().unwrap().key.clone(),
+            agent: agent.clone(),
+            episode: 10,
+            kind: "done".into(),
+            names: vec![
+                "Actual node one".into(),
+                "default".into(),
+                "Actual workspace".into(),
+                "Actual agent 0".into(),
+            ],
+            dismissed: false,
+            observed_seconds: 200,
+            observed_nanos: 0,
+        };
+        let card = notice.card_key();
+        v.outcome_notices = Some(std::sync::Arc::new(BTreeMap::from([(
+            card.clone(),
+            notice.clone(),
+        )])));
+        let mut sim = Simulation::default();
+        let mut state = Panels::default();
+        let frame = |sim: &Simulation, v: &View, state: &mut Panels, events| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    state.handle_input(ui, sim.clock, false);
+                    draw(
+                        ui,
+                        &Context {
+                            sim,
+                            view: v,
+                            rect,
+                            selected: None,
+                            passive: false,
+                        },
+                        state,
+                    );
+                },
+            );
+            let texts = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            out.textures_delta.clear();
+            texts
+        };
+        sim.update(&v, Stamp::seconds(201), 0.);
+        for clock in [2., 30., 90., 300.] {
+            sim.update(&v, Stamp::seconds(201), clock);
+            let texts = frame(&sim, &v, &mut state, vec![]);
+            assert!(texts.iter().any(|t| t == "AGENT COMPLETED"), "{texts:?}");
+            assert_eq!(sim.state(sim.id(&agent).unwrap()), AgentState::Idle);
+            assert_eq!(sim.summary().states[2], 0);
+            assert!(
+                sim.activities[&card]
+                    .event
+                    .text
+                    .contains("Current state: idle")
+            );
+        }
+        assert!(
+            frame(&sim, &v, &mut state, vec![key(egui::Key::W, true, false)])
+                .iter()
+                .any(|t| t == "AGENT COMPLETED")
+        );
+        frame(&sim, &v, &mut state, vec![key(egui::Key::W, false, false)]);
+        // Focus resolves the real agent, not its independent outcome card key.
+        for _ in 0..20 {
+            frame(&sim, &v, &mut state, vec![key(egui::Key::Tab, true, false)]);
+            frame(
+                &sim,
+                &v,
+                &mut state,
+                vec![key(egui::Key::Tab, false, false)],
+            );
+            frame(
+                &sim,
+                &v,
+                &mut state,
+                vec![key(egui::Key::Enter, true, false)],
+            );
+            frame(
+                &sim,
+                &v,
+                &mut state,
+                vec![key(egui::Key::Enter, false, false)],
+            );
+            if state.focus.is_some() {
+                break;
+            }
+        }
+        assert_eq!(state.focus.as_ref(), Some(&agent[..2].to_vec()));
+        // Working does not delete the unread result; a live work card can coexist.
+        n.herdr.as_mut().unwrap().agents[0].agent_status = "working".into();
+        v.scene = view(vec![n.clone()], 2).scene;
+        v.revision += 1;
+        sim.update(&v, Stamp::seconds(201), 301.);
+        assert_eq!(sim.activities[&card].stop_episode, Some(10));
+        assert!(sim.activities.contains_key(&agent));
+        assert!(
+            sim.activities[&card]
+                .event
+                .text
+                .contains("Current state: working")
+        );
+        // A later direct Working -> Idle supersedes the previous unread Done.
+        n.herdr.as_mut().unwrap().agents[0].agent_status = "idle".into();
+        v.scene = view(vec![n.clone()], 3).scene;
+        v.revision += 1;
+        notice.episode = 11;
+        notice.kind = "idle".into();
+        v.outcome_notices = Some(std::sync::Arc::new(BTreeMap::from([(
+            card.clone(),
+            notice.clone(),
+        )])));
+        sim.update(&v, Stamp::seconds(201), 302.);
+        sim.update(&v, Stamp::seconds(201), 304.);
+        let texts = frame(&sim, &v, &mut state, vec![]);
+        assert!(
+            texts.iter().any(|t| t == "WORK STOPPED — IDLE"),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t == "AGENT COMPLETED"));
+        assert_eq!(sim.activities[&card].stop_episode, Some(11));
+        assert_eq!(
+            sim.activities
+                .keys()
+                .filter(|k| k.last().unwrap() == "outcome")
+                .count(),
+            1
+        );
+        for _ in 0..20 {
+            frame(&sim, &v, &mut state, vec![key(egui::Key::Tab, true, false)]);
+            frame(
+                &sim,
+                &v,
+                &mut state,
+                vec![key(egui::Key::Tab, false, false)],
+            );
+            frame(
+                &sim,
+                &v,
+                &mut state,
+                vec![key(egui::Key::Enter, true, false)],
+            );
+            frame(
+                &sim,
+                &v,
+                &mut state,
+                vec![key(egui::Key::Enter, false, false)],
+            );
+            if state
+                .dismissed
+                .get(&card)
+                .is_some_and(|d| d.episode == Some(11))
+            {
+                break;
+            }
+        }
+        assert_eq!(state.take_dismissals(), vec![(card.clone(), 11)]);
+        notice.dismissed = true;
+        v.outcome_notices = Some(std::sync::Arc::new(BTreeMap::from([(
+            card.clone(),
+            notice.clone(),
+        )])));
+        v.acknowledgement_revision += 1;
+        sim.update(&v, Stamp::seconds(201), 304.4);
+        assert!(
+            frame(&sim, &v, &mut state, vec![])
+                .iter()
+                .any(|t| t == "WORK STOPPED — IDLE")
+        );
+        sim.update(&v, Stamp::seconds(201), 306.);
+        assert!(
+            !frame(&sim, &v, &mut state, vec![])
+                .iter()
+                .any(|t| t == "WORK STOPPED — IDLE")
+        );
+        // A fresh Done renews the same card slot with a fresh, unacknowledged ID.
+        notice.episode = 12;
+        notice.kind = "done".into();
+        notice.dismissed = false;
+        v.outcome_notices = Some(std::sync::Arc::new(BTreeMap::from([(
+            card.clone(),
+            notice,
+        )])));
+        v.revision += 1;
+        sim.update(&v, Stamp::seconds(201), 307.);
+        sim.update(&v, Stamp::seconds(201), 309.);
+        assert!(
+            frame(&sim, &v, &mut state, vec![])
+                .iter()
+                .any(|t| t == "AGENT COMPLETED")
+        );
+        assert!(!state.dismissed.contains_key(&card));
+        // Disappearance retains the result with truthful missing-agent context.
+        v.scene = view(vec![], 5).scene;
+        v.revision += 1;
+        sim.update(&v, Stamp::seconds(201), 310.);
+        assert!(
+            sim.activities[&card]
+                .event
+                .text
+                .contains("no longer observed")
+        );
+        assert!(sim.anchor(&card).is_none());
+        assert!(
+            frame(&sim, &v, &mut state, vec![])
+                .iter()
+                .any(|t| t.contains("AGENT COMPLETED"))
+        );
+        assert_eq!(sim.summary().agents, 0);
     }
     #[test]
     fn idle_work_stop_is_persistent_visible_and_independently_dismissible_on_a_crowded_first_frame()
