@@ -176,9 +176,10 @@ func nodeHello(instanceID string) *agentflowv1.NodeEnvelope {
 	return &agentflowv1.NodeEnvelope{
 		Body: &agentflowv1.NodeEnvelope_Hello{
 			Hello: &agentflowv1.Hello{
-				Protocol:   protocol.SupportedRange(),
-				InstanceId: instanceID,
-				Role:       agentflowv1.Role_ROLE_NODE,
+				Protocol:              protocol.SupportedRange(),
+				ImplementationVersion: "test-version",
+				InstanceId:            instanceID,
+				Role:                  agentflowv1.Role_ROLE_NODE,
 			},
 		},
 	}

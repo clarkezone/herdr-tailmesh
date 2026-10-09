@@ -273,6 +273,9 @@ func (service *service) Connect(stream grpc.BidiStreamingServer[agentflowv1.Node
 	if err := service.fleet.setLogicalName(entry, hello.Hostname); err != nil {
 		return err
 	}
+	if err := service.fleet.setImplementationVersion(entry, hello.ImplementationVersion); err != nil {
+		return err
+	}
 	service.fleet.mu.Lock()
 	entry.probes = service.commands != nil && slices.Contains(hello.Capabilities, protocol.ProbeCapability)
 	entry.projects = service.commands != nil && slices.Contains(hello.Capabilities, protocol.ProjectConfigCapability)
