@@ -10,13 +10,16 @@ adversarial review are maintained in ai-core under Object Class Callouts.
 - Click an object to open its typed card; click again, blank space, or its
   bracketed × to close it. Bulk and clicked cards deduplicate by full projected
   identity. A closed bulk item stays hidden until its class is toggled off/on
-  or the item is explicitly selected again.
+  or the item is explicitly selected again. Sampling and readmission do not
+  clear a close; actual removal/incarnation replacement clears obsolete state.
 - Selected cards show their own name, an **↑ parent** row and **→ direct child**
   rows with matching role glyphs. Clicking a row replaces the selection, without
   changing explicit Focus, class toggles or outcome acknowledgements. Coordinator
   is the logical parent of all nodes; the coordinator has no parent and agent
   leaves omit children. Relationships use the actual observed tree and complete
   keys, including session incarnations and agent tab scope.
+  New selections return to the first callout page even if bulk order is
+  unchanged; later deliberate paging with that selection remains available.
 - Child inventories are complete, bounded to the scrolling card and virtualized.
   Long row labels truncate with full-name hover help. Explicit navigation reaches
   sampled inventory too: those cards disclose the missing marker and have no

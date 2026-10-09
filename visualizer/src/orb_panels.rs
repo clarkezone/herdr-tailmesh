@@ -1215,6 +1215,9 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
     let painter = ui.painter().with_clip_rect(rect);
     let docks = dock_layout(context, state);
     let mut response = Response::default();
+    // A clicked object may already be first in bulk order. Bring its card into
+    // view even when no membership entry moves, without overriding later paging.
+    let selection_changed = state.objects.selection() != context.selected;
     state
         .objects
         .update(context.sim, context.view, context.selected);
@@ -1286,7 +1289,8 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             ),
         )
     });
-    if state.membership.len() != candidates.len()
+    if selection_changed
+        || state.membership.len() != candidates.len()
         || !state
             .membership
             .iter()
@@ -1912,6 +1916,110 @@ mod tests {
         let stale = vec!["coordinator".into(), "another-instance".into()];
         card.key = Some(&stale);
         assert!(card_anchor(&card, &sim, rect).is_none());
+    }
+    #[test]
+    fn selecting_first_bulk_object_returns_to_page_one_without_a_membership_change() {
+        let ctx = egui::Context::default();
+        let v = view(
+            (0..12)
+                .map(|i| node(&format!("node-{i:02}"), "idle", 1))
+                .collect(),
+            1,
+        );
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        let selected = v.scene.as_ref().unwrap().nodes[0].key.clone();
+        let mut state = Panels::default();
+        state.objects.toggle(crate::orb_objects::Class::Node);
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100., 800.));
+        let frame = |state: &mut Panels, sim: &Simulation, selection: Option<&Key>, events| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    draw(
+                        ui,
+                        &Context {
+                            sim,
+                            view: &v,
+                            rect,
+                            selected: selection,
+                            passive: false,
+                        },
+                        state,
+                    );
+                },
+            );
+            let labels = out
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(t) = &shape.shape {
+                        let point = t.pos + t.galley.size() * 0.5;
+                        shape
+                            .clip_rect
+                            .contains(point)
+                            .then(|| (t.galley.text().to_owned(), point))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            out.textures_delta.clear();
+            labels
+        };
+        let click = |point, pressed| {
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        frame(&mut state, &sim, None, vec![]);
+        sim.update(&v, Stamp::seconds(201), 3.);
+        let labels = frame(&mut state, &sim, None, vec![]);
+        let membership = state.membership.clone();
+        assert_eq!(membership[0], CardId::Object(selected.clone()));
+        let next = labels.iter().find(|(s, _)| s == "›").unwrap().1;
+        frame(&mut state, &sim, None, click(next, true));
+        frame(&mut state, &sim, None, click(next, false));
+        assert!(
+            state.page_start > 0,
+            "real pager input moves to a later page"
+        );
+        frame(&mut state, &sim, Some(&selected), vec![]);
+        assert_eq!(
+            state.membership, membership,
+            "selection does not reorder an already-first bulk card"
+        );
+        assert_eq!(
+            state.page_start, 0,
+            "a newly selected object must be brought into view"
+        );
+        assert_eq!(state.page, 0);
+        sim.update(&v, Stamp::seconds(201), 6.);
+        let labels = frame(&mut state, &sim, Some(&selected), vec![]);
+        assert!(labels.iter().any(|(s, _)| s == "PARENT"));
+        assert!(labels.iter().any(|(s, _)| s == "CHILDREN (2)"));
+        let next = labels.iter().find(|(s, _)| s == "›").unwrap().1;
+        frame(&mut state, &sim, Some(&selected), click(next, true));
+        frame(&mut state, &sim, Some(&selected), click(next, false));
+        let page = state.page_start;
+        assert!(page > 0);
+        frame(&mut state, &sim, Some(&selected), vec![]);
+        assert_eq!(
+            state.page_start, page,
+            "unchanged selection must not override later deliberate paging"
+        );
+        assert!(state.take_dismissals().is_empty());
+        assert_eq!(sim.summary().agents, 24);
     }
     #[test]
     fn actual_keyboard_events_ignore_repeat_release_passive_and_preserve_source_preferences() {

@@ -9,6 +9,7 @@ use herdr_mesh_visualizer::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::Bound,
     sync::Arc,
 };
 
@@ -111,6 +112,9 @@ pub struct Objects {
     pub cards: BTreeMap<Key, Arc<Object>>,
 }
 impl Objects {
+    pub fn selection(&self) -> Option<&Key> {
+        self.selected.as_ref()
+    }
     pub fn toggle(&mut self, class: Class) {
         self.enabled[class.index()] = !self.enabled[class.index()];
         self.suppressed.retain(|key| {
@@ -209,6 +213,7 @@ impl Objects {
             present.insert(branch.key.clone());
         }
         if !represented {
+            self.retain_suppressed(branch, present);
             return;
         }
         let bulk = match branch.kind {
@@ -228,6 +233,25 @@ impl Objects {
             self.scan(child, path, sim, view, cards, present);
         }
         path.pop();
+    }
+    fn retain_suppressed(&self, branch: &Branch, present: &mut BTreeSet<Key>) {
+        // Sampling is not removal. Follow only prefixes with an explicitly
+        // closed key; don't clone or scan the full omitted inventory.
+        if self.suppressed.is_empty()
+            || !self
+                .suppressed
+                .range::<[String], _>((Bound::Included(branch.key.as_slice()), Bound::Unbounded))
+                .next()
+                .is_some_and(|key| key.starts_with(&branch.key))
+        {
+            return;
+        }
+        if self.suppressed.contains(&branch.key) {
+            present.insert(branch.key.clone());
+        }
+        for child in &branch.children {
+            self.retain_suppressed(child, present);
+        }
     }
     fn object(
         &self,
@@ -366,6 +390,53 @@ mod tests {
                 .parent
                 .is_none()
         );
+    }
+    #[test]
+    fn closed_workspace_stays_closed_through_geometry_sampling_and_readmission() {
+        let first = view(vec![node("a", "idle", 1), node("z", "idle", 1)], 1);
+        let selected = first.scene.as_ref().unwrap().nodes[1].children[1].children[0]
+            .key
+            .clone();
+        let mut sim = Simulation::default();
+        sim.update(&first, Stamp::seconds(201), 0.);
+        let mut objects = Objects::default();
+        objects.toggle(Class::Workspace);
+        objects.update(&sim, &first, None);
+        assert!(objects.cards.contains_key(&selected));
+        objects.close(&selected);
+        objects.update(&sim, &first, None);
+        assert!(!objects.cards.contains_key(&selected));
+        let mut crowded = node("a", "idle", 1);
+        let expand = |h: &mut herdr_mesh_visualizer::pb::HerdrState| {
+            let workspace = h.workspaces[0].clone();
+            h.workspaces
+                .extend((1..2000).map(|i| herdr_mesh_visualizer::pb::HerdrEntity {
+                    id: format!("workspace-{i:04}"),
+                    ..workspace.clone()
+                }));
+        };
+        expand(crowded.herdr.as_mut().unwrap());
+        expand(crowded.sessions[0].herdr.as_mut().unwrap());
+        let sampled = view(vec![crowded, node("z", "idle", 1)], 2);
+        sim.update(&sampled, Stamp::seconds(201), 1.);
+        assert!(
+            sim.id(&selected).is_none(),
+            "the reported workspace genuinely loses geometry admission"
+        );
+        objects.update(&sim, &sampled, None);
+        assert!(
+            objects.suppressed.contains(&selected),
+            "sampling must not reopen a closed card"
+        );
+        let restored = view(vec![node("a", "idle", 1), node("z", "idle", 1)], 3);
+        sim.update(&restored, Stamp::seconds(201), 3.);
+        assert!(sim.id(&selected).is_some());
+        objects.update(&sim, &restored, None);
+        assert!(!objects.cards.contains_key(&selected));
+        objects.toggle(Class::Workspace);
+        objects.toggle(Class::Workspace);
+        objects.update(&sim, &restored, None);
+        assert!(objects.cards.contains_key(&selected));
     }
 
     #[test]
