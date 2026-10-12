@@ -19,6 +19,11 @@ backgrounds cover only their own bounds; they gently drift and connect to the
 coordinator. The key appears once for the first minute after launch, then stays
 hidden. **L** toggles the legend manually, overriding the startup timer indefinitely.
 **K** toggles a scrollable keyboard-shortcut panel in normal and compact Orb mode.
+**Esc** closes keyboard help without clearing Focus; otherwise Esc clears Focus.
+**B** toggles all projected object names. **N/S/W/A** show names for their enabled
+node/session/workspace/agent overlay subsets, independently of Focus and B.
+Labels retain their logical size and avoid callouts; crowded or offscreen labels
+are omitted rather than overlapped.
 The separate counts panel starts visible and stays on until **F** toggles it.
 When both are visible they stack without overlap. When either is alone it hugs
 the bottom-left margin; showing the other smoothly moves it up before the new
@@ -55,8 +60,10 @@ independently of whether the key is showing.
 
 Each observed working, blocked or completed agent has an independent persistent callout with
 its real node/session/workspace/agent names, including initial/reconnect snapshots.
-**A** toggles working callouts only; blocked and completed cards remain visible. State and
-counts, selection and timed notices remain independent of A. Working → blocked
+**A** toggles all-agent observation callouts and projected agent names, including
+idle and unknown agents. Existing activity, blocked-attention and completion cards
+remain independent of A; bulk cards never replace actionable outcome cards. State,
+counts and selection remain independent of A. Working → blocked
 replaces the work card with persistent ATTENTION REQUIRED, and blocked → working
 replaces attention with work. Each agent has one latest outcome card, independent of its current state:
 

@@ -18,6 +18,7 @@ pub enum Class {
     Node,
     Session,
     Workspace,
+    Agent,
 }
 impl Class {
     fn index(self) -> usize {
@@ -25,6 +26,7 @@ impl Class {
             Self::Node => 0,
             Self::Session => 1,
             Self::Workspace => 2,
+            Self::Agent => 3,
         }
     }
 }
@@ -104,7 +106,7 @@ pub struct Object {
 }
 #[derive(Default)]
 pub struct Objects {
-    enabled: [bool; 3],
+    enabled: [bool; 4],
     suppressed: BTreeSet<Key>,
     selected: Option<Key>,
     revision: Option<(u64, u64, bool, u64, i64)>,
@@ -112,6 +114,15 @@ pub struct Objects {
     pub cards: BTreeMap<Key, Arc<Object>>,
 }
 impl Objects {
+    pub fn reset_source(&mut self) {
+        *self = Self {
+            enabled: self.enabled,
+            ..Default::default()
+        };
+    }
+    pub fn enabled(&self, class: Class) -> bool {
+        self.enabled[class.index()]
+    }
     pub fn selection(&self) -> Option<&Key> {
         self.selected.as_ref()
     }
@@ -123,6 +134,7 @@ impl Objects {
                     Class::Node => 2,
                     Class::Session => 5,
                     Class::Workspace => 7,
+                    Class::Agent => 10,
                 }
         });
         self.dirty = true;
@@ -220,6 +232,7 @@ impl Objects {
             "node" => self.enabled[0],
             "session" => self.enabled[1],
             "workspace" => self.enabled[2],
+            "agent" => self.enabled[3],
             _ => false,
         };
         if bulk && !self.suppressed.contains(&branch.key) {
@@ -344,6 +357,41 @@ mod tests {
     use super::*;
     use crate::mesh_model::tests::{node, view};
     use herdr_mesh_visualizer::heartbeat::Stamp;
+    #[test]
+    fn agent_bulk_toggle_includes_every_state_and_reopens_closed_cards() {
+        let v = view(
+            ["working", "blocked", "done", "idle", "unknown"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, state)| node(&i.to_string(), state, 1))
+                .collect(),
+            1,
+        );
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 2.);
+        let mut objects = Objects::default();
+        objects.toggle(Class::Agent);
+        objects.update(&sim, &v, None);
+        assert_eq!(objects.cards.len(), 10);
+        assert!(
+            objects
+                .cards
+                .values()
+                .all(|o| matches!(o.glyph, Glyph::Agent(_)))
+        );
+        let key = objects.cards.keys().next().unwrap().clone();
+        objects.close(&key);
+        objects.update(&sim, &v, None);
+        assert!(!objects.cards.contains_key(&key));
+        objects.toggle(Class::Agent);
+        objects.update(&sim, &v, None);
+        assert!(objects.cards.is_empty());
+        objects.toggle(Class::Agent);
+        objects.reset_source();
+        objects.update(&sim, &v, None);
+        assert_eq!(objects.cards.len(), 10);
+        assert!(objects.cards.contains_key(&key));
+    }
     #[test]
     fn relationships_walk_actual_root_to_leaf_and_keep_same_names_in_distinct_scopes() {
         let v = view(vec![node("one", "idle", 1), node("two", "done", 1)], 1);

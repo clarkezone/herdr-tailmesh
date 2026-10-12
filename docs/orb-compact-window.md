@@ -13,9 +13,17 @@ scale. These shortcuts do nothing in normal Orb mode. The legacy tree retains
 its existing keyboard zoom behavior.
 
 **L** toggles the legend. **K** toggles a scrollable keyboard-shortcut overlay
-in either normal or compact mode; K or its Close button dismisses it. The overlay
+in either normal or compact mode; K, Esc or its Close button dismisses it. Esc
+preserves Focus when closing help and clears Focus only when help is closed. The overlay
 blocks underlying scene selection while open. It does not appear in
 screensaver/preview mode or change callout/outcome state.
+
+**B** toggles all projected object names. Enabled **N/S/W/A** overlays also show
+names for their node/session/workspace/all-agent subsets. Focus names remain
+visible independently. The same projection and collision bounds apply in normal
+and compact mode; offscreen/crowded names are omitted without shrinking text.
+**A** includes idle and unknown agents and does not hide or acknowledge existing
+activity, blocked-attention or completion cards.
 
 The compact view presents activity and selected-object cards as short rows on
 the right, with the same animated reveal, focus checkbox and per-instance

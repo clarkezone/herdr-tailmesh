@@ -8,6 +8,22 @@ or a green unit-test job does not establish provider compatibility on that OS.
 
 ## Build artifacts
 
+Every push to `main`, including a merged PR, runs **Mesh CI** and publishes
+downloadable workflow artifacts for Windows amd64, Windows arm64, and Linux
+amd64. The native Windows arm64 build uses `windows-11-arm`; existing macOS
+validation remains enabled. PR runs build the same artifacts before merge.
+
+In the successful workflow run's **Artifacts** section, download
+`herdr-mesh-windows-amd64`, `herdr-mesh-windows-arm64`, or
+`herdr-mesh-linux-amd64` for the Go engine ZIP and `SHA256SUMS`.
+The separate `herdr-mesh-visualizer-Windows-X64`,
+`herdr-mesh-visualizer-Windows-ARM64`, and `herdr-mesh-visualizer-Linux-X64`
+artifacts contain viewer ZIPs and checksums; Windows artifacts also contain
+the separately packaged `.scr` screensaver. Archive versions use
+`ci-<full-commit-sha>` so engine and viewer downloads can be matched to the
+exact same source revision. Engine packaging uses the FIPS-pinned release
+script below. These are unsigned CI downloads, not GitHub releases.
+
 On Windows with the repository's Go toolchain and PowerShell:
 
 ```powershell
@@ -34,7 +50,8 @@ transport experiments remain outside the production source entrypoints.
 
 These are unsigned artifacts, not an installer or self-update mechanism.
 Checksums detect corruption only when obtained through a trusted channel; they
-do not authenticate the publisher. Nothing uploads or publishes a release.
+do not authenticate the publisher. The script does not upload anything; CI
+uploads workflow artifacts but does not publish GitHub releases.
 Code signing and platform notarization require separately managed credentials.
 
 An optional coordinator-hosted dashboard port requires its own all-sources-to-server
