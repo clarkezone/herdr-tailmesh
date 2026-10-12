@@ -1,5 +1,11 @@
 # Herdr mesh visualizer
 
+Interactive Orb supports **T** for the compact companion window, **Ctrl + / −**
+for compact sizing, and dragging its title rail. It launches at the remembered
+larger size. Omarchy uses scoped Hyprland IPC; Windows uses a DPI-aware,
+taskbar-aware native placement backend with non-activating topmost transitions.
+See [compact mode](../docs/orb-compact-window.md).
+
 A standalone Rust viewer for the managed Herdr mesh daemon. **Orb is the default**
 for both the interactive executable and Windows screensaver/preview. It presents
 real coordinator → node → session → workspace → agent observations using the
@@ -11,7 +17,8 @@ Orb uses the full, centered viewport with a blank border. Two narrow floating
 panels hold the visual key and the seven fleet totals in vertical lists. Their
 backgrounds cover only their own bounds; they gently drift and connect to the
 coordinator. The key appears once for the first minute after launch, then stays
-hidden. **K** toggles it manually, overriding the startup timer indefinitely.
+hidden. **L** toggles the legend manually, overriding the startup timer indefinitely.
+**K** toggles a scrollable keyboard-shortcut panel in normal and compact Orb mode.
 The separate counts panel starts visible and stays on until **F** toggles it.
 When both are visible they stack without overlap. When either is alone it hugs
 the bottom-left margin; showing the other smoothly moves it up before the new
@@ -172,7 +179,7 @@ inside their surface cluster. This uses full observations even when geometry is
 sampled, ages with inventory freshness, and remains separate from receipt heartbeat
 pulses. Sampled agent callouts anchor to their owning node. Callout history is capped
 at 8,000, with blocked attention ahead of working, then completed cards and old timed history; capacity
-omissions are disclosed independently of K/F/A, while totals remain complete.
+omissions are disclosed independently of L/F/A, while totals remain complete.
 
 Every activity callout and typed object card offers a compact
 illuminated reticle **Focus** toggle.

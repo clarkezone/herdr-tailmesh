@@ -5,6 +5,7 @@ pub mod heartbeat;
 pub mod outcomes;
 pub mod projection;
 pub mod summary;
+pub mod window_preferences;
 // Canonical control messages include large oneofs; the viewer never constructs
 // those envelopes. Keep generated types faithful to the shared schema.
 #[allow(clippy::large_enum_variant)]

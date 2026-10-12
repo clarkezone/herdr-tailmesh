@@ -1,4 +1,5 @@
 mod animation;
+mod compact_window;
 mod fleet_panel;
 mod launch;
 mod mesh_legend;

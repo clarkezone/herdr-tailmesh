@@ -43,6 +43,8 @@ struct LayoutTrace {
 }
 #[derive(Default)]
 pub struct Panels {
+    pub compact: bool,
+    keys: bool,
     pub page: usize,
     pub projects: bool,
     pub focus: Option<Key>,
@@ -68,6 +70,16 @@ pub struct Panels {
     diagnostic_layout: Option<LayoutTrace>,
 }
 impl Panels {
+    pub fn set_compact(&mut self, compact: bool) {
+        if self.compact == compact {
+            return;
+        }
+        self.compact = compact;
+        self.presentations.clear();
+        self.page_start = 0;
+        self.previous.clear();
+        self.page = 0;
+    }
     pub fn reset_source(&mut self) {
         self.page = 0;
         self.page_start = 0;
@@ -212,7 +224,8 @@ impl Panels {
                         continue;
                     }
                     match key {
-                        egui::Key::K => self.controls.toggle(Panel::Key, clock),
+                        egui::Key::L => self.controls.toggle(Panel::Key, clock),
+                        egui::Key::K => self.keys = !self.keys,
                         egui::Key::F => self.controls.toggle(Panel::Counts, clock),
                         egui::Key::N => self.objects.toggle(crate::orb_objects::Class::Node),
                         egui::Key::S => self.objects.toggle(crate::orb_objects::Class::Session),
@@ -672,7 +685,11 @@ fn present_cards(
             }
             let drifted = p.motion.sample(clock).0.translate(vec2(
                 0.,
-                drift(clock, (p.snapshot.event.serial % 3) as f64, 8.),
+                if state.compact {
+                    0.
+                } else {
+                    drift(clock, (p.snapshot.event.serial % 3) as f64, 8.)
+                },
             ));
             Some((
                 p.snapshot.clone(),
@@ -983,7 +1000,14 @@ fn page_controls(
             state.page = state.previous.len();
             state.page_since = clock;
         }
-        if width >= 180. {
+        if state.compact {
+            ui.small(format!(
+                "{}–{} / {}",
+                state.page_start + 1,
+                (state.page_start + capacity).min(count),
+                count
+            ));
+        } else if width >= 180. {
             ui.small(&caption);
         } else if width >= 80. {
             ui.small(format!("{}", state.page + 1))
@@ -1209,11 +1233,262 @@ fn hierarchy_links(
     ui.separator();
 }
 
+// Dense presentation reads the normal candidate list and acknowledgement state.
+fn compact_slots(rect: Rect, remaining: usize) -> Vec<Rect> {
+    let width = (rect.width() * 0.56).clamp(174., 240.).min(rect.width());
+    let capacity = ((rect.height() - 30.).max(0.) / 52.).floor() as usize;
+    (0..capacity.min(remaining).min(64))
+        .map(|i| {
+            Rect::from_min_size(
+                pos2(rect.right() - width, rect.top() + i as f32 * 52.),
+                vec2(width, 48.),
+            )
+        })
+        .collect()
+}
+fn compact_caption<'a>(card: &Card<'a>) -> (&'a str, &'a str) {
+    let agent = card
+        .event
+        .text
+        .lines()
+        .find_map(|l| l.strip_prefix("Agent: "));
+    let label = agent.unwrap_or_else(|| card.event.text.lines().next().unwrap_or(""));
+    let scope = card
+        .event
+        .text
+        .lines()
+        .find_map(|l| l.strip_prefix("Node: "))
+        .unwrap_or("");
+    (label, scope)
+}
+fn draw_compact(
+    ui: &mut Ui,
+    context: &Context<'_>,
+    state: &mut Panels,
+    candidates: &[Card<'_>],
+) -> Response {
+    let rect = context.rect;
+    let painter = ui.painter().with_clip_rect(rect);
+    let slots = compact_slots(rect, candidates.len().saturating_sub(state.page_start));
+    let start = state.page_start;
+    let capacity = slots.len();
+    let displayed = present_cards(candidates, &slots, start, state, context);
+    let mut response = Response::default();
+    for (snapshot, bounds, reveal, index) in &displayed {
+        if !reveal.active() {
+            continue;
+        }
+        let card = snapshot.card();
+        let aperture = reveal.aperture(*bounds).intersect(rect);
+        response.blocked.push(aperture);
+        let [r, g, b] = card.event.color;
+        let color: Color32 = egui::Rgba::from_rgb(r, g, b).into();
+        if let Some(anchor) = card_anchor(&card, context.sim, rect) {
+            reveal.leader(&painter, anchor, *bounds, color);
+        }
+        let mut ink = painter.with_clip_rect(aperture);
+        frame(&ink, aperture, color, reveal.opacity());
+        ink.multiply_opacity(reveal.opacity());
+        let (label, scope) = compact_caption(&card);
+        let state_title = title(&card, context.sim);
+        let text_bounds = Rect::from_min_max(
+            bounds.min + vec2(7., 4.),
+            pos2(bounds.right() - 72., bounds.bottom() - 4.),
+        );
+        // No font shrinking: truncate each bounded line and expose full context on hover.
+        let mut style = egui::text::TextFormat {
+            font_id: FontId::monospace(10.),
+            color,
+            ..Default::default()
+        };
+        for (text, offset) in [
+            (state_title.replace("AGENT ", ""), 0.),
+            (label.to_owned(), 13.),
+            (scope.to_owned(), 26.),
+        ] {
+            let job = egui::text::LayoutJob {
+                text: text.clone(),
+                sections: vec![egui::text::LayoutSection {
+                    leading_space: 0.,
+                    byte_range: egui::text::ByteIndex(0)..egui::text::ByteIndex(text.len()),
+                    format: style.clone(),
+                }],
+                wrap: egui::text::TextWrapping {
+                    max_width: text_bounds.width().max(1.),
+                    max_rows: 1,
+                    break_anywhere: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let galley = ink.layout_job(job);
+            ink.galley(text_bounds.min + vec2(0., offset), galley, color);
+            style.font_id = FontId::monospace(11.);
+        }
+        let enabled = !context.passive && reveal.interactive() && index.is_some();
+        if enabled {
+            let hit = ui.interact(
+                text_bounds.intersect(aperture),
+                ui.id().with(("compact-select", card.id())),
+                egui::Sense::click(),
+            );
+            if hit.clicked()
+                && let Some(key) = card.key
+            {
+                response.navigate_to = Some(context.view.agent_key(key).clone());
+            }
+            hit.on_hover_text(format!(
+                "{}\n{}\nRestore (T) for full details",
+                state_title, card.event.text
+            ));
+        }
+        let control = Rect::from_min_max(
+            pos2(bounds.right() - 70., bounds.top() + 12.),
+            bounds.max - vec2(3., 8.),
+        );
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .id(ui.id().with(("compact-controls", card.id())))
+                .max_rect(control),
+        );
+        child.set_clip_rect(control.intersect(aperture));
+        child.set_opacity(reveal.opacity());
+        if !enabled {
+            child.disable();
+        }
+        child.spacing_mut().item_spacing.x = 0.;
+        child.horizontal(|ui| {
+            if let Some(key) = card.key {
+                if card_anchor(&card, context.sim, rect).is_some() {
+                    crate::orb_focus::checkbox(
+                        ui,
+                        context.view,
+                        context.view.agent_key(key),
+                        &mut state.focus,
+                    );
+                }
+                if card.acknowledgeable {
+                    dismiss_stop(
+                        ui,
+                        key,
+                        state,
+                        context.sim.clock,
+                        context.view.stop_episode(key),
+                        context.view,
+                    );
+                }
+                if card.typed.is_some() && close_object(ui) {
+                    state.objects.close(key);
+                    if context.selected == Some(key) {
+                        response.clear_selection = true;
+                    }
+                }
+            }
+        });
+        reveal.scan(&painter, *bounds);
+    }
+    if !candidates.is_empty() {
+        let width = (rect.width() * 0.56).clamp(174., 240.).min(rect.width());
+        let footer = Rect::from_min_size(
+            pos2(rect.right() - width, rect.bottom() - 26.),
+            vec2(width, 26.),
+        );
+        response.blocked.push(footer);
+        frame(&painter, footer, CYAN, 1.);
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .id(ui.id().with("compact-pager"))
+                .max_rect(footer.shrink2(vec2(4., 2.))),
+        );
+        child.set_clip_rect(footer);
+        child.horizontal(|ui| {
+            page_controls(
+                ui,
+                state,
+                candidates.len(),
+                capacity,
+                !context.passive,
+                context.sim.clock,
+            );
+        });
+    }
+    state.trace_flyouts(context, candidates, start, capacity, None);
+    response
+}
+
 pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response {
+    let show_keys = state.keys && !context.passive;
+    let mut response = ui
+        .scope(|ui| {
+            if show_keys {
+                ui.disable();
+            }
+            draw_content(ui, context, state)
+        })
+        .inner;
+    if show_keys {
+        let rect = context.rect.shrink(8.);
+        let bounds = Rect::from_center_size(
+            rect.center(),
+            vec2(rect.width().min(460.), rect.height().min(410.)),
+        );
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .id(ui.id().with("orb-shortcuts"))
+                .layer_id(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    ui.id().with("orb-shortcuts-layer"),
+                ))
+                .max_rect(bounds.shrink(12.)),
+        );
+        frame(child.painter(), bounds, CYAN, 1.);
+        child.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        child.horizontal(|ui| {
+            ui.label(egui::RichText::new("KEYBOARD · K").monospace().color(CYAN));
+            if ui.button("Close").clicked() {
+                state.keys = false;
+            }
+        });
+        child.separator();
+        egui::ScrollArea::vertical()
+            .max_height(child.available_height())
+            .auto_shrink([false, false])
+            .show(&mut child, |ui| {
+                for (key, action) in [
+                    ("T", "Toggle normal / compact window"),
+                    ("Ctrl + / Ctrl =", "Enlarge compact window by 10%"),
+                    ("Ctrl -", "Shrink compact window by 10% (minimum 360 × 240)"),
+                    ("L", "Toggle legend"),
+                    ("K", "Toggle this keyboard list"),
+                    ("F", "Toggle fleet counts"),
+                    ("N", "Toggle node callouts"),
+                    ("S", "Toggle session callouts"),
+                    ("W", "Toggle workspace callouts"),
+                    ("A", "Toggle working-agent callouts"),
+                    ("Esc", "Clear explicit Focus"),
+                    ("Tab / Shift + Tab", "Navigate controls"),
+                    ("Space / Enter", "Activate a focused control"),
+                ] {
+                    ui.label(egui::RichText::new(key).monospace().color(CYAN));
+                    ui.label(action);
+                }
+                ui.separator();
+                ui.small("Ctrl +/- only sizes the compact window. Drag its title rail to move; T or Restore returns to normal.");
+            });
+        response.blocked.push(context.rect);
+    }
+    response
+}
+
+fn draw_content(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response {
     state.refresh_dismissals(context.view);
     let rect = context.rect;
     let painter = ui.painter().with_clip_rect(rect);
-    let docks = dock_layout(context, state);
+    let docks = if state.compact {
+        Vec::new()
+    } else {
+        dock_layout(context, state)
+    };
     let mut response = Response::default();
     // A clicked object may already be first in bulk order. Bring its card into
     // view even when no membership entry moves, without overriding later paging.
@@ -1224,6 +1499,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
     let objects: Vec<_> = state.objects.cards.values().cloned().collect();
     let mut reserved: Vec<_> = docks.iter().map(|d| d.bounds).collect();
     if !context.passive
+        && !state.compact
         && let Some(bounds) = crate::orb_focus::panel(
             ui,
             context.view,
@@ -1237,8 +1513,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         reserved.push(bounds);
         response.blocked.push(bounds);
     }
-    let detail = state
-        .projects
+    let detail = (state.projects && !state.compact)
         .then(|| {
             let target = detail_rect(context, &reserved);
             let motion = state
@@ -1305,6 +1580,9 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         state.previous.clear();
         state.page = 0;
         state.page_since = context.sim.clock;
+    }
+    if state.compact {
+        return draw_compact(ui, context, state, &candidates);
     }
     let mut slots = places(
         &painter,
@@ -1700,7 +1978,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             );
             if dock.panel == Panel::Key {
                 child.horizontal(|ui| {
-                    ui.small("KEY · K").on_hover_text(
+                    ui.small("LEGEND · L").on_hover_text(
                         "N nodes · S sessions · W workspaces · F fleet · A working agents",
                     );
                     if !context.passive && ui.selectable_label(state.projects, "Projects").clicked()
@@ -1731,7 +2009,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         }
         reveal.scan(&painter, dock.bounds);
     }
-    // Sampling is relevant even when K/F are hidden; never disguise partial detail.
+    // Sampling is relevant even when L/F are hidden; never disguise partial detail.
     if context.sim.omitted > 0 {
         painter.text(
             rect.left_top(),
@@ -1773,6 +2051,184 @@ mod tests {
             modifiers: Default::default(),
         }
     }
+    #[test]
+    fn legend_and_keyboard_help_toggle_independently_and_help_fits_compact_mode() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "working", 1)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 2.);
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(328., 182.));
+        let mut state = Panels::default();
+        let run = |state: &mut Panels, events, passive| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    state.handle_input(ui, 2., passive);
+                    let response = draw(
+                        ui,
+                        &Context {
+                            sim: &sim,
+                            view: &v,
+                            rect,
+                            selected: None,
+                            passive,
+                        },
+                        state,
+                    );
+                    assert_eq!(response.blocked.contains(&rect), state.keys && !passive);
+                },
+            );
+            let labels = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            output.textures_delta.clear();
+            labels
+        };
+        run(&mut state, vec![key(egui::Key::L, true, false)], false);
+        assert!(!state.controls.key.shown);
+        let labels = run(&mut state, vec![key(egui::Key::K, true, false)], false);
+        assert!(state.keys);
+        assert!(!state.controls.key.shown);
+        assert!(labels.iter().any(|s| s == "KEYBOARD · K"));
+        state.set_compact(true);
+        let labels = run(&mut state, vec![key(egui::Key::K, true, true)], false);
+        assert!(state.keys);
+        assert!(labels.iter().any(|s| s == "KEYBOARD · K"));
+        let labels = run(&mut state, vec![key(egui::Key::K, true, false)], true);
+        assert!(state.keys);
+        assert!(!labels.iter().any(|s| s == "KEYBOARD · K"));
+        run(
+            &mut state,
+            vec![
+                key(egui::Key::K, false, false),
+                key(egui::Key::L, false, false),
+            ],
+            false,
+        );
+        run(&mut state, vec![key(egui::Key::K, true, false)], false);
+        assert!(!state.keys);
+        run(&mut state, vec![key(egui::Key::L, true, false)], false);
+        assert!(state.controls.key.shown);
+    }
+
+    #[test]
+    fn compact_rows_fit_minimum_and_keep_each_stop_dismissal_scoped() {
+        for size in [vec2(328., 182.), vec2(488., 302.), vec2(928., 662.)] {
+            let rect = Rect::from_min_size(pos2(16., 42.), size);
+            let slots = compact_slots(rect, 100);
+            assert!(slots.len() >= 2);
+            for (i, slot) in slots.iter().enumerate() {
+                assert!(rect.contains_rect(*slot));
+                assert!(slot.bottom() <= rect.bottom() - 26.);
+                assert!(slots[..i].iter().all(|r| !r.intersects(*slot)));
+            }
+        }
+        let mut v = view(vec![node("one", "done", 8)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        v.completion_episodes = std::sync::Arc::new(
+            sim.activities
+                .keys()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), i as u64 + 1))
+                .collect(),
+        );
+        sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        sim.update(&v, Stamp::seconds(201), 2.);
+        sim.events.clear();
+        let mut state = Panels::default();
+        state.set_compact(true);
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(328., 182.));
+        let run = |state: &mut Panels, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    draw(
+                        ui,
+                        &Context {
+                            sim: &sim,
+                            view: &v,
+                            rect,
+                            selected: None,
+                            passive: false,
+                        },
+                        state,
+                    );
+                },
+            );
+            let dismiss = output.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::LineSegment { points, .. }
+                    if points[1] - points[0] == vec2(7., 7.) =>
+                {
+                    Some(points[0] + vec2(3.5, 3.5))
+                }
+                _ => None,
+            });
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            output.textures_delta.clear();
+            (dismiss, text)
+        };
+        let (button, text) = run(&mut state, vec![]);
+        assert_eq!(text.iter().filter(|t| t.as_str() == "COMPLETED").count(), 2);
+        assert!(
+            text.iter().any(|t| t.contains(" / ")),
+            "visible pager includes total"
+        );
+        assert!(state.take_dismissals().is_empty());
+        let p = button.expect("compact completion has a visible close control");
+        for pressed in [true, false] {
+            run(
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(p),
+                    egui::Event::PointerButton {
+                        pos: p,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        let dismissed = state.take_dismissals();
+        assert_eq!(dismissed.len(), 1);
+        assert_eq!(v.completion_episodes[&dismissed[0].0], dismissed[0].1);
+        assert_eq!(
+            sim.summary().agents,
+            16,
+            "presentation close never changes observed counts"
+        );
+        state.set_compact(false);
+        state.set_compact(true);
+        assert_eq!(
+            state.dismissed.len(),
+            1,
+            "mode toggles preserve acknowledgement state"
+        );
+    }
+
     #[test]
     fn hierarchy_virtualizes_children_and_scrolling_reaches_the_exact_last_child() {
         use crate::orb_objects::{Related, Relations};
@@ -2051,7 +2507,7 @@ mod tests {
         assert!(!state.controls.workers.shown);
         run(
             vec![
-                key(egui::Key::K, true, false),
+                key(egui::Key::L, true, false),
                 key(egui::Key::F, true, false),
             ],
             false,

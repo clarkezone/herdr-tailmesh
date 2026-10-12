@@ -17,8 +17,9 @@ use winit::window::Fullscreen;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::{ElementState, WindowEvent},
+    event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{Key, ModifiersState},
     window::{Window, WindowAttributes, WindowId, WindowLevel},
 };
 
@@ -43,6 +44,7 @@ struct Renderer {
     orb_ui: crate::orb_ui::OrbUi,
     orb: Option<crate::orbital_sphere::OrbitalSphereScene>,
     depth: wgpu::TextureView,
+    restore_compact: bool,
     #[cfg(target_os = "windows")]
     _session_notifications: Option<windows_screensaver::SessionNotifications>,
 }
@@ -139,8 +141,7 @@ impl Renderer {
             gpu.adapter.get_info()
         );
         surface.configure(&device, &config);
-        let context = egui::Context::default();
-        context.set_visuals(egui::Visuals::dark());
+        let context = viewer_context(tree);
         let state = egui_winit::State::new(
             context.clone(),
             egui::ViewportId::ROOT,
@@ -172,6 +173,7 @@ impl Renderer {
             orb_ui: Default::default(),
             orb,
             depth,
+            restore_compact: false,
             #[cfg(target_os = "windows")]
             _session_notifications: None,
         })
@@ -215,7 +217,41 @@ impl Renderer {
         let mut orb_rect = None;
         let mut output = self.context.run_ui(input, |root| {
             if self.orb.is_some() {
-                orb_rect = self.orb_ui.draw(root, &view, port, passive, clock);
+                if self.orb_ui.compact() {
+                    let rail = egui::Rect::from_min_size(
+                        root.max_rect().min,
+                        egui::vec2(root.max_rect().width(), 26.),
+                    );
+                    root.painter()
+                        .rect_filled(rail, 0., egui::Color32::from_rgb(12, 26, 38));
+                    root.painter().text(
+                        rail.min + egui::vec2(10., 13.),
+                        egui::Align2::LEFT_CENTER,
+                        "HERDR · T / Ctrl ±",
+                        egui::FontId::monospace(11.),
+                        egui::Color32::from_rgb(90, 216, 235),
+                    );
+                    let button = egui::Rect::from_min_max(
+                        egui::pos2(rail.right() - 70., rail.top() + 2.),
+                        rail.max - egui::vec2(4., 2.),
+                    );
+                    let mut bar = root.new_child(egui::UiBuilder::new().max_rect(button));
+                    if bar
+                        .add_sized(button.size(), egui::Button::new("↗"))
+                        .on_hover_text("Restore larger view · T")
+                        .clicked()
+                    {
+                        self.restore_compact = true;
+                    }
+                    let body = egui::Rect::from_min_max(
+                        egui::pos2(root.max_rect().left(), rail.bottom()),
+                        root.max_rect().max,
+                    );
+                    let mut body = root.new_child(egui::UiBuilder::new().max_rect(body));
+                    orb_rect = self.orb_ui.draw(&mut body, &view, port, passive, clock);
+                } else {
+                    orb_rect = self.orb_ui.draw(root, &view, port, passive, clock);
+                }
             } else if passive {
                 self.ui.draw_screensaver(root, &view, port);
             } else {
@@ -308,6 +344,14 @@ impl Renderer {
         Ok(())
     }
 }
+fn viewer_context(tree: bool) -> egui::Context {
+    let context = egui::Context::default();
+    context.set_visuals(egui::Visuals::dark());
+    // Orb owns Ctrl +/- for compact window sizing, not UI-scale changes.
+    context.options_mut(|options| options.zoom_with_keyboard = tree);
+    context
+}
+
 fn depth_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
@@ -328,6 +372,9 @@ fn depth_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture
 }
 
 struct App {
+    companion: Option<crate::compact_window::Controller>,
+    modifiers: ModifiersState,
+    cursor: winit::dpi::LogicalPosition<f64>,
     renderers: Vec<Renderer>,
     shared: Arc<Shared>,
     port: u16,
@@ -362,6 +409,11 @@ impl ApplicationHandler<()> for App {
         match result {
             Ok(renderers) => {
                 self.renderers = renderers;
+                if let Some(c) = &mut self.companion
+                    && let Some(r) = self.renderers.first()
+                {
+                    c.attach(&r.window);
+                }
                 self.started = Instant::now();
                 #[cfg(target_os = "windows")]
                 {
@@ -385,6 +437,8 @@ impl ApplicationHandler<()> for App {
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        #[cfg(target_os = "windows")]
+        let mut event = event;
         if self.mode == Mode::Fullscreen && matches!(&event, WindowEvent::Focused(false)) {
             self.focus_loss_pending
                 .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
@@ -421,8 +475,72 @@ impl ApplicationHandler<()> for App {
                 r.window.request_redraw();
             }
         }
+        if let Some(c) = &mut self.companion {
+            match &event {
+                WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.cursor = position.to_logical(r.window.scale_factor())
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Left,
+                    ..
+                } if c.compact
+                    && self.cursor.y < 26.
+                    && self.cursor.x
+                        < r.window
+                            .inner_size()
+                            .to_logical::<f64>(r.window.scale_factor())
+                            .width
+                            - 72. =>
+                {
+                    if let Err(e) = r.window.drag_window() {
+                        log::warn!("Cannot drag compact window: {e}");
+                    }
+                    return;
+                }
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed
+                        && !self.modifiers.alt_key()
+                        && !self.modifiers.super_key() =>
+                {
+                    if let Key::Character(key) = &event.logical_key {
+                        if key.eq_ignore_ascii_case("t")
+                            && !event.repeat
+                            && !self.modifiers.control_key()
+                        {
+                            c.toggle(&r.window);
+                            r.orb_ui.set_compact(c.compact);
+                            return;
+                        }
+                        if c.compact
+                            && self.modifiers.control_key()
+                            && matches!(key.as_str(), "+" | "=" | "-")
+                        {
+                            c.step(&r.window, key.as_str() != "-");
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            #[cfg(target_os = "windows")]
+            if let WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                inner_size_writer,
+            } = &mut event
+            {
+                c.scale_factor_changed(*scale_factor, inner_size_writer);
+            }
+        }
         match event {
-            WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
+                if let Some(c) = &mut self.companion {
+                    c.capture(&r.window);
+                    c.flush();
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => r.resize(size),
             WindowEvent::RedrawRequested => {
                 if let Err(e) = r.render(
@@ -433,6 +551,13 @@ impl ApplicationHandler<()> for App {
                 ) {
                     self.error = Some(e);
                     event_loop.exit();
+                }
+                if r.restore_compact {
+                    r.restore_compact = false;
+                    if let Some(c) = &mut self.companion {
+                        c.toggle(&r.window);
+                        r.orb_ui.set_compact(c.compact);
+                    }
                 }
             }
             _ => {}
@@ -459,6 +584,11 @@ impl ApplicationHandler<()> for App {
                 event_loop.exit();
                 return;
             }
+        }
+        if let Some(c) = &mut self.companion
+            && let Some(r) = self.renderers.first()
+        {
+            c.tick(&r.window);
         }
         if Instant::now() >= self.next_tick {
             #[cfg(target_os = "windows")]
@@ -505,7 +635,10 @@ impl App {
             Mode::Viewer => vec![
                 WindowAttributes::default()
                     .with_title("Herdr mesh visualizer")
-                    .with_inner_size(PhysicalSize::new(1440, 900)),
+                    .with_inner_size(match &self.companion {
+                        Some(c) => winit::dpi::Size::Logical(c.initial_size()),
+                        None => winit::dpi::Size::Physical(PhysicalSize::new(1440, 900)),
+                    }),
             ],
             Mode::Fullscreen => event_loop
                 .available_monitors()
@@ -630,7 +763,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let check = options.check;
     if options.help {
         println!(
-            "herdr-mesh-visualizer [--port 8790] [--tree] [--check]\nOrb is the default. --tree opens the legacy tree. --check verifies a snapshot without opening a window."
+            "herdr-mesh-visualizer [--port 8790] [--tree] [--check]\nOrb is the default. Interactive Orb: T compact mode, Ctrl +/- resize compact, drag its title rail. --tree opens the legacy tree. --check verifies a snapshot without opening a window."
         );
         #[cfg(target_os = "windows")]
         println!("Windows screensaver: /s | /p HWND | /c [HWND] (also /p:HWND and /c:HWND)");
@@ -718,6 +851,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             rt.block_on(client::run(port, worker_shared, stop_rx));
         })?;
     let mut app = App {
+        companion: (options.mode == Mode::Viewer && !options.tree)
+            .then(crate::compact_window::Controller::load),
+        modifiers: ModifiersState::empty(),
+        cursor: Default::default(),
         renderers: Vec::new(),
         shared,
         port,
@@ -751,6 +888,34 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orb_window_size_shortcuts_never_change_rendering_scale() {
+        let context = viewer_context(false);
+        for key in [egui::Key::Minus, egui::Key::Plus, egui::Key::Equals] {
+            let modifiers = egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            };
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            context.run_ui(input, |_| {}).textures_delta.clear();
+            context
+                .run_ui(Default::default(), |_| {})
+                .textures_delta
+                .clear();
+            assert_eq!(context.zoom_factor(), 1.);
+        }
+    }
 
     #[test]
     fn startup_focus_loss_remains_pending_until_grace_expires() {
