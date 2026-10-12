@@ -11,12 +11,42 @@ use winit::{
 
 pub struct Controller {
     pub compact: bool,
-    prefs: Arc<Mutex<Preferences>>,
+    prefs: Arc<Mutex<WindowPreferences>>,
     path: Option<std::path::PathBuf>,
     changed: Option<Instant>,
     settle: Instant,
     #[cfg(target_os = "linux")]
     hypr: Option<hypr::Adapter>,
+}
+#[derive(Default)]
+struct WindowPreferences {
+    value: Preferences,
+    #[cfg(any(target_os = "linux", test))]
+    generation: u64,
+}
+impl WindowPreferences {
+    fn step(&mut self, grow: bool) {
+        #[cfg(any(target_os = "linux", test))]
+        self.request();
+        self.value.compact = self.value.compact.stepped(grow);
+    }
+    #[cfg(any(target_os = "linux", test))]
+    fn request(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+    #[cfg(any(target_os = "linux", test))]
+    fn publish(&mut self, generation: u64, compact: bool, bounds: Bounds) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        if compact {
+            self.value.compact = bounds;
+        } else {
+            self.value.normal = bounds;
+        }
+        true
+    }
 }
 impl Controller {
     pub fn load() -> Self {
@@ -33,7 +63,11 @@ impl Controller {
             .unwrap_or_default();
         Self {
             compact: false,
-            prefs: Arc::new(Mutex::new(prefs)),
+            prefs: Arc::new(Mutex::new(WindowPreferences {
+                value: prefs,
+                #[cfg(any(target_os = "linux", test))]
+                generation: 0,
+            })),
             path,
             changed: None,
             settle: Instant::now(),
@@ -43,7 +77,7 @@ impl Controller {
     }
     pub fn initial_size(&self) -> LogicalSize<f64> {
         let p = self.prefs.lock().unwrap();
-        LogicalSize::new(p.normal.size[0], p.normal.size[1])
+        LogicalSize::new(p.value.normal.size[0], p.value.normal.size[1])
     }
     pub fn attach(&mut self, window: &Window) {
         #[cfg(target_os = "linux")]
@@ -64,7 +98,7 @@ impl Controller {
         }
         {
             let mut p = self.prefs.lock().unwrap();
-            p.compact = p.compact.stepped(grow);
+            p.step(grow);
         }
         self.apply(window);
     }
@@ -75,9 +109,9 @@ impl Controller {
         }
         let prefs = self.prefs.lock().unwrap();
         let bounds = if self.compact {
-            prefs.compact
+            prefs.value.compact
         } else {
-            prefs.normal
+            prefs.value.normal
         };
         if let Err(e) = writer.request_inner_size(
             LogicalSize::new(bounds.size[0], bounds.size[1]).to_physical::<u32>(scale),
@@ -87,10 +121,12 @@ impl Controller {
     }
     fn apply(&mut self, window: &Window) {
         let mut p = self.prefs.lock().unwrap();
+        #[cfg(target_os = "linux")]
+        let generation = p.request();
         let b = if self.compact {
-            &mut p.compact
+            &mut p.value.compact
         } else {
-            &mut p.normal
+            &mut p.value.normal
         };
         *b = b.limited(self.compact);
         // Hyprland uses its own logical work areas; other backends use winit.
@@ -151,16 +187,16 @@ impl Controller {
             Ok(fitted) => {
                 let mut p = self.prefs.lock().unwrap();
                 if self.compact {
-                    p.compact = fitted;
+                    p.value.compact = fitted;
                 } else {
-                    p.normal = fitted;
+                    p.value.normal = fitted;
                 }
             }
             Err(e) => log::warn!("Cannot place companion window: {e}"),
         }
         #[cfg(target_os = "linux")]
         if let Some(hypr) = &self.hypr {
-            hypr.apply(self.compact, bounds);
+            hypr.apply(self.compact, bounds, generation);
         }
         self.settle = Instant::now() + std::time::Duration::from_millis(650);
         self.changed = Some(Instant::now());
@@ -179,9 +215,9 @@ impl Controller {
         }
         let mut prefs = self.prefs.lock().unwrap();
         let b = if self.compact {
-            &mut prefs.compact
+            &mut prefs.value.compact
         } else {
-            &mut prefs.normal
+            &mut prefs.value.normal
         };
         if Instant::now() < self.settle {
             // Win32 placement is synchronous; retain an immediate drag/toggle
@@ -210,13 +246,48 @@ impl Controller {
     }
     pub fn flush(&mut self) {
         if let Some(path) = &self.path
-            && let Err(e) = self.prefs.lock().unwrap().write(path)
+            && let Err(e) = self.prefs.lock().unwrap().value.write(path)
         {
             log::warn!("Cannot save window preferences: {e}");
             self.changed = Some(Instant::now());
             return;
         }
         self.changed = None;
+    }
+}
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+
+    #[test]
+    fn stale_compositor_updates_cannot_lose_consecutive_resize_steps() {
+        let mut prefs = WindowPreferences::default();
+        let original = prefs.value.compact;
+        let initial = prefs.request();
+        assert!(prefs.publish(initial, true, original));
+
+        prefs.step(true);
+        let first = prefs.request();
+        let first_target = prefs.value.compact;
+        assert!(!prefs.publish(initial, true, original));
+        prefs.step(true);
+        assert!(!prefs.publish(first, true, first_target));
+        let second = prefs.request();
+        let second_target = prefs.value.compact;
+        assert_eq!(second_target, original.stepped(true).stepped(true));
+        assert!(!prefs.publish(first, true, first_target));
+        assert!(prefs.publish(second, true, second_target));
+
+        let normal = prefs.value.normal;
+        let restore = prefs.request();
+        let moved = Bounds {
+            position: Some([1000, 700]),
+            ..second_target
+        };
+        assert!(prefs.publish(restore, true, moved));
+        assert!(prefs.publish(restore, false, normal));
+        assert_eq!(prefs.value.compact, moved);
+        assert_eq!(prefs.value.normal, normal);
     }
 }
 #[cfg(target_os = "windows")]
@@ -380,14 +451,14 @@ mod windows {
             let path = dir.path().join("window-preferences.json");
             let mut controller = Controller {
                 compact: false,
-                prefs: Arc::new(Mutex::new(Preferences::default())),
+                prefs: Arc::new(Mutex::new(WindowPreferences::default())),
                 path: Some(path.clone()),
                 changed: None,
                 settle: Instant::now(),
             };
             controller.attach(&window);
             event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
-            let normal = controller.prefs.lock().unwrap().normal;
+            let normal = controller.prefs.lock().unwrap().value.normal;
             controller.toggle(&window);
             event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
             assert_ne!(
@@ -397,7 +468,7 @@ mod windows {
             for grow in [false, true] {
                 controller.step(&window, grow);
                 event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
-                let expected = controller.prefs.lock().unwrap().compact;
+                let expected = controller.prefs.lock().unwrap().value.compact;
                 let actual = window.inner_size().to_logical::<f64>(window.scale_factor());
                 assert!(
                     (actual.width - expected.size[0]).abs() <= 1.,
@@ -411,7 +482,8 @@ mod windows {
             for monitor in window.available_monitors() {
                 {
                     let mut prefs = controller.prefs.lock().unwrap();
-                    prefs.compact.position = Some([monitor.position().x, monitor.position().y]);
+                    prefs.value.compact.position =
+                        Some([monitor.position().x, monitor.position().y]);
                 }
                 controller.apply(&window);
                 event_loop.pump_events(Some(std::time::Duration::ZERO), |event, _| {
@@ -443,7 +515,7 @@ mod windows {
             window.set_outer_position(PhysicalPosition::new(position.x + 12, position.y + 12));
             event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
             controller.capture(&window);
-            let compact = controller.prefs.lock().unwrap().compact;
+            let compact = controller.prefs.lock().unwrap().value.compact;
             assert_eq!(compact.position, Some([position.x + 12, position.y + 12]));
             controller.toggle(&window);
             event_loop.pump_events(Some(std::time::Duration::ZERO), |event, _| {
@@ -463,17 +535,17 @@ mod windows {
                 unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST,
                 0
             );
-            assert_eq!(controller.prefs.lock().unwrap().normal, normal);
+            assert_eq!(controller.prefs.lock().unwrap().value.normal, normal);
             let actual = window.inner_size().to_logical::<f64>(window.scale_factor());
             assert!((actual.width - normal.size[0]).abs() <= 1.);
             assert!((actual.height - normal.size[1]).abs() <= 1.);
             controller.toggle(&window);
-            assert_eq!(controller.prefs.lock().unwrap().compact, compact);
+            assert_eq!(controller.prefs.lock().unwrap().value.compact, compact);
             controller.capture(&window);
             controller.flush();
             assert_eq!(
                 Preferences::read(&path).unwrap(),
-                *controller.prefs.lock().unwrap()
+                controller.prefs.lock().unwrap().value
             );
             assert_eq!(unsafe { GetForegroundWindow() }, foreground);
         }
@@ -530,7 +602,7 @@ mod hypr {
         time::Duration,
     };
     pub struct Adapter {
-        tx: mpsc::Sender<(bool, Bounds)>,
+        tx: mpsc::Sender<(bool, Bounds, u64)>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         worker: Option<std::thread::JoinHandle<()>>,
     }
@@ -661,15 +733,16 @@ mod hypr {
     }
     fn run(
         path: PathBuf,
-        prefs: Arc<Mutex<Preferences>>,
+        prefs: Arc<Mutex<WindowPreferences>>,
         saved: Option<PathBuf>,
-        rx: mpsc::Receiver<(bool, Bounds)>,
+        rx: mpsc::Receiver<(bool, Bounds, u64)>,
         stopping: Arc<std::sync::atomic::AtomicBool>,
     ) {
         let pid = std::process::id();
         let mut compact = false;
         let mut apply = true;
-        let mut desired = prefs.lock().unwrap().normal;
+        let mut desired = prefs.lock().unwrap().value.normal;
+        let mut generation = 0;
         let mut settle = Instant::now();
         let mut active = String::new();
         let mut dirty = None;
@@ -687,25 +760,17 @@ mod hypr {
                     return Ok(());
                 };
                 if let Some(next) = requested.take() {
-                    if !apply
+                    let changed = compact != next.0;
+                    if changed
+                        && !apply
                         && let Some(current) = bounds(v)
                         && expected.is_none_or(|(target, _)| size_matches(current, target))
                     {
-                        let mut p = prefs.lock().unwrap();
-                        if compact {
-                            p.compact = current;
-                        } else {
-                            p.normal = current;
-                        }
+                        prefs.lock().unwrap().publish(next.2, compact, current);
                     }
-                    let changed = compact != next.0;
                     compact = next.0;
-                    desired = if changed {
-                        let p = prefs.lock().unwrap();
-                        if compact { p.compact } else { p.normal }
-                    } else {
-                        next.1
-                    };
+                    desired = next.1;
+                    generation = next.2;
                     if !changed
                         && !apply
                         && let Some(current) = bounds(v)
@@ -743,12 +808,7 @@ mod hypr {
                         p[1]
                     );
                     eval(&path, v, pid, &body)?;
-                    let mut pref = prefs.lock().unwrap();
-                    if compact {
-                        pref.compact = b;
-                    } else {
-                        pref.normal = b;
-                    }
+                    prefs.lock().unwrap().publish(generation, compact, b);
                     apply = false;
                     settle = Instant::now() + Duration::from_millis(650);
                     previous = None;
@@ -783,12 +843,7 @@ mod hypr {
                         previous = Some(b);
                         dirty = Some(Instant::now());
                     }
-                    let mut p = prefs.lock().unwrap();
-                    if compact {
-                        p.compact = b;
-                    } else {
-                        p.normal = b;
-                    }
+                    prefs.lock().unwrap().publish(generation, compact, b);
                 }
                 let focused = items.iter().find(|v| v["focusHistoryID"] == 0);
                 let current = focused.and_then(address).unwrap_or("");
@@ -811,6 +866,7 @@ mod hypr {
                     prefs
                         .lock()
                         .unwrap()
+                        .value
                         .write(file)
                         .map_err(|e| e.to_string())?;
                     dirty = None;
@@ -840,21 +896,16 @@ mod hypr {
                 .and_then(bounds)
             && expected.is_none_or(|(target, _)| size_matches(current, target))
         {
-            let mut p = prefs.lock().unwrap();
-            if compact {
-                p.compact = current;
-            } else {
-                p.normal = current;
-            }
+            prefs.lock().unwrap().publish(generation, compact, current);
         }
         if let Some(path) = saved
-            && let Err(e) = prefs.lock().unwrap().write(&path)
+            && let Err(e) = prefs.lock().unwrap().value.write(&path)
         {
             log::warn!("Cannot save window preferences: {e}");
         }
     }
     impl Adapter {
-        pub fn start(prefs: Arc<Mutex<Preferences>>, saved: Option<PathBuf>) -> Option<Self> {
+        pub fn start(prefs: Arc<Mutex<WindowPreferences>>, saved: Option<PathBuf>) -> Option<Self> {
             let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
             if !signature
                 .bytes()
@@ -869,7 +920,7 @@ mod hypr {
             if !path.is_absolute() || !path.exists() {
                 return None;
             }
-            let (tx, rx) = mpsc::channel::<(bool, Bounds)>();
+            let (tx, rx) = mpsc::channel::<(bool, Bounds, u64)>();
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stopping = stop.clone();
             let worker = std::thread::Builder::new()
@@ -883,14 +934,16 @@ mod hypr {
                 worker: Some(worker),
             })
         }
-        pub fn apply(&self, compact: bool, bounds: Bounds) {
-            let _ = self.tx.send((compact, bounds));
+        pub fn apply(&self, compact: bool, bounds: Bounds, generation: u64) {
+            if let Err(e) = self.tx.send((compact, bounds, generation)) {
+                log::warn!("Cannot request companion placement: {e}");
+            }
         }
     }
     impl Drop for Adapter {
         fn drop(&mut self) {
             self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = self.tx.send((false, Preferences::default().normal));
+            let _ = self.tx.send((false, Preferences::default().normal, 0));
             if let Some(w) = self.worker.take() {
                 let _ = w.join();
             }

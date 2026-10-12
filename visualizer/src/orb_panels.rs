@@ -1475,7 +1475,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                 ui.separator();
                 ui.small("Ctrl +/- only sizes the compact window. Drag its title rail to move; T or Restore returns to normal.");
             });
-        response.blocked.push(bounds);
+        response.blocked.push(context.rect);
     }
     response
 }
@@ -2068,7 +2068,7 @@ mod tests {
                 },
                 |ui| {
                     state.handle_input(ui, 2., passive);
-                    draw(
+                    let response = draw(
                         ui,
                         &Context {
                             sim: &sim,
@@ -2079,6 +2079,7 @@ mod tests {
                         },
                         state,
                     );
+                    assert_eq!(response.blocked.contains(&rect), state.keys && !passive);
                 },
             );
             let labels = output

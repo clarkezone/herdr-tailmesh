@@ -14,7 +14,8 @@ its existing keyboard zoom behavior.
 
 **L** toggles the legend. **K** toggles a scrollable keyboard-shortcut overlay
 in either normal or compact mode; K or its Close button dismisses it. The overlay
-does not appear in screensaver/preview mode or change callout/outcome state.
+blocks underlying scene selection while open. It does not appear in
+screensaver/preview mode or change callout/outcome state.
 
 The compact view presents activity and selected-object cards as short rows on
 the right, with the same animated reveal, focus checkbox and per-instance
@@ -78,6 +79,9 @@ being lost when toggling during resize settling. Geometry capture now waits for
 the requested dimensions, reads the outgoing mode before a switch and captures
 again on shutdown. Rotated monitor selection uses the same logical extent as
 restore clamping. IPC replies have byte limits and total/per-read deadlines.
+Compositor observations are generation-checked against queued geometry requests,
+so an older resize cannot overwrite a newer target. Only mode switches capture
+outgoing geometry; same-mode resizing preserves consecutive shortcut increments.
 
 Portable checks cover minimum row packing, real pointer dismissal of one exact
 episode, independent preference replacement/restart, malformed preferences,
