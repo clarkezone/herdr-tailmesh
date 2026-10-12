@@ -68,6 +68,23 @@ impl Controller {
         }
         self.apply(window);
     }
+    #[cfg(target_os = "windows")]
+    pub fn scale_factor_changed(&self, scale: f64, writer: &mut winit::event::InnerSizeWriter) {
+        if Instant::now() >= self.settle {
+            return;
+        }
+        let prefs = self.prefs.lock().unwrap();
+        let bounds = if self.compact {
+            prefs.compact
+        } else {
+            prefs.normal
+        };
+        if let Err(e) = writer.request_inner_size(
+            LogicalSize::new(bounds.size[0], bounds.size[1]).to_physical::<u32>(scale),
+        ) {
+            log::warn!("Cannot restore companion size after DPI change: {e}");
+        }
+    }
     fn apply(&mut self, window: &Window) {
         let mut p = self.prefs.lock().unwrap();
         let b = if self.compact {
@@ -81,7 +98,10 @@ impl Controller {
         let compositor = self.hypr.is_some();
         #[cfg(not(target_os = "linux"))]
         let compositor = false;
-        if !compositor && let Some(m) = window.current_monitor() {
+        if !compositor
+            && !cfg!(target_os = "windows")
+            && let Some(m) = window.current_monitor()
+        {
             let size = m.size().to_logical::<f64>(m.scale_factor());
             // Native positions remain desktop physical pixels; only extent is logical.
             let mut fitted = b.on_monitor([0, 0], [size.width, size.height]);
@@ -119,12 +139,24 @@ impl Controller {
             if self.compact { 240. } else { 400. },
         )));
         window.set_max_inner_size(self.compact.then_some(LogicalSize::new(960., 720.)));
-        if !compositor {
+        if !compositor && !cfg!(target_os = "windows") {
             window.set_maximized(false);
             let _ = window.request_inner_size(LogicalSize::new(bounds.size[0], bounds.size[1]));
             if let Some(pos) = bounds.position {
                 window.set_outer_position(PhysicalPosition::new(pos[0], pos[1]));
             }
+        }
+        #[cfg(target_os = "windows")]
+        match windows::apply(window, self.compact, bounds) {
+            Ok(fitted) => {
+                let mut p = self.prefs.lock().unwrap();
+                if self.compact {
+                    p.compact = fitted;
+                } else {
+                    p.normal = fitted;
+                }
+            }
+            Err(e) => log::warn!("Cannot place companion window: {e}"),
         }
         #[cfg(target_os = "linux")]
         if let Some(hypr) = &self.hypr {
@@ -138,10 +170,7 @@ impl Controller {
         if self.hypr.is_some() {
             return;
         }
-        if Instant::now() < self.settle
-            || window.is_maximized()
-            || window.is_minimized() == Some(true)
-        {
+        if window.is_maximized() || window.is_minimized() == Some(true) {
             return;
         }
         let size = window.inner_size().to_logical::<f64>(window.scale_factor());
@@ -154,6 +183,16 @@ impl Controller {
         } else {
             &mut prefs.normal
         };
+        if Instant::now() < self.settle {
+            // Win32 placement is synchronous; retain an immediate drag/toggle
+            // once the requested client extent has arrived, not an interim resize.
+            #[cfg(target_os = "windows")]
+            if (size.width - b.size[0]).abs() > 1. || (size.height - b.size[1]).abs() > 1. {
+                return;
+            }
+            #[cfg(not(target_os = "windows"))]
+            return;
+        }
         let next = Bounds {
             size: [size.width, size.height],
             position: window.outer_position().ok().map(|p| [p.x, p.y]),
@@ -178,6 +217,305 @@ impl Controller {
             return;
         }
         self.changed = None;
+    }
+}
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::*;
+    use windows_sys::Win32::{
+        Foundation::RECT,
+        Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
+            MonitorFromWindow,
+        },
+        UI::{
+            HiDpi::AdjustWindowRectExForDpi,
+            WindowsAndMessaging::{
+                GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, HWND_NOTOPMOST, HWND_TOPMOST,
+                SWP_NOACTIVATE, SWP_NOOWNERZORDER, SetWindowPos,
+            },
+        },
+    };
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    fn fit(mut rect: RECT, work: RECT) -> RECT {
+        let width = (rect.right - rect.left).min(work.right - work.left).max(1);
+        let height = (rect.bottom - rect.top).min(work.bottom - work.top).max(1);
+        rect.left = rect.left.clamp(work.left, work.right - width);
+        rect.top = rect.top.clamp(work.top, work.bottom - height);
+        rect.right = rect.left + width;
+        rect.bottom = rect.top + height;
+        rect
+    }
+
+    pub fn apply(window: &Window, compact: bool, bounds: Bounds) -> Result<Bounds, String> {
+        let RawWindowHandle::Win32(handle) =
+            window.window_handle().map_err(|e| e.to_string())?.as_raw()
+        else {
+            return Err("Expected a Win32 companion window".into());
+        };
+        let hwnd = handle.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+        window.set_maximized(false);
+        let monitor = if let Some([x, y]) = bounds.position {
+            // Select the saved origin, not the newly-created window's monitor.
+            let rect = RECT {
+                left: x,
+                top: y,
+                right: x.saturating_add(1),
+                bottom: y.saturating_add(1),
+            };
+            unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) }
+        } else {
+            unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }
+        };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            return Err(format!(
+                "Monitor work area: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let scale = window
+            .available_monitors()
+            .find(|m| m.position().x == info.rcMonitor.left && m.position().y == info.rcMonitor.top)
+            .ok_or("Companion monitor is no longer available")?
+            .scale_factor();
+        let dpi = (scale * 96.).round() as u32;
+        let mut frame = RECT::default();
+        if !compact
+            && unsafe {
+                AdjustWindowRectExForDpi(
+                    &mut frame,
+                    GetWindowLongW(hwnd, GWL_STYLE) as u32,
+                    0,
+                    GetWindowLongW(hwnd, GWL_EXSTYLE) as u32,
+                    dpi,
+                )
+            } == 0
+        {
+            return Err(format!(
+                "Window frame extent: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let extra = [frame.right - frame.left, frame.bottom - frame.top];
+        let size = LogicalSize::new(bounds.size[0], bounds.size[1]).to_physical::<i32>(scale);
+        let position = bounds
+            .position
+            .or_else(|| window.outer_position().ok().map(|p| [p.x, p.y]))
+            .unwrap_or([info.rcWork.left, info.rcWork.top]);
+        let position = [
+            position[0].clamp(info.rcWork.left, info.rcWork.right),
+            position[1].clamp(info.rcWork.top, info.rcWork.bottom),
+        ];
+        let rect = fit(
+            RECT {
+                left: position[0],
+                top: position[1],
+                right: position[0].saturating_add(size.width.saturating_add(extra[0])),
+                bottom: position[1].saturating_add(size.height.saturating_add(extra[1])),
+            },
+            info.rcWork,
+        );
+        if unsafe {
+            SetWindowPos(
+                hwnd,
+                if compact {
+                    HWND_TOPMOST
+                } else {
+                    HWND_NOTOPMOST
+                },
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "Window placement: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Bounds {
+            size: [
+                f64::from((rect.right - rect.left - extra[0]).max(1)) / scale,
+                f64::from((rect.bottom - rect.top - extra[1]).max(1)) / scale,
+            ],
+            position: Some([rect.left, rect.top]),
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        #[allow(deprecated)]
+        fn native_modes_restore_geometry_without_activation() {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetForegroundWindow, GetWindowRect, WS_EX_TOPMOST,
+            };
+            use winit::{
+                event_loop::EventLoop,
+                platform::{
+                    pump_events::EventLoopExtPumpEvents, windows::EventLoopBuilderExtWindows,
+                },
+                window::WindowAttributes,
+            };
+            let mut event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
+            let window = event_loop
+                .create_window(WindowAttributes::default().with_visible(false))
+                .unwrap();
+            let RawWindowHandle::Win32(handle) = window.window_handle().unwrap().as_raw() else {
+                panic!("Expected Win32 test window");
+            };
+            let hwnd = handle.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+            let foreground = unsafe { GetForegroundWindow() };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("window-preferences.json");
+            let mut controller = Controller {
+                compact: false,
+                prefs: Arc::new(Mutex::new(Preferences::default())),
+                path: Some(path.clone()),
+                changed: None,
+                settle: Instant::now(),
+            };
+            controller.attach(&window);
+            event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+            let normal = controller.prefs.lock().unwrap().normal;
+            controller.toggle(&window);
+            event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+            assert_ne!(
+                unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST,
+                0
+            );
+            for grow in [false, true] {
+                controller.step(&window, grow);
+                event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+                let expected = controller.prefs.lock().unwrap().compact;
+                let actual = window.inner_size().to_logical::<f64>(window.scale_factor());
+                assert!(
+                    (actual.width - expected.size[0]).abs() <= 1.,
+                    "actual {actual:?}, expected {expected:?}"
+                );
+                assert!(
+                    (actual.height - expected.size[1]).abs() <= 1.,
+                    "actual {actual:?}, expected {expected:?}"
+                );
+            }
+            for monitor in window.available_monitors() {
+                {
+                    let mut prefs = controller.prefs.lock().unwrap();
+                    prefs.compact.position = Some([monitor.position().x, monitor.position().y]);
+                }
+                controller.apply(&window);
+                event_loop.pump_events(Some(std::time::Duration::ZERO), |event, _| {
+                    if let winit::event::Event::WindowEvent {
+                        event:
+                            winit::event::WindowEvent::ScaleFactorChanged {
+                                scale_factor,
+                                mut inner_size_writer,
+                            },
+                        ..
+                    } = event
+                    {
+                        controller.scale_factor_changed(scale_factor, &mut inner_size_writer);
+                    }
+                });
+                let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+                let mut info = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                assert_ne!(unsafe { GetMonitorInfoW(monitor, &mut info) }, 0);
+                let mut rect = RECT::default();
+                assert_ne!(unsafe { GetWindowRect(hwnd, &mut rect) }, 0);
+                assert!(rect.left >= info.rcWork.left && rect.top >= info.rcWork.top);
+                assert!(rect.right <= info.rcWork.right && rect.bottom <= info.rcWork.bottom);
+            }
+            // A drag followed immediately by Restore must retain the new position.
+            let position = window.outer_position().unwrap();
+            window.set_outer_position(PhysicalPosition::new(position.x + 12, position.y + 12));
+            event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+            controller.capture(&window);
+            let compact = controller.prefs.lock().unwrap().compact;
+            assert_eq!(compact.position, Some([position.x + 12, position.y + 12]));
+            controller.toggle(&window);
+            event_loop.pump_events(Some(std::time::Duration::ZERO), |event, _| {
+                if let winit::event::Event::WindowEvent {
+                    event:
+                        winit::event::WindowEvent::ScaleFactorChanged {
+                            scale_factor,
+                            mut inner_size_writer,
+                        },
+                    ..
+                } = event
+                {
+                    controller.scale_factor_changed(scale_factor, &mut inner_size_writer);
+                }
+            });
+            assert_eq!(
+                unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST,
+                0
+            );
+            assert_eq!(controller.prefs.lock().unwrap().normal, normal);
+            let actual = window.inner_size().to_logical::<f64>(window.scale_factor());
+            assert!((actual.width - normal.size[0]).abs() <= 1.);
+            assert!((actual.height - normal.size[1]).abs() <= 1.);
+            controller.toggle(&window);
+            assert_eq!(controller.prefs.lock().unwrap().compact, compact);
+            controller.capture(&window);
+            controller.flush();
+            assert_eq!(
+                Preferences::read(&path).unwrap(),
+                *controller.prefs.lock().unwrap()
+            );
+            assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+        }
+
+        #[test]
+        fn placement_respects_taskbars_negative_origins_and_removed_monitors() {
+            let work = RECT {
+                left: -1920,
+                top: 40,
+                right: 0,
+                bottom: 1040,
+            };
+            for scale in [1., 1.25, 1.5, 2.] {
+                let size = LogicalSize::new(520., 360.).to_physical::<i32>(scale);
+                let fitted = fit(
+                    RECT {
+                        left: -3000,
+                        top: 2000,
+                        right: -3000 + size.width,
+                        bottom: 2000 + size.height,
+                    },
+                    work,
+                );
+                assert_eq!(fitted.left, work.left);
+                assert_eq!(fitted.bottom, work.bottom);
+                assert_eq!(fitted.right - fitted.left, size.width);
+                assert_eq!(fitted.bottom - fitted.top, size.height);
+            }
+            let fitted = fit(
+                RECT {
+                    left: 5000,
+                    top: -900,
+                    right: 9000,
+                    bottom: 3000,
+                },
+                work,
+            );
+            assert_eq!(
+                [fitted.left, fitted.top, fitted.right, fitted.bottom],
+                [-1920, 40, 0, 1040]
+            );
+        }
     }
 }
 #[cfg(target_os = "linux")]

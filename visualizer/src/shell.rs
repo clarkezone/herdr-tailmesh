@@ -141,8 +141,7 @@ impl Renderer {
             gpu.adapter.get_info()
         );
         surface.configure(&device, &config);
-        let context = egui::Context::default();
-        context.set_visuals(egui::Visuals::dark());
+        let context = viewer_context(tree);
         let state = egui_winit::State::new(
             context.clone(),
             egui::ViewportId::ROOT,
@@ -345,6 +344,14 @@ impl Renderer {
         Ok(())
     }
 }
+fn viewer_context(tree: bool) -> egui::Context {
+    let context = egui::Context::default();
+    context.set_visuals(egui::Visuals::dark());
+    // Orb owns Ctrl +/- for compact window sizing, not UI-scale changes.
+    context.options_mut(|options| options.zoom_with_keyboard = tree);
+    context
+}
+
 fn depth_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
@@ -430,6 +437,8 @@ impl ApplicationHandler<()> for App {
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        #[cfg(target_os = "windows")]
+        let mut event = event;
         if self.mode == Mode::Fullscreen && matches!(&event, WindowEvent::Focused(false)) {
             self.focus_loss_pending
                 .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
@@ -514,6 +523,14 @@ impl ApplicationHandler<()> for App {
                     }
                 }
                 _ => {}
+            }
+            #[cfg(target_os = "windows")]
+            if let WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                inner_size_writer,
+            } = &mut event
+            {
+                c.scale_factor_changed(*scale_factor, inner_size_writer);
             }
         }
         match event {
@@ -871,6 +888,34 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orb_window_size_shortcuts_never_change_rendering_scale() {
+        let context = viewer_context(false);
+        for key in [egui::Key::Minus, egui::Key::Plus, egui::Key::Equals] {
+            let modifiers = egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            };
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            context.run_ui(input, |_| {}).textures_delta.clear();
+            context
+                .run_ui(Default::default(), |_| {})
+                .textures_delta
+                .clear();
+            assert_eq!(context.zoom_factor(), 1.);
+        }
+    }
 
     #[test]
     fn startup_focus_loss_remains_pending_until_grace_expires() {

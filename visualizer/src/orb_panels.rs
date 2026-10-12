@@ -44,6 +44,7 @@ struct LayoutTrace {
 #[derive(Default)]
 pub struct Panels {
     pub compact: bool,
+    keys: bool,
     pub page: usize,
     pub projects: bool,
     pub focus: Option<Key>,
@@ -223,7 +224,8 @@ impl Panels {
                         continue;
                     }
                     match key {
-                        egui::Key::K => self.controls.toggle(Panel::Key, clock),
+                        egui::Key::L => self.controls.toggle(Panel::Key, clock),
+                        egui::Key::K => self.keys = !self.keys,
                         egui::Key::F => self.controls.toggle(Panel::Counts, clock),
                         egui::Key::N => self.objects.toggle(crate::orb_objects::Class::Node),
                         egui::Key::S => self.objects.toggle(crate::orb_objects::Class::Session),
@@ -1415,6 +1417,70 @@ fn draw_compact(
 }
 
 pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response {
+    let show_keys = state.keys && !context.passive;
+    let mut response = ui
+        .scope(|ui| {
+            if show_keys {
+                ui.disable();
+            }
+            draw_content(ui, context, state)
+        })
+        .inner;
+    if show_keys {
+        let rect = context.rect.shrink(8.);
+        let bounds = Rect::from_center_size(
+            rect.center(),
+            vec2(rect.width().min(460.), rect.height().min(410.)),
+        );
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .id(ui.id().with("orb-shortcuts"))
+                .layer_id(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    ui.id().with("orb-shortcuts-layer"),
+                ))
+                .max_rect(bounds.shrink(12.)),
+        );
+        frame(child.painter(), bounds, CYAN, 1.);
+        child.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        child.horizontal(|ui| {
+            ui.label(egui::RichText::new("KEYBOARD · K").monospace().color(CYAN));
+            if ui.button("Close").clicked() {
+                state.keys = false;
+            }
+        });
+        child.separator();
+        egui::ScrollArea::vertical()
+            .max_height(child.available_height())
+            .auto_shrink([false, false])
+            .show(&mut child, |ui| {
+                for (key, action) in [
+                    ("T", "Toggle normal / compact window"),
+                    ("Ctrl + / Ctrl =", "Enlarge compact window by 10%"),
+                    ("Ctrl -", "Shrink compact window by 10% (minimum 360 × 240)"),
+                    ("L", "Toggle legend"),
+                    ("K", "Toggle this keyboard list"),
+                    ("F", "Toggle fleet counts"),
+                    ("N", "Toggle node callouts"),
+                    ("S", "Toggle session callouts"),
+                    ("W", "Toggle workspace callouts"),
+                    ("A", "Toggle working-agent callouts"),
+                    ("Esc", "Clear explicit Focus"),
+                    ("Tab / Shift + Tab", "Navigate controls"),
+                    ("Space / Enter", "Activate a focused control"),
+                ] {
+                    ui.label(egui::RichText::new(key).monospace().color(CYAN));
+                    ui.label(action);
+                }
+                ui.separator();
+                ui.small("Ctrl +/- only sizes the compact window. Drag its title rail to move; T or Restore returns to normal.");
+            });
+        response.blocked.push(bounds);
+    }
+    response
+}
+
+fn draw_content(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response {
     state.refresh_dismissals(context.view);
     let rect = context.rect;
     let painter = ui.painter().with_clip_rect(rect);
@@ -1912,7 +1978,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             );
             if dock.panel == Panel::Key {
                 child.horizontal(|ui| {
-                    ui.small("KEY · K").on_hover_text(
+                    ui.small("LEGEND · L").on_hover_text(
                         "N nodes · S sessions · W workspaces · F fleet · A working agents",
                     );
                     if !context.passive && ui.selectable_label(state.projects, "Projects").clicked()
@@ -1943,7 +2009,7 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
         }
         reveal.scan(&painter, dock.bounds);
     }
-    // Sampling is relevant even when K/F are hidden; never disguise partial detail.
+    // Sampling is relevant even when L/F are hidden; never disguise partial detail.
     if context.sim.omitted > 0 {
         painter.text(
             rect.left_top(),
@@ -1985,6 +2051,74 @@ mod tests {
             modifiers: Default::default(),
         }
     }
+    #[test]
+    fn legend_and_keyboard_help_toggle_independently_and_help_fits_compact_mode() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "working", 1)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 2.);
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(328., 182.));
+        let mut state = Panels::default();
+        let run = |state: &mut Panels, events, passive| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    state.handle_input(ui, 2., passive);
+                    draw(
+                        ui,
+                        &Context {
+                            sim: &sim,
+                            view: &v,
+                            rect,
+                            selected: None,
+                            passive,
+                        },
+                        state,
+                    );
+                },
+            );
+            let labels = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            output.textures_delta.clear();
+            labels
+        };
+        run(&mut state, vec![key(egui::Key::L, true, false)], false);
+        assert!(!state.controls.key.shown);
+        let labels = run(&mut state, vec![key(egui::Key::K, true, false)], false);
+        assert!(state.keys);
+        assert!(!state.controls.key.shown);
+        assert!(labels.iter().any(|s| s == "KEYBOARD · K"));
+        state.set_compact(true);
+        let labels = run(&mut state, vec![key(egui::Key::K, true, true)], false);
+        assert!(state.keys);
+        assert!(labels.iter().any(|s| s == "KEYBOARD · K"));
+        let labels = run(&mut state, vec![key(egui::Key::K, true, false)], true);
+        assert!(state.keys);
+        assert!(!labels.iter().any(|s| s == "KEYBOARD · K"));
+        run(
+            &mut state,
+            vec![
+                key(egui::Key::K, false, false),
+                key(egui::Key::L, false, false),
+            ],
+            false,
+        );
+        run(&mut state, vec![key(egui::Key::K, true, false)], false);
+        assert!(!state.keys);
+        run(&mut state, vec![key(egui::Key::L, true, false)], false);
+        assert!(state.controls.key.shown);
+    }
+
     #[test]
     fn compact_rows_fit_minimum_and_keep_each_stop_dismissal_scoped() {
         for size in [vec2(328., 182.), vec2(488., 302.), vec2(928., 662.)] {
@@ -2372,7 +2506,7 @@ mod tests {
         assert!(!state.controls.workers.shown);
         run(
             vec![
-                key(egui::Key::K, true, false),
+                key(egui::Key::L, true, false),
                 key(egui::Key::F, true, false),
             ],
             false,

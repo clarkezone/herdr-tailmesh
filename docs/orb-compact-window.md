@@ -8,6 +8,14 @@ current monitor. Normal and compact geometry are saved independently in
 `window-preferences.json` beside the visualizer's existing state files. Launch
 always uses the normal view.
 
+Ctrl + / − changes only the compact window's size, never text or rendering
+scale. These shortcuts do nothing in normal Orb mode. The legacy tree retains
+its existing keyboard zoom behavior.
+
+**L** toggles the legend. **K** toggles a scrollable keyboard-shortcut overlay
+in either normal or compact mode; K or its Close button dismisses it. The overlay
+does not appear in screensaver/preview mode or change callout/outcome state.
+
 The compact view presents activity and selected-object cards as short rows on
 the right, with the same animated reveal, focus checkbox and per-instance
 outcome close control. Hover a row for full context; click its text to select
@@ -31,31 +39,36 @@ handled using compositor coordinates. IPC runs on a separate worker with
 bounded reads and timeouts; errors are logged. Other Wayland compositors do not
 provide this adapter and may ignore native topmost/position requests.
 
-## Windows handoff
+## Windows
 
-Shared compact UI, preference persistence and mode switching compile on all
-platforms. The winit path already requests decorations, WindowLevel::AlwaysOnTop,
-native dragging and logical size changes. Windows native behavior is **not yet
-validated** by the Omarchy delivery. The followup agent should:
+Windows uses the shared compact UI, preference persistence, shortcuts and native
+title-rail dragging. The interactive controller places its HWND with
+`SetWindowPos` and `SWP_NOACTIVATE`, switching between topmost compact mode and
+ordinary decorated mode without taking focus. It selects the saved position's
+monitor (or the nearest remaining monitor), fits the outer frame to the Windows
+work area so it does not cover the taskbar, and converts logical client sizes
+using that monitor's DPI. During mode/monitor restoration, the controller
+overrides deferred DPI resize suggestions so they cannot replace the restored
+size. An immediate drag followed by Restore retains the outgoing position.
+No registry entries, global hotkeys or daemon settings are changed.
 
-- Validate topmost across ordinary app activation without stealing focus,
-  and normal-mode restoration. If needed, isolate HWND/SetWindowPos behavior
-  behind the existing shell/controller boundary.
-- Verify title-rail dragging begins on a real mouse press and restore does
+Native Windows regression coverage uses an invisible HWND and checks topmost
+removal/restoration, unchanged foreground ownership, logical client sizes,
+work-area containment on attached monitors, immediate move/toggle and independent
+geometry persistence. Geometry tests also cover negative origins, missing
+monitors, oversized windows and 100%, 125%, 150%, 200% scale conversions.
+These checks are not visual or hardware-input acceptance. Remaining manual checks:
+
+- Verify topmost across ordinary app activation and readable compact rendering.
+- Verify title-rail dragging begins on a real mouse press and Restore does
   not start dragging; test keyboard and keypad Ctrl + / −.
-- Verify 100%, 125%, 150%, 200% DPI, moving across mixed-DPI monitors, normal
-  launch and compact resize limits. Sizes are logical, while native positions
-  are physical desktop coordinates. Use Windows work areas (not whole monitor)
-  for taskbar-aware bounds; select the saved rectangle's monitor when present.
-- Validate separate normal/compact size and compact-position restoration,
-  disconnecting monitors, negative desktop origins, maximized/minimized state,
-  clean shutdown and startup. Do not save transition sizes into the wrong mode.
+- Verify live dragging across mixed-DPI monitors, monitor disconnection,
+  maximized/minimized transitions, clean shutdown and startup.
 - Test simultaneous working/blocked/unread Completed/Idle-stop rows, paging,
   selection/focus and durable per-episode × across restart at the minimum size.
 - Preserve passive multi-monitor screensaver, preview child HWND and --tree.
 
-This PR remains open for testing; Windows graphical acceptance is a separate
-followup, not inferred from CI compilation.
+Windows graphical acceptance is separate from compilation and native HWND tests.
 
 ## Adversarial review and validation
 
