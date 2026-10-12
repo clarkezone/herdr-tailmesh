@@ -1263,17 +1263,24 @@ fn compact_slots(rect: Rect, remaining: usize) -> Vec<Rect> {
         .collect()
 }
 fn compact_caption<'a>(card: &Card<'a>) -> (&'a str, &'a str) {
-    let agent = card
-        .event
-        .text
-        .lines()
-        .find_map(|l| l.strip_prefix("Agent: "));
+    let prefix = match card.typed {
+        Some(mesh_orb::Glyph::Coordinator) => "coordinator: ",
+        Some(mesh_orb::Glyph::Node) => "node: ",
+        Some(mesh_orb::Glyph::Session) => "session: ",
+        Some(mesh_orb::Glyph::Workspace) => "workspace: ",
+        Some(mesh_orb::Glyph::Agent(_)) => "agent: ",
+        None => "Agent: ",
+    };
+    let agent = card.event.text.lines().find_map(|l| l.strip_prefix(prefix));
     let label = agent.unwrap_or_else(|| card.event.text.lines().next().unwrap_or(""));
     let scope = card
         .event
         .text
         .lines()
-        .find_map(|l| l.strip_prefix("Node: "))
+        .find_map(|l| {
+            l.strip_prefix("Node: ")
+                .or_else(|| l.strip_prefix("node: "))
+        })
         .unwrap_or("");
     (label, scope)
 }
@@ -1289,9 +1296,20 @@ fn draw_compact(
     let start = state.page_start;
     let capacity = slots.len();
     let displayed = present_cards(candidates, &slots, start, state, context);
+    let footer = (!candidates.is_empty()).then(|| {
+        let width = (rect.width() * 0.56).clamp(174., 240.).min(rect.width());
+        Rect::from_min_size(
+            pos2(rect.right() - width, rect.bottom() - 26.),
+            vec2(width, 26.),
+        )
+    });
     let mut response = Response::default();
     if !context.passive {
-        let obstacles: Vec<_> = displayed.iter().map(|(_, bounds, _, _)| *bounds).collect();
+        let obstacles: Vec<_> = displayed
+            .iter()
+            .map(|(_, bounds, _, _)| *bounds)
+            .chain(footer)
+            .collect();
         crate::orb_focus::labels(
             ui,
             context.sim,
@@ -1415,12 +1433,7 @@ fn draw_compact(
         });
         reveal.scan(&painter, *bounds);
     }
-    if !candidates.is_empty() {
-        let width = (rect.width() * 0.56).clamp(174., 240.).min(rect.width());
-        let footer = Rect::from_min_size(
-            pos2(rect.right() - width, rect.bottom() - 26.),
-            vec2(width, 26.),
-        );
+    if let Some(footer) = footer {
         response.blocked.push(footer);
         frame(&painter, footer, CYAN, 1.);
         let mut child = ui.new_child(
@@ -2097,6 +2110,117 @@ mod tests {
             repeat,
             modifiers: Default::default(),
         }
+    }
+    #[test]
+    fn compact_bulk_agent_captions_use_agent_names_and_node_scope() {
+        let v = view(vec![node("one", "idle", 2)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 2.);
+        let mut objects = crate::orb_objects::Objects::default();
+        objects.toggle(crate::orb_objects::Class::Agent);
+        objects.update(&sim, &v, None);
+        assert!(!objects.cards.is_empty());
+        for object in objects.cards.values() {
+            let card = Card {
+                event: &object.event,
+                key: Some(&object.key),
+                persistent: true,
+                working: false,
+                attention: false,
+                acknowledgeable: false,
+                typed: Some(object.glyph),
+                pinned: false,
+            };
+            let (label, scope) = compact_caption(&card);
+            assert!(label.starts_with("Actual agent "));
+            assert_eq!(scope, "Actual node one");
+        }
+    }
+    #[test]
+    fn compact_names_do_not_render_beneath_pager() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "idle", 1)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        sim.update(&v, Stamp::seconds(201), 2.);
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(488., 302.));
+        let id = sim.id(&v.scene.as_ref().unwrap().nodes[0].key).unwrap();
+        let position = mesh_orb::visible_position(&sim, id) * 1.1;
+        let viewport = crate::orb_viewport::Viewport {
+            x: 0.,
+            y: 0.,
+            width: rect.width(),
+            height: rect.height(),
+            pixels_per_point: 1.,
+        };
+        let distance = mesh_orb::camera_distance(viewport);
+        let half = (45_f32.to_radians() * 0.5).tan();
+        sim.camera = Some(crate::orb_focus::Pose {
+            rotation: glam::Quat::IDENTITY,
+            center: glam::Vec3::new(
+                position.x
+                    - (2. * 310. / rect.width() - 1.) * distance * half * rect.width()
+                        / rect.height(),
+                position.y - (1. - 2. * 288. / rect.height()) * distance * half,
+                position.z,
+            ),
+            ..crate::orb_focus::Pose::ambient(sim.time)
+        });
+        let mut state = Panels {
+            compact: true,
+            ..Default::default()
+        };
+        state.objects.toggle(crate::orb_objects::Class::Node);
+        let footer = Rect::from_min_size(pos2(248., 276.), vec2(240., 26.));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                let unreserved = crate::orb_focus::labels(
+                    ui,
+                    &sim,
+                    &v,
+                    rect,
+                    &None,
+                    &[],
+                    state.name_visibility(),
+                );
+                assert!(
+                    unreserved.iter().any(|r| r.intersects(footer)),
+                    "fixture must put a name beneath the pager"
+                );
+            },
+        );
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw(
+                    ui,
+                    &Context {
+                        sim: &sim,
+                        view: &v,
+                        rect,
+                        selected: None,
+                        passive: false,
+                    },
+                    &mut state,
+                );
+            },
+        );
+        for shape in &output.shapes {
+            if let egui::Shape::Text(text) = &shape.shape
+                && text.galley.text() == "Actual node one"
+            {
+                assert!(!Rect::from_min_size(text.pos, text.galley.size()).intersects(footer));
+            }
+        }
+        output.textures_delta.clear();
     }
     #[test]
     fn keyboard_help_lists_b_and_escape_closes_help_before_clearing_focus() {
