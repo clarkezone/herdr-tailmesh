@@ -437,6 +437,22 @@ pub fn panel(
 }
 
 /// Name projection is independent of how much room remains for the hierarchy.
+#[derive(Default, Clone, Copy)]
+pub struct Names {
+    pub all: bool,
+    pub classes: [bool; 4],
+}
+impl Names {
+    fn shows(self, entity: Id) -> bool {
+        self.all
+            || self.classes[match entity {
+                Id::Node(_) => 0,
+                Id::Session(..) => 1,
+                Id::Workspace(..) => 2,
+                Id::Agent(..) => 3,
+            }]
+    }
+}
 pub fn labels(
     ui: &Ui,
     sim: &Simulation,
@@ -444,45 +460,68 @@ pub fn labels(
     rect: Rect,
     focus: &Option<Key>,
     reserved: &[Rect],
+    names: Names,
 ) -> Vec<Rect> {
-    let Some(node) = focus.as_ref().and_then(|key| node_for(view, key)) else {
-        return Vec::new();
-    };
-    let Some(id) = sim.id(&node.key) else {
-        return Vec::new();
-    };
+    let focused_node = focus
+        .as_ref()
+        .and_then(|key| node_for(view, key))
+        .and_then(|node| sim.id(&node.key))
+        .map(|id| id.indices().0);
+    let focus_root = focus
+        .as_ref()
+        .is_some_and(|key| sim.coordinator_key() == Some(key));
     let mut used = reserved.to_vec();
     let mut result = Vec::new();
-    let mut labelled = 0;
     let mut measured = 0;
-    for (&entity, life) in &sim.entities {
-        if entity.indices().0 != id.indices().0
-            || !life.entering()
-            || life.alpha(sim.clock) < 0.1
-            || labelled >= 128
-            || measured >= 256
-        {
-            continue;
+    let entities = sim
+        .entities
+        .iter()
+        .filter(|(entity, life)| {
+            (names.shows(**entity) || focus_root || focused_node == Some(entity.indices().0))
+                && life.entering()
+                && life.alpha(sim.clock) >= 0.1
+        })
+        .map(|(&entity, _)| {
+            let color = if matches!(entity, Id::Agent(..)) {
+                egui::Rgba::from_rgb(
+                    sim.state(entity).color()[0],
+                    sim.state(entity).color()[1],
+                    sim.state(entity).color()[2],
+                )
+                .into()
+            } else {
+                COLOR
+            };
+            (
+                mesh_orb::visible_position(sim, entity),
+                sim.name(entity),
+                color,
+            )
+        });
+    let coordinator = view
+        .scene
+        .as_ref()
+        .and_then(|scene| scene.coordinator.as_ref())
+        .filter(|_| names.all || focus_root)
+        .map(|root| {
+            (
+                mesh_orb::coordinator(sim.motion_time()),
+                root.label.as_str(),
+                COLOR,
+            )
+        });
+    for (position, name, color) in coordinator.into_iter().chain(entities) {
+        if result.len() >= 128 || measured >= 256 {
+            break;
         }
-        let Some(p) = mesh_orb::project_sim(mesh_orb::visible_position(sim, entity), sim, rect)
-            .filter(|p| rect.contains(*p))
+        let Some(p) = mesh_orb::project_sim(position, sim, rect).filter(|p| rect.contains(*p))
         else {
             continue;
         };
         measured += 1;
-        let color = if matches!(entity, Id::Agent(..)) {
-            egui::Rgba::from_rgb(
-                sim.state(entity).color()[0],
-                sim.state(entity).color()[1],
-                sim.state(entity).color()[2],
-            )
-            .into()
-        } else {
-            COLOR
-        };
-        let galley =
-            ui.painter()
-                .layout_no_wrap(sim.name(entity).into(), FontId::monospace(10.), color);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(name.into(), FontId::monospace(10.), color);
         let label = Rect::from_min_size(p + vec2(10., -8.), galley.size());
         if rect.contains_rect(label) && !used.iter().any(|r| r.expand(3.).intersects(label)) {
             ui.painter().with_clip_rect(rect).rect_filled(
@@ -495,7 +534,6 @@ pub fn labels(
                 .galley(label.min, galley, color);
             used.push(label);
             result.push(label);
-            labelled += 1;
         }
     }
     result
@@ -662,6 +700,63 @@ mod tests {
         }
     }
     #[test]
+    fn projected_names_follow_each_overlay_and_all_names_without_focus() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "idle", 2)], 1);
+        let mut sim = Simulation::default();
+        advance(&mut sim, &v, 0.);
+        advance(&mut sim, &v, 2.);
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, vec2(1920., 1080.));
+        for class in 0..5 {
+            let mut visibility = Names::default();
+            if class == 4 {
+                visibility.all = true;
+            } else {
+                visibility.classes[class] = true;
+            }
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    let projected = labels(ui, &sim, &v, rect, &None, &[], visibility);
+                    assert!(!projected.is_empty(), "class {class} must project names");
+                    assert!(projected.iter().all(|r| rect.contains_rect(*r)));
+                },
+            );
+            let allowed: std::collections::BTreeSet<_> = sim
+                .entities
+                .keys()
+                .filter(|id| visibility.shows(**id))
+                .map(|id| sim.name(*id))
+                .chain(
+                    v.scene
+                        .as_ref()
+                        .unwrap()
+                        .coordinator
+                        .iter()
+                        .filter(|_| visibility.all)
+                        .map(|b| b.label.as_str()),
+                )
+                .collect();
+            for shape in &out.shapes {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    assert!(
+                        allowed.contains(text.galley.text()),
+                        "wrong subset: {}",
+                        text.galley.text()
+                    );
+                }
+            }
+            out.textures_delta.clear();
+        }
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            assert!(labels(ui, &sim, &v, rect, &None, &[], Names::default()).is_empty());
+        });
+        out.textures_delta.clear();
+    }
+    #[test]
     fn projected_names_do_not_depend_on_a_usable_hierarchy_panel() {
         let ctx = egui::Context::default();
         let v = view(vec![node("one", "done", 1)], 1);
@@ -681,7 +776,7 @@ mod tests {
             |ui| {
                 let bounds = panel(ui, &v, rect, &mut focus, &[], &mut None, 0.).unwrap();
                 assert!(bounds.height() < 40.);
-                let names = labels(ui, &sim, &v, rect, &focus, &[bounds]);
+                let names = labels(ui, &sim, &v, rect, &focus, &[bounds], Names::default());
                 assert!(
                     !names.is_empty(),
                     "compact hierarchy must not suppress projected names"

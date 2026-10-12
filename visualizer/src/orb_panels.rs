@@ -45,6 +45,7 @@ struct LayoutTrace {
 pub struct Panels {
     pub compact: bool,
     keys: bool,
+    names: bool,
     pub page: usize,
     pub projects: bool,
     pub focus: Option<Key>,
@@ -70,6 +71,14 @@ pub struct Panels {
     diagnostic_layout: Option<LayoutTrace>,
 }
 impl Panels {
+    fn name_visibility(&self) -> crate::orb_focus::Names {
+        use crate::orb_objects::Class;
+        crate::orb_focus::Names {
+            all: self.names,
+            classes: [Class::Node, Class::Session, Class::Workspace, Class::Agent]
+                .map(|class| self.objects.enabled(class)),
+        }
+    }
     pub fn set_compact(&mut self, compact: bool) {
         if self.compact == compact {
             return;
@@ -85,7 +94,7 @@ impl Panels {
         self.page_start = 0;
         self.previous.clear();
         self.membership.clear();
-        self.objects = Default::default();
+        self.objects.reset_source();
         self.presentations.clear();
         self.project_motion = None;
         self.focus_motion = None;
@@ -230,8 +239,15 @@ impl Panels {
                         egui::Key::N => self.objects.toggle(crate::orb_objects::Class::Node),
                         egui::Key::S => self.objects.toggle(crate::orb_objects::Class::Session),
                         egui::Key::W => self.objects.toggle(crate::orb_objects::Class::Workspace),
-                        egui::Key::A => self.controls.toggle_workers(clock),
-                        egui::Key::Escape => self.focus = None,
+                        egui::Key::A => self.objects.toggle(crate::orb_objects::Class::Agent),
+                        egui::Key::B => self.names = !self.names,
+                        egui::Key::Escape => {
+                            if self.keys {
+                                self.keys = false;
+                            } else {
+                                self.focus = None;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1274,6 +1290,18 @@ fn draw_compact(
     let capacity = slots.len();
     let displayed = present_cards(candidates, &slots, start, state, context);
     let mut response = Response::default();
+    if !context.passive {
+        let obstacles: Vec<_> = displayed.iter().map(|(_, bounds, _, _)| *bounds).collect();
+        crate::orb_focus::labels(
+            ui,
+            context.sim,
+            context.view,
+            rect,
+            &state.focus,
+            &obstacles,
+            state.name_visibility(),
+        );
+    }
     for (snapshot, bounds, reveal, index) in &displayed {
         if !reveal.active() {
             continue;
@@ -1460,12 +1488,13 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
                     ("Ctrl -", "Shrink compact window by 10% (minimum 360 × 240)"),
                     ("L", "Toggle legend"),
                     ("K", "Toggle this keyboard list"),
+                    ("B", "Toggle all object names"),
+                    ("Esc", "Close keyboard help; otherwise clear Focus"),
                     ("F", "Toggle fleet counts"),
-                    ("N", "Toggle node callouts"),
-                    ("S", "Toggle session callouts"),
-                    ("W", "Toggle workspace callouts"),
-                    ("A", "Toggle working-agent callouts"),
-                    ("Esc", "Clear explicit Focus"),
+                    ("N", "Toggle node callouts and names"),
+                    ("S", "Toggle session callouts and names"),
+                    ("W", "Toggle workspace callouts and names"),
+                    ("A", "Toggle all-agent callouts and names"),
                     ("Tab / Shift + Tab", "Navigate controls"),
                     ("Space / Enter", "Activate a focused control"),
                 ] {
@@ -1496,7 +1525,6 @@ fn draw_content(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Respo
     state
         .objects
         .update(context.sim, context.view, context.selected);
-    let objects: Vec<_> = state.objects.cards.values().cloned().collect();
     let mut reserved: Vec<_> = docks.iter().map(|d| d.bounds).collect();
     if !context.passive
         && !state.compact
@@ -1535,10 +1563,21 @@ fn draw_content(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Respo
                 || c.key.is_none_or(|key| !state.dismissed.contains_key(key))
         })
         .collect();
-    candidates.retain(|c| {
-        c.key
-            .is_none_or(|key| !state.objects.cards.contains_key(key))
-    });
+    // Bulk agent cards fill gaps, but must not replace actionable activity/outcome cards.
+    let activity_keys: BTreeSet<_> = candidates.iter().filter_map(|c| c.key).collect();
+    let objects: Vec<_> = state
+        .objects
+        .cards
+        .values()
+        .filter(|o| {
+            !matches!(o.glyph, mesh_orb::Glyph::Agent(_))
+                || context.selected == Some(&o.key)
+                || !activity_keys.contains(&o.key)
+        })
+        .cloned()
+        .collect();
+    let object_keys: BTreeSet<_> = objects.iter().map(|o| &o.key).collect();
+    candidates.retain(|c| c.key.is_none_or(|key| !object_keys.contains(key)));
     candidates.extend(objects.iter().map(|o| Card {
         event: &o.event,
         key: Some(&o.key),
@@ -1661,6 +1700,7 @@ fn draw_content(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Respo
             rect,
             &state.focus,
             &label_obstacles,
+            state.name_visibility(),
         );
     }
     if let Some(anchor) = mesh_orb::project_sim(
@@ -1942,7 +1982,13 @@ fn draw_content(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Respo
         );
         panel_painter.multiply_opacity(reveal.opacity());
         let compact = dock.bounds.height() < 100.;
-        let header_height = if compact { 0. } else { 42. };
+        let header_height = if compact {
+            0.
+        } else if dock.panel == Panel::Key {
+            60.
+        } else {
+            42.
+        };
         if !compact {
             let header = Rect::from_min_max(
                 dock.bounds.min + vec2(12., 6.),
@@ -1979,7 +2025,7 @@ fn draw_content(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Respo
             if dock.panel == Panel::Key {
                 child.horizontal(|ui| {
                     ui.small("LEGEND · L").on_hover_text(
-                        "N nodes · S sessions · W workspaces · F fleet · A working agents",
+                        "N nodes · S sessions · W workspaces · A all agents · B all names · F fleet",
                     );
                     if !context.passive && ui.selectable_label(state.projects, "Projects").clicked()
                     {
@@ -1987,6 +2033,7 @@ fn draw_content(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Respo
                         response.clear_selection = true;
                     }
                 });
+                child.small("B all names · K keyboard help");
             } else {
                 child.small("FLEET · F");
             }
@@ -2050,6 +2097,67 @@ mod tests {
             repeat,
             modifiers: Default::default(),
         }
+    }
+    #[test]
+    fn keyboard_help_lists_b_and_escape_closes_help_before_clearing_focus() {
+        let ctx = egui::Context::default();
+        let v = view(vec![node("one", "idle", 1)], 1);
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 2.);
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1920., 1080.));
+        let focused = v.scene.as_ref().unwrap().nodes[0].key.clone();
+        let mut state = Panels {
+            focus: Some(focused.clone()),
+            ..Default::default()
+        };
+        let frame = |state: &mut Panels, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    state.handle_input(ui, 2., false);
+                    draw(
+                        ui,
+                        &Context {
+                            sim: &sim,
+                            view: &v,
+                            rect,
+                            selected: None,
+                            passive: false,
+                        },
+                        state,
+                    );
+                },
+            );
+            let visible_b = output.shapes.iter().any(|shape| match &shape.shape {
+                egui::Shape::Text(text) => {
+                    text.galley.text() == "B"
+                        && shape
+                            .clip_rect
+                            .contains_rect(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => false,
+            });
+            output.textures_delta.clear();
+            visible_b
+        };
+        // ScrollArea layout settles after the initial frame.
+        frame(&mut state, vec![key(egui::Key::K, true, false)]);
+        assert!(
+            frame(&mut state, vec![]),
+            "B must be visible without scrolling"
+        );
+        frame(&mut state, vec![key(egui::Key::Escape, true, false)]);
+        assert!(!state.keys);
+        assert_eq!(state.focus.as_ref(), Some(&focused));
+        frame(&mut state, vec![key(egui::Key::Escape, true, true)]);
+        assert_eq!(state.focus.as_ref(), Some(&focused));
+        frame(&mut state, vec![key(egui::Key::Escape, false, false)]);
+        frame(&mut state, vec![key(egui::Key::Escape, true, false)]);
+        assert!(state.focus.is_none());
     }
     #[test]
     fn legend_and_keyboard_help_toggle_independently_and_help_fits_compact_mode() {
@@ -2478,6 +2586,64 @@ mod tests {
         assert_eq!(sim.summary().agents, 24);
     }
     #[test]
+    fn a_adds_idle_agent_cards_without_replacing_activity_or_completion_cards() {
+        let ctx = egui::Context::default();
+        let v = view(
+            vec![
+                node("work", "working", 1),
+                node("done", "done", 1),
+                node("idle", "idle", 1),
+            ],
+            1,
+        );
+        let mut sim = Simulation::default();
+        sim.update(&v, Stamp::seconds(201), 0.);
+        sim.update(&v, Stamp::seconds(201), 3.);
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1920., 1080.));
+        let mut state = Panels::default();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events: vec![key(egui::Key::A, true, false)],
+                ..Default::default()
+            },
+            |ui| {
+                state.handle_input(ui, 3., false);
+                draw(
+                    ui,
+                    &Context {
+                        sim: &sim,
+                        view: &v,
+                        rect,
+                        selected: None,
+                        passive: false,
+                    },
+                    &mut state,
+                );
+            },
+        );
+        out.textures_delta.clear();
+        assert!(state.name_visibility().classes[3]);
+        for card in cards(&sim).into_iter().filter(|c| c.persistent) {
+            assert!(
+                state.membership.contains(&card.id()),
+                "bulk agent overlay must preserve {}",
+                card.event.title
+            );
+        }
+        assert!(state.membership.iter().any(|id| {
+            match id {
+                CardId::Object(key) => {
+                    state.objects.cards.get(key).is_some_and(|o| {
+                        matches!(o.glyph, mesh_orb::Glyph::Agent(AgentState::Idle))
+                    })
+                }
+                _ => false,
+            }
+        }));
+        assert!(state.take_dismissals().is_empty());
+    }
+    #[test]
     fn actual_keyboard_events_ignore_repeat_release_passive_and_preserve_source_preferences() {
         let ctx = egui::Context::default();
         let mut state = Panels::default();
@@ -2492,7 +2658,9 @@ mod tests {
             output.textures_delta.clear();
         };
         run(vec![key(egui::Key::A, true, false)], false, 2., &mut state);
-        assert!(!state.controls.workers.shown);
+        assert!(state.objects.enabled(crate::orb_objects::Class::Agent));
+        run(vec![key(egui::Key::B, true, false)], false, 2., &mut state);
+        assert!(state.name_visibility().all);
         run(
             vec![
                 key(egui::Key::A, true, true),
@@ -2502,9 +2670,10 @@ mod tests {
             3.,
             &mut state,
         );
-        assert!(!state.controls.workers.shown);
+        assert!(state.objects.enabled(crate::orb_objects::Class::Agent));
+        assert!(state.name_visibility().all);
         run(vec![key(egui::Key::A, true, false)], true, 4., &mut state);
-        assert!(!state.controls.workers.shown);
+        assert!(state.objects.enabled(crate::orb_objects::Class::Agent));
         run(
             vec![
                 key(egui::Key::L, true, false),
@@ -2523,14 +2692,14 @@ mod tests {
         );
         assert!(!state.controls.key.reveal(200.).active());
         assert!(!state.controls.counts.reveal(200.).active());
-        assert!(!state.controls.workers.reveal(200.).active());
+        assert!(state.objects.enabled(crate::orb_objects::Class::Agent));
         run(
             vec![key(egui::Key::A, true, false)],
             false,
             201.,
             &mut state,
         );
-        assert!(state.controls.workers.reveal(203.).interactive());
+        assert!(!state.objects.enabled(crate::orb_objects::Class::Agent));
     }
     #[test]
     fn dock_is_bounded_separate_and_remaining_panel_moves_to_bottom() {

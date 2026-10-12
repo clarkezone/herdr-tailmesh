@@ -241,6 +241,7 @@ impl Controls {
         }
         incoming.set(opening, clock, delay);
     }
+    #[cfg(test)]
     pub fn toggle_workers(&mut self, clock: f64) {
         self.workers.set(!self.workers.shown, clock, 0.);
     }

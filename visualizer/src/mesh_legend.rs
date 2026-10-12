@@ -35,11 +35,11 @@ pub const ENTRIES: [Entry; 9] = [
         glyph: Glyph::Workspace,
     },
     Entry {
-        label: "Agent",
+        label: "Agent · A",
         glyph: Glyph::Agent(AgentState::Working),
     },
     Entry {
-        label: "Working · A",
+        label: "Working",
         glyph: Glyph::Agent(AgentState::Working),
     },
     Entry {

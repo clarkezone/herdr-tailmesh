@@ -18,7 +18,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            target: windows-amd64
+          - os: windows-11-arm
+            target: windows-arm64
+          - os: ubuntu-latest
+            target: linux-amd64
+          - os: macos-latest
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -65,14 +72,29 @@ jobs:
           python scripts/test-package-visualizer.py
           binary="$PWD/visualizer/target/release/herdr-mesh-visualizer"
           if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
-          python scripts/package-visualizer.py --binary "$binary" --version 0.1.0
+          python scripts/package-visualizer.py --binary "$binary" --version "ci-${{ github.sha }}"
       - name: Package Windows screensaver separately
         if: runner.os == 'Windows'
-        run: python scripts/package-visualizer.py --binary visualizer/target/release/herdr-mesh-screensaver.exe --version 0.1.0 --screensaver
+        run: python scripts/package-visualizer.py --binary visualizer/target/release/herdr-mesh-screensaver.exe --version "ci-${{ github.sha }}" --screensaver
       - uses: actions/upload-artifact@v4
         with:
           name: herdr-mesh-visualizer-${{ runner.os }}-${{ runner.arch }}
           path: dist/visualizer/*
+          if-no-files-found: error
+      - name: Build and package production engine
+        if: matrix.target != ''
+        shell: pwsh
+        run: |
+          .\scripts\build-release.ps1 -Version "ci-${{ github.sha }}" -Targets "${{ matrix.target }}" -OutputDirectory dist\engine
+      - name: Publish engine artifacts
+        if: matrix.target != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: herdr-mesh-${{ matrix.target }}
+          path: |
+            dist/engine/*.zip
+            dist/engine/SHA256SUMS
+          if-no-files-found: error
   test:
     strategy:
       fail-fast: false
