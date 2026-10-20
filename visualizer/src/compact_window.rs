@@ -11,6 +11,10 @@ use winit::{
 
 pub struct Controller {
     pub compact: bool,
+    #[cfg(target_os = "windows")]
+    topmost: Option<bool>,
+    #[cfg(target_os = "windows")]
+    dpi_drag: Option<std::rc::Rc<windows::DpiDrag>>,
     prefs: Arc<Mutex<WindowPreferences>>,
     path: Option<std::path::PathBuf>,
     changed: Option<Instant>,
@@ -63,6 +67,10 @@ impl Controller {
             .unwrap_or_default();
         Self {
             compact: false,
+            #[cfg(target_os = "windows")]
+            topmost: None,
+            #[cfg(target_os = "windows")]
+            dpi_drag: None,
             prefs: Arc::new(Mutex::new(WindowPreferences {
                 value: prefs,
                 #[cfg(any(target_os = "linux", test))]
@@ -80,11 +88,32 @@ impl Controller {
         LogicalSize::new(p.value.normal.size[0], p.value.normal.size[1])
     }
     pub fn attach(&mut self, window: &Window) {
+        #[cfg(target_os = "windows")]
+        match windows::install_dpi_drag_hook(window) {
+            Ok(hook) => self.dpi_drag = Some(hook),
+            Err(e) => log::warn!("Cannot stabilize mixed-DPI window dragging: {e}"),
+        }
         #[cfg(target_os = "linux")]
         {
             self.hypr = hypr::Adapter::start(self.prefs.clone(), self.path.clone());
         }
         self.apply(window);
+    }
+    fn window_level(&self) -> WindowLevel {
+        #[cfg(target_os = "windows")]
+        let topmost = self.topmost.unwrap_or(self.compact);
+        #[cfg(not(target_os = "windows"))]
+        let topmost = self.compact;
+        if topmost {
+            WindowLevel::AlwaysOnTop
+        } else {
+            WindowLevel::Normal
+        }
+    }
+    #[cfg(target_os = "windows")]
+    pub fn toggle_topmost(&mut self, window: &Window) {
+        self.topmost = Some(self.window_level() != WindowLevel::AlwaysOnTop);
+        window.set_window_level(self.window_level());
     }
     pub fn toggle(&mut self, window: &Window) {
         self.capture(window);
@@ -104,7 +133,9 @@ impl Controller {
     }
     #[cfg(target_os = "windows")]
     pub fn scale_factor_changed(&self, scale: f64, writer: &mut winit::event::InnerSizeWriter) {
-        if Instant::now() >= self.settle {
+        if Instant::now() >= self.settle
+            || self.dpi_drag.as_ref().is_some_and(|hook| hook.dragged())
+        {
             return;
         }
         let prefs = self.prefs.lock().unwrap();
@@ -120,6 +151,10 @@ impl Controller {
         }
     }
     fn apply(&mut self, window: &Window) {
+        #[cfg(target_os = "windows")]
+        if let Some(hook) = &self.dpi_drag {
+            hook.placement_started();
+        }
         let mut p = self.prefs.lock().unwrap();
         #[cfg(target_os = "linux")]
         let generation = p.request();
@@ -165,11 +200,7 @@ impl Controller {
         let bounds = *b;
         drop(p);
         window.set_decorations(!self.compact);
-        window.set_window_level(if self.compact {
-            WindowLevel::AlwaysOnTop
-        } else {
-            WindowLevel::Normal
-        });
+        window.set_window_level(self.window_level());
         window.set_min_inner_size(Some(LogicalSize::new(
             if self.compact { 360. } else { 640. },
             if self.compact { 240. } else { 400. },
@@ -223,7 +254,9 @@ impl Controller {
             // Win32 placement is synchronous; retain an immediate drag/toggle
             // once the requested client extent has arrived, not an interim resize.
             #[cfg(target_os = "windows")]
-            if (size.width - b.size[0]).abs() > 1. || (size.height - b.size[1]).abs() > 1. {
+            if !self.dpi_drag.as_ref().is_some_and(|hook| hook.dragged())
+                && ((size.width - b.size[0]).abs() > 1. || (size.height - b.size[1]).abs() > 1.)
+            {
                 return;
             }
             #[cfg(not(target_os = "windows"))]
@@ -293,21 +326,103 @@ mod preference_tests {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
+    use std::{cell::Cell, rc::Rc};
     use windows_sys::Win32::{
-        Foundation::RECT,
+        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
             GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
             MonitorFromWindow,
         },
         UI::{
             HiDpi::AdjustWindowRectExForDpi,
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::{
-                GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, HWND_NOTOPMOST, HWND_TOPMOST,
-                SWP_NOACTIVATE, SWP_NOOWNERZORDER, SetWindowPos,
+                GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WINDOWPOS,
+                WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY,
+                WM_WINDOWPOSCHANGING,
             },
         },
     };
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    #[derive(Default)]
+    pub struct DpiDrag {
+        moving: Cell<bool>,
+        changing_dpi: Cell<bool>,
+        dragged: Cell<bool>,
+    }
+    impl DpiDrag {
+        pub fn dragged(&self) -> bool {
+            self.dragged.get()
+        }
+        pub fn placement_started(&self) {
+            self.dragged.set(false);
+        }
+    }
+    const DPI_DRAG_SUBCLASS: usize = 0x484d4450;
+
+    unsafe extern "system" fn dpi_drag_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        id: usize,
+        data: usize,
+    ) -> LRESULT {
+        let native = data as *const DpiDrag;
+        // The HWND owns one Rc; retain another across reentrant window messages.
+        unsafe { Rc::increment_strong_count(native) };
+        let state = unsafe { Rc::from_raw(native) };
+        match message {
+            WM_ENTERSIZEMOVE => {
+                state.moving.set(true);
+                state.dragged.set(true);
+            }
+            WM_EXITSIZEMOVE => state.moving.set(false),
+            WM_DPICHANGED if state.moving.get() => {
+                let previous = state.changing_dpi.replace(true);
+                let result = unsafe { DefSubclassProc(window, message, wparam, lparam) };
+                state.changing_dpi.set(previous);
+                return result;
+            }
+            WM_WINDOWPOSCHANGING if state.changing_dpi.get() => {
+                // Keep winit's DPI notification, but not its resize/reposition:
+                // that can move the window back across the monitor boundary.
+                let position = unsafe { &mut *(lparam as *mut WINDOWPOS) };
+                position.flags |= SWP_NOMOVE | SWP_NOSIZE;
+            }
+            WM_NCDESTROY => unsafe {
+                RemoveWindowSubclass(window, Some(dpi_drag_proc), id);
+                drop(Rc::from_raw(native));
+            },
+            _ => {}
+        }
+        unsafe { DefSubclassProc(window, message, wparam, lparam) }
+    }
+
+    pub fn install_dpi_drag_hook(window: &Window) -> Result<Rc<DpiDrag>, String> {
+        let RawWindowHandle::Win32(handle) =
+            window.window_handle().map_err(|e| e.to_string())?.as_raw()
+        else {
+            return Err("Expected a Win32 companion window".into());
+        };
+        let hook = Rc::new(DpiDrag::default());
+        let state = Rc::into_raw(hook.clone());
+        if unsafe {
+            SetWindowSubclass(
+                handle.hwnd.get() as HWND,
+                Some(dpi_drag_proc),
+                DPI_DRAG_SUBCLASS,
+                state as usize,
+            )
+        } == 0
+        {
+            unsafe { drop(Rc::from_raw(state)) };
+            return Err("Cannot install DPI drag window hook".into());
+        }
+        Ok(hook)
+    }
 
     fn fit(mut rect: RECT, work: RECT) -> RECT {
         let width = (rect.right - rect.left).min(work.right - work.left).max(1);
@@ -394,16 +509,12 @@ mod windows {
         if unsafe {
             SetWindowPos(
                 hwnd,
-                if compact {
-                    HWND_TOPMOST
-                } else {
-                    HWND_NOTOPMOST
-                },
+                std::ptr::null_mut(),
                 rect.left,
                 rect.top,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER,
             )
         } == 0
         {
@@ -424,6 +535,128 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn rect(window: HWND) -> [i32; 4] {
+            let mut rect = RECT::default();
+            assert_ne!(
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(window, &mut rect)
+                },
+                0
+            );
+            [rect.left, rect.top, rect.right, rect.bottom]
+        }
+
+        fn dpi_drag_preserves_geometry(window: &Window, hwnd: HWND) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+            let original = rect(hwnd);
+            let original_dpi = (window.scale_factor() * 96.).round() as usize;
+            unsafe { SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0) };
+            for dpi in [120, 144, 192, 96, original_dpi] {
+                let mut suggested = RECT {
+                    left: original[0] + 50,
+                    top: original[1] + 50,
+                    right: original[2] + 150,
+                    bottom: original[3] + 150,
+                };
+                unsafe {
+                    SendMessageW(
+                        hwnd,
+                        WM_DPICHANGED,
+                        dpi | (dpi << 16),
+                        &mut suggested as *mut RECT as LPARAM,
+                    )
+                };
+                assert_eq!(window.scale_factor(), dpi as f64 / 96.);
+                assert_eq!(rect(hwnd), original, "DPI {dpi} changed drag geometry");
+            }
+            // Only geometry nested within a DPI change is blocked, not user moves/resizes.
+            assert_ne!(
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        original[0] + 8,
+                        original[1] + 8,
+                        original[2] - original[0] + 16,
+                        original[3] - original[1] + 16,
+                        SWP_NOACTIVATE | SWP_NOZORDER,
+                    )
+                },
+                0
+            );
+            assert_ne!(rect(hwnd), original);
+            unsafe { SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0) };
+            let before = rect(hwnd);
+            let dpi = if original_dpi == 144 { 96 } else { 144 };
+            for dpi in [dpi, original_dpi] {
+                let mut suggested = RECT {
+                    left: before[0] + 50,
+                    top: before[1] + 50,
+                    right: before[2] + 150,
+                    bottom: before[3] + 150,
+                };
+                unsafe {
+                    SendMessageW(
+                        hwnd,
+                        WM_DPICHANGED,
+                        dpi | (dpi << 16),
+                        &mut suggested as *mut RECT as LPARAM,
+                    )
+                };
+                assert_ne!(rect(hwnd), before, "DPI geometry stayed blocked after drag");
+            }
+        }
+
+        fn immediate_dpi_drag_is_captured(
+            controller: &mut Controller,
+            window: &Window,
+            hwnd: HWND,
+        ) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+            let preferences = controller.prefs.lock().unwrap().value;
+            let original = rect(hwnd);
+            let original_dpi = (window.scale_factor() * 96.).round() as usize;
+            let dpi = original_dpi * 3 / 4;
+            let mut suggested = RECT {
+                left: original[0],
+                top: original[1],
+                right: original[2],
+                bottom: original[3],
+            };
+            unsafe {
+                SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+                SendMessageW(
+                    hwnd,
+                    WM_DPICHANGED,
+                    dpi | (dpi << 16),
+                    &mut suggested as *mut RECT as LPARAM,
+                );
+                SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+            }
+            assert!(Instant::now() < controller.settle);
+            controller.capture(window);
+            let actual = window.inner_size().to_logical::<f64>(window.scale_factor());
+            let captured = {
+                let p = controller.prefs.lock().unwrap();
+                if controller.compact {
+                    p.value.compact
+                } else {
+                    p.value.normal
+                }
+            };
+            assert_eq!(captured.size, [actual.width, actual.height]);
+            assert_eq!(captured.position, Some([original[0], original[1]]));
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_DPICHANGED,
+                    original_dpi | (original_dpi << 16),
+                    &mut suggested as *mut RECT as LPARAM,
+                )
+            };
+            controller.prefs.lock().unwrap().value = preferences;
+        }
 
         #[test]
         #[allow(deprecated)]
@@ -451,6 +684,8 @@ mod windows {
             let path = dir.path().join("window-preferences.json");
             let mut controller = Controller {
                 compact: false,
+                topmost: None,
+                dpi_drag: None,
                 prefs: Arc::new(Mutex::new(WindowPreferences::default())),
                 path: Some(path.clone()),
                 changed: None,
@@ -458,8 +693,24 @@ mod windows {
             };
             controller.attach(&window);
             event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+            immediate_dpi_drag_is_captured(&mut controller, &window, hwnd);
+            controller.apply(&window);
+            event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+            dpi_drag_preserves_geometry(&window, hwnd);
+            assert!(controller.dpi_drag.as_ref().unwrap().dragged());
+            event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+            controller.apply(&window);
+            assert!(!controller.dpi_drag.as_ref().unwrap().dragged());
+            event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
             let normal = controller.prefs.lock().unwrap().value.normal;
             controller.toggle(&window);
+            event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+            immediate_dpi_drag_is_captured(&mut controller, &window, hwnd);
+            controller.apply(&window);
+            event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+            dpi_drag_preserves_geometry(&window, hwnd);
+            event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+            controller.apply(&window);
             event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
             assert_ne!(
                 unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST,
@@ -547,6 +798,31 @@ mod windows {
                 Preferences::read(&path).unwrap(),
                 controller.prefs.lock().unwrap().value
             );
+            for topmost in [false, true] {
+                let before = rect(hwnd);
+                let preferences = controller.prefs.lock().unwrap().value;
+                let decorated = window.is_decorated();
+                controller.toggle_topmost(&window);
+                event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+                assert_eq!(rect(hwnd), before);
+                assert_eq!(window.is_decorated(), decorated);
+                assert!(controller.compact);
+                assert_eq!(controller.prefs.lock().unwrap().value, preferences);
+                assert_eq!(
+                    unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST != 0,
+                    topmost
+                );
+                controller.step(&window, false);
+                for _ in 0..2 {
+                    controller.toggle(&window);
+                    event_loop.pump_events(Some(std::time::Duration::ZERO), |_, _| {});
+                    assert_eq!(
+                        unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST != 0,
+                        topmost,
+                        "mode/size changes must retain the explicit topmost choice"
+                    );
+                }
+            }
             assert_eq!(unsafe { GetForegroundWindow() }, foreground);
         }
 

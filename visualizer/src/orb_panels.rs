@@ -1497,6 +1497,8 @@ pub fn draw(ui: &mut Ui, context: &Context<'_>, state: &mut Panels) -> Response 
             .show(&mut child, |ui| {
                 for (key, action) in [
                     ("T", "Toggle normal / compact window"),
+                    #[cfg(target_os = "windows")]
+                    ("Ctrl T", "Toggle always on top without resizing"),
                     ("Ctrl + / Ctrl =", "Enlarge compact window by 10%"),
                     ("Ctrl -", "Shrink compact window by 10% (minimum 360 × 240)"),
                     ("L", "Toggle legend"),
