@@ -4,6 +4,8 @@ Interactive Orb supports **T** for the compact companion window, **Ctrl + / −*
 for compact sizing, and dragging its title rail. It launches at the remembered
 larger size. Omarchy uses scoped Hyprland IPC; Windows uses a DPI-aware,
 taskbar-aware native placement backend with non-activating topmost transitions.
+On Windows, **Ctrl+T** toggles always on top without resizing or changing modes;
+the choice lasts for this run and survives T and compact-size changes.
 See [compact mode](../docs/orb-compact-window.md).
 
 A standalone Rust viewer for the managed Herdr mesh daemon. **Orb is the default**

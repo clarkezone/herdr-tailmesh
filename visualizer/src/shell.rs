@@ -505,6 +505,15 @@ impl ApplicationHandler<()> for App {
                         && !self.modifiers.super_key() =>
                 {
                     if let Key::Character(key) = &event.logical_key {
+                        #[cfg(target_os = "windows")]
+                        if key.eq_ignore_ascii_case("t")
+                            && !event.repeat
+                            && self.modifiers.control_key()
+                            && !self.modifiers.shift_key()
+                        {
+                            c.toggle_topmost(&r.window);
+                            return;
+                        }
                         if key.eq_ignore_ascii_case("t")
                             && !event.repeat
                             && !self.modifiers.control_key()
@@ -766,7 +775,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             "herdr-mesh-visualizer [--port 8790] [--tree] [--check]\nOrb is the default. Interactive Orb: T compact mode, Ctrl +/- resize compact, drag its title rail. --tree opens the legacy tree. --check verifies a snapshot without opening a window."
         );
         #[cfg(target_os = "windows")]
-        println!("Windows screensaver: /s | /p HWND | /c [HWND] (also /p:HWND and /c:HWND)");
+        println!(
+            "Windows Orb: Ctrl+T toggles always on top without resizing.\nWindows screensaver: /s | /p HWND | /c [HWND] (also /p:HWND and /c:HWND)"
+        );
         return Ok(());
     }
     if let Mode::Configure(parent) = options.mode {

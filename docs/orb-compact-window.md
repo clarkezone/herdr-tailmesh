@@ -61,10 +61,24 @@ overrides deferred DPI resize suggestions so they cannot replace the restored
 size. An immediate drag followed by Restore retains the outgoing position.
 No registry entries, global hotkeys or daemon settings are changed.
 
+**Ctrl+T** toggles always on top without changing window size, position,
+decorations or mode. This session-only override applies in both normal and
+compact mode and survives T/Restore and Ctrl + / −. Until Ctrl+T is used,
+the existing defaults remain: compact is topmost and normal is not.
+
+During native title-bar or compact title-rail dragging, DPI changes still update
+rendering scale, but their automatic resize/reposition requests are suppressed.
+The window retains its physical footprint while straddling mixed-DPI monitors;
+ordinary mouse resizing and explicit mode/size changes remain available.
+Outside a drag, DPI changes and saved-geometry restoration behave as before.
+
 Native Windows regression coverage uses an invisible HWND and checks topmost
 removal/restoration, unchanged foreground ownership, logical client sizes,
 work-area containment on attached monitors, immediate move/toggle and independent
-geometry persistence. Geometry tests also cover negative origins, missing
+geometry persistence. Synthetic DPI messages check stable drag geometry in both
+modes, continued DPI notifications and unblocked ordinary moves/resizes. Topmost
+overrides are checked for unchanged geometry and retention across mode/size changes.
+Geometry tests also cover negative origins, missing
 monitors, oversized windows and 100%, 125%, 150%, 200% scale conversions.
 These checks are not visual or hardware-input acceptance. Remaining manual checks:
 
